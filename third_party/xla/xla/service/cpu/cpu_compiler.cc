@@ -152,6 +152,7 @@ limitations under the License.
 #include "xla/map_util.h"
 #include "xla/mlir_hlo/transforms/passes.h"
 #include "xla/service/all_reduce_promotion.h"
+#include "xla/service/outer_dimension_propagation.h"
 #include "xla/service/all_to_all_decomposer.h"
 #include "xla/service/batched_gather_scatter_normalizer.h"
 #include "xla/service/batchnorm_expander.h"
@@ -801,6 +802,7 @@ absl::Status CpuCompiler::RunHloPassesThroughLayoutAssn(
   pipeline.AddPass<LiteralCanonicalizer>(LiteralPool::Default(),
                                          /*min_size_bytes=*/1024);
 
+  pipeline.AddPass<OuterDimensionPropagationPass>();
   return pipeline.Run(module).status();
 }
 
