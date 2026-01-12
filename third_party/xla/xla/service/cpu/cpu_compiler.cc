@@ -599,13 +599,6 @@ absl::Status CpuCompiler::RunHloPassesThroughLayoutAssn(
   if (enable_xnnpack)
     pipeline.AddPass<XnnPackOpsRewriter>();
 
-  bool use_kernel_selector =
-      xla::GetDebugOptionsFromFlags().xla_cpu_use_kernel_selector();
-  if (use_kernel_selector) {
-    // This pass rewrites hlo.dot into custom calls.
-    pipeline.AddPass<KernelSelectorOpsRewriter>();
-  }
-
   // Expand random number generation.
   pipeline.AddPass<RngExpander>();
   pipeline.AddPass<RngBitGeneratorExpander>(RandomAlgorithm::RNG_PHILOX);
@@ -846,6 +839,13 @@ absl::Status CpuCompiler::RunHloPassesAfterLayoutAssn(
 
   pipeline.AddPass<ReshapeDecomposer>();
 
+  bool use_kernel_selector =
+      xla::GetDebugOptionsFromFlags().xla_cpu_use_kernel_selector();
+  if (use_kernel_selector) {
+    // This pass rewrites hlo.dot into custom calls.
+    pipeline.AddPass<KernelSelectorOpsRewriter>();
+  }
+
   const int max_parallelism =
       module->config().intra_op_parallelism_threads() > 0
           ? module->config().intra_op_parallelism_threads()
@@ -878,7 +878,10 @@ absl::Status CpuCompiler::RunHloPassesAfterLayoutAssn(
   }
 
   // Add a fusion pass now that layout assignment is done.
-  pipeline.AddPass<CpuInstructionFusion>();
+  if (getenv("SET_CPU_INS_FUSION_NOT_DUPLICATE") != NULL)
+    pipeline.AddPass<CpuInstructionFusion>(/*may_duplicate=*/false);
+  else
+    pipeline.AddPass<CpuInstructionFusion>(/*may_duplicate=*/true);
   if (is_fusion_emitters) {
     pipeline.AddPass<FusionWrapper>();
   }

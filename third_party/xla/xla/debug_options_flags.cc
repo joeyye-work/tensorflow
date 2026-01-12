@@ -100,8 +100,8 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
 #ifdef XLA_CPU_USE_ACL
   opts.set_xla_cpu_use_acl(true);
 #endif
-  opts.set_xla_cpu_use_fusion_emitters(false);
-  opts.set_xla_cpu_use_thunk_runtime(false);
+  opts.set_xla_cpu_use_fusion_emitters(true);
+  opts.set_xla_cpu_use_thunk_runtime(true);
   opts.set_xla_cpu_use_xnnpack(false);
   opts.set_xla_cpu_enable_xnnpack(false);  // For softmax
   opts.set_xla_cpu_use_kernel_selector(false);
