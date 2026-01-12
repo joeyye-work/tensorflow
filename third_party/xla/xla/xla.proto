@@ -222,6 +222,8 @@ message DebugOptions {
   // When true, XLA:CPU uses XNNPACK to execute supported operations.
   bool xla_cpu_use_xnnpack = 359;
 
+  bool xla_cpu_enable_xnnpack = 389;
+
   // Enabling this will enable optimizations that ignore the possibility of NaN.
   bool xla_enable_fast_math = 335;
 

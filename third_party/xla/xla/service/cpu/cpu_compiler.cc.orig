@@ -236,8 +236,6 @@ limitations under the License.
 #include "tsl/profiler/lib/traceme.h"
 #include "tsl/profiler/lib/traceme_encode.h"
 
-#include "xnnpack_ops_rewriter.h"
-
 #ifdef TF_LLVM_X86_AVAILABLE
 #include "llvm/TargetParser/X86TargetParser.h"
 #endif
@@ -592,12 +590,6 @@ absl::Status CpuCompiler::RunHloPassesThroughLayoutAssn(
                 .value_or(false);
   };
   pipeline.AddPass<OperandUpcaster>(upcaster_filter);
-
-  // For softmax, rewrite to custom calls with XNNPACK targets.
-  bool enable_xnnpack =
-      xla::GetDebugOptionsFromFlags().xla_cpu_enable_xnnpack();
-  if (enable_xnnpack)
-    pipeline.AddPass<XnnPackOpsRewriter>();
 
   // Expand random number generation.
   pipeline.AddPass<RngExpander>();

@@ -97,6 +97,7 @@ extern const char* const kOneDnnLayerNormSymbolName;
 extern const char* const kOneDnnConvolutionSymbolName;
 extern const char* const kOneDnnMatMulReorderSymbolName;
 extern const char* const kHandleFfiCallSymbolName;
+extern const char* const kXnnPackSoftMaxNDSymbolName;
 
 // All symbol names for XLA CPU runtime functions need to start with this
 // prefix.

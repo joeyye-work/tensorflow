@@ -110,6 +110,9 @@ limitations under the License.
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
 
+#include "xnnpack_ops.h"
+#include "xnnpack_ops_rewriter.h"
+
 #if defined(INTEL_MKL)
 #include "xla/service/cpu/onednn_memory_util.h"
 #endif
@@ -2463,6 +2466,39 @@ absl::Status IrEmitter::HandleTopK(HloInstruction* hlo) {
   return absl::OkStatus();
 }
 
+absl::Status IrEmitter::HandleXnnPackSoftMax(HloInstruction* hlo) {
+  const HloInstruction* input = hlo->operand(0);
+  Shape shape = input->shape();
+
+  TF_RETURN_IF_ERROR(EmitTargetAddressForOp(hlo));
+  TF_RET_CHECK(input->shape().element_type() == F32);
+  TF_RET_CHECK(shape.dimensions().size() >= 2);
+
+  TF_ASSIGN_OR_RETURN(const BufferAllocation::Slice input_values_slice,
+                      assignment_.GetUniqueSlice(hlo->operand(0), {}));
+  TF_ASSIGN_OR_RETURN(const BufferAllocation::Slice out_values_slice,
+                      assignment_.GetUniqueSlice(hlo, {}));
+
+  llvm::Value* values_ptr = EmitBufferPointer(input_values_slice, shape);
+  llvm::Value* out_values_ptr = EmitBufferPointer(out_values_slice, shape);
+
+  // Flatten the batches into a single dimension.
+  int channels = shape.dimensions(shape.dimensions().size() - 1);
+  int batch_size = 1;
+  for (int i = 0; i < shape.dimensions().size() - 1; i++)
+    batch_size = batch_size * shape.dimensions(i);
+
+  EmitCallToFunc(runtime::kXnnPackSoftMaxNDSymbolName,
+                 {/*run_options=*/GetExecutableRunOptionsArgument(),
+                  /*input*/ values_ptr,
+                  /*output*/ out_values_ptr,
+                  /*batch_size*/ b()->getInt64(batch_size),
+                  /*channels*/ b()->getInt64(channels)},
+                 b()->getVoidTy());
+
+  return absl::OkStatus();
+}
+
 #if defined(INTEL_MKL)
 
 // Emits operands alloca vector for oneDNN custom calls.
@@ -2814,6 +2850,9 @@ absl::Status IrEmitter::HandleCustomCall(HloInstruction* custom_call) {
   }
   if (custom_call->custom_call_target() == "TopK") {
     return HandleTopK(custom_call);
+  }
+  if (custom_call->custom_call_target() == kCustomCallXnnPackSoftMax) {
+    return HandleXnnPackSoftMax(custom_call);
   }
 #if defined(INTEL_MKL)
   if (custom_call->custom_call_target() == "__onednn$matmul") {

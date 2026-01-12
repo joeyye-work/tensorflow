@@ -56,6 +56,7 @@ limitations under the License.
 #include "xla/service/cpu/runtime_single_threaded_matmul.h"
 #include "xla/service/cpu/runtime_topk.h"
 #include "xla/service/cpu/windows_compatibility.h"
+#include "xla/service/cpu/xnnpack_ops.h"
 #include "xla/service/custom_call_target_registry.h"
 #include "tsl/platform/logging.h"
 
@@ -209,6 +210,7 @@ static bool RegisterKnownJITSymbols() {
   REGISTER_CPU_RUNTIME_SYMBOL(TracingStart);
   REGISTER_CPU_RUNTIME_SYMBOL(TracingEnd);
   REGISTER_CPU_RUNTIME_SYMBOL(HandleFfiCall);
+  REGISTER_CPU_RUNTIME_SYMBOL(XnnPackSoftMaxND);
 #if defined(INTEL_MKL)
   REGISTER_CPU_RUNTIME_SYMBOL(OneDnnMatMul);
   REGISTER_CPU_RUNTIME_SYMBOL(OneDnnSoftmax);
