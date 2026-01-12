@@ -29,6 +29,7 @@ load("@local_xla//third_party/nvshmem:workspace.bzl", nvshmem = "repo")
 load("@local_xla//third_party/pybind11_abseil:workspace.bzl", pybind11_abseil = "repo")
 load("@local_xla//third_party/pybind11_bazel:workspace.bzl", pybind11_bazel = "repo")
 load("@local_xla//third_party/robin_map:workspace.bzl", robin_map = "repo")
+load("@local_xla//third_party/openblas:workspace.bzl", openblas = "repo")
 load("@rules_jvm_external//:defs.bzl", "maven_install")
 load("@tf_runtime//:dependencies.bzl", "tfrt_dependencies")
 load("//tensorflow/tools/def_file_filter:def_file_filter_configure.bzl", "def_file_filter_configure")
@@ -100,6 +101,7 @@ def _initialize_third_party():
     tensorrt()
     nvshmem()
     triton()
+    openblas()
 
     # copybara: tsl vendor
 

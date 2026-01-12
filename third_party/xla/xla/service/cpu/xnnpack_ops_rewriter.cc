@@ -26,8 +26,6 @@ limitations under the License.
 namespace xla {
 namespace cpu {
 
-extern const char* const kCustomCallXnnPackSoftMax = "__xnnpack$softmax";
-
 namespace {
 namespace m = match;
 namespace pu = ::xla::cpu::xnnpack_pattern_utils_internal;
@@ -205,7 +203,7 @@ class XnnPackOpsRewriterVisitor : public DfsHloRewriteVisitor {
 
     HloInstruction* softmax_call =
         divide_instr->AddInstruction(HloInstruction::CreateCustomCall(
-            output_shape, {producer.value()}, kCustomCallXnnPackSoftMax));
+            output_shape, {producer.value()}, "__xnnpack$softmax"));
     TF_RETURN_IF_ERROR(ReplaceInstruction(divide_instr, softmax_call));
 
     return absl::OkStatus();

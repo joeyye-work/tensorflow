@@ -1,0 +1,17 @@
+cc_binary(
+    name = "libblas_mlir.so",
+    srcs = ["libblas_mlir/src/sgemm.cpp",
+        "libblas_mlir/src/sgemv.cpp",
+        "libblas_mlir/src/sbatch_matmul_3d.cpp",
+        "libblas_mlir/src/sbatch_matmul_4d.cpp",
+        "libblas_mlir/kernels/sbatch_matmul_3d_nn_mlir.s",
+        "libblas_mlir/kernels/sbatch_matmul_3d_nt_mlir.s",
+        "libblas_mlir/kernels/sbatch_matmul_4d_nn_mlir.s",
+        "libblas_mlir/kernels/sbatch_matmul_4d_nt_mlir.s",
+        "libblas_mlir/kernels/sgemm_nn_alpha1_beta1_mlir.s",
+        "libblas_mlir/kernels/sgemv_n_alpha1_beta1_mlir.s"],
+    linkshared = True,
+    linkstatic = False,
+    includes = ["libblas_mlir/include"],
+    visibility = ["//visibility:public"],
+)

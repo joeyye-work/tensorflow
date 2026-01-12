@@ -76,6 +76,7 @@ filegroup(
         "runtime_single_threaded_matmul_s32.cc",
         "runtime_single_threaded_matmul_u8.cc",
         "runtime_topk.cc",
+        "xnnpack_ops.cc",
         # Multi-threaded support.
         "runtime_conv2d.cc",
         "runtime_conv3d.cc",
@@ -109,6 +110,7 @@ filegroup(
         "runtime_single_threaded_fft.h",
         "runtime_single_threaded_matmul.h",
         "runtime_topk.h",
+        "xnnpack_ops.h",
         # Multi-threaded support.
         "runtime_conv2d.h",
         "runtime_conv3d.h",
@@ -218,6 +220,7 @@ cc_library(
         ":small_while_loop_hoisting_pass",
         ":thunk_emitter",
         ":xla_framework",
+        ":xnnpack_ops_rewriter",
         "//xla:cpu_function_runtime",
         "//xla:debug_options_flags",
         "//xla:literal",
@@ -617,6 +620,7 @@ cc_library(
         ":runtime_single_threaded_fft",
         ":runtime_single_threaded_matmul",
         ":runtime_topk",
+        ":xnnpack_ops",
         "//xla/service:custom_call_target_registry",
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/strings:string_view",
@@ -838,6 +842,8 @@ cc_library(
         ":onednn_config_proto_cc",
         ":onednn_memory_util",
         ":parallel_loop_emitter",
+        ":xnnpack_ops_rewriter",
+        ":xnnpack_ops",
         "//xla:literal",
         "//xla:literal_util",
         "//xla:shape_util",
@@ -2185,5 +2191,34 @@ xla_cc_test(
         "//xla/tsl/lib/monitoring:collected_metrics",
         "//xla/tsl/lib/monitoring:collection_registry",
         "@local_tsl//tsl/platform:test",
+    ],
+)
+
+cc_library(
+    name = "xnnpack_ops_rewriter",
+    srcs = ["xnnpack_ops_rewriter.cc"],
+    hdrs = [
+        "xnnpack_ops_rewriter.h",
+        "xnnpack_pattern_utils.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//xla/hlo/ir:hlo",
+        "//xla:literal_comparison",
+        "//xla:literal_util",
+        "//xla:status_macros",
+        "//xla/hlo/pass:hlo_pass",
+        "//xla/service:pattern_matcher",
+    ],
+)
+
+cc_library(
+    name = "xnnpack_ops",
+    srcs = ["xnnpack_ops.cc"],
+    hdrs = ["xnnpack_ops.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@XNNPACK",
+        "@com_google_absl//absl/base",
     ],
 )

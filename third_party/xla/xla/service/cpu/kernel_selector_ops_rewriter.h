@@ -1,5 +1,4 @@
-/* Referenced & Modified External Open Source Code:
-Original Copyright: 2023 The OpenXLA Authors.
+/* Copyright 2025 Huawei. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,12 +13,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef XLA_SERVICE_CPU_XNNPACK_OPS_REWRITER_H_
-#define XLA_SERVICE_CPU_XNNPACK_OPS_REWRITER_H_
+#ifndef XLA_SERVICE_CPU_KERNEL_SELECTOR_OPS_REWRITER_H_
+#define XLA_SERVICE_CPU_KERNEL_SELECTOR_OPS_REWRITER_H_
 
-#include <optional>
-
-#include "absl/algorithm/container.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/pass/hlo_pass_interface.h"
@@ -27,9 +23,12 @@ limitations under the License.
 namespace xla {
 namespace cpu {
 
-class XnnPackOpsRewriter : public HloModulePass {
+// This pass rewrites hlo.dot into custom calls.
+class KernelSelectorOpsRewriter : public HloModulePass {
  public:
-  absl::string_view name() const override { return "xnnpack-ops-rewriter"; }
+  absl::string_view name() const override {
+    return "kernel-selector-ops-rewriter";
+  }
 
   using HloPassInterface::Run;
   absl::StatusOr<bool> Run(
@@ -40,4 +39,4 @@ class XnnPackOpsRewriter : public HloModulePass {
 }  // namespace cpu
 }  // namespace xla
 
-#endif  // XLA_SERVICE_CPU_XNNPACK_OPS_REWRITER_H_
+#endif  // XLA_SERVICE_CPU_KERNEL_SELECTOR_OPS_REWRITER_H_

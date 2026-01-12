@@ -183,6 +183,8 @@ limitations under the License.
 #include "xla/service/cpu/runtime_symbol_generator.h"
 #include "xla/service/cpu/small_while_loop_hoisting_pass.h"
 #include "xla/service/cpu/thunk_emitter.h"
+#include "xla/service/cpu/xnnpack_ops_rewriter.h"
+#include "xla/service/cpu/kernel_selector_ops_rewriter.h"
 #include "xla/service/cpu_gpu_shape_verifier.h"
 #include "xla/service/dump.h"
 #include "xla/service/dynamic_dimension_inference.h"
@@ -235,8 +237,6 @@ limitations under the License.
 #include "tsl/platform/logging.h"  // IWYU pragma: keep
 #include "tsl/profiler/lib/traceme.h"
 #include "tsl/profiler/lib/traceme_encode.h"
-
-#include "xnnpack_ops_rewriter.h"
 
 #ifdef TF_LLVM_X86_AVAILABLE
 #include "llvm/TargetParser/X86TargetParser.h"
@@ -598,6 +598,13 @@ absl::Status CpuCompiler::RunHloPassesThroughLayoutAssn(
       xla::GetDebugOptionsFromFlags().xla_cpu_enable_xnnpack();
   if (enable_xnnpack)
     pipeline.AddPass<XnnPackOpsRewriter>();
+
+  bool use_kernel_selector =
+      xla::GetDebugOptionsFromFlags().xla_cpu_use_kernel_selector();
+  if (use_kernel_selector) {
+    // This pass rewrites hlo.dot into custom calls.
+    pipeline.AddPass<KernelSelectorOpsRewriter>();
+  }
 
   // Expand random number generation.
   pipeline.AddPass<RngExpander>();

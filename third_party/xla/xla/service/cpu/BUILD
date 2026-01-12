@@ -89,6 +89,7 @@ filegroup(
         "runtime_matmul_f64.cc",
         "runtime_matmul_s32.cc",
         "runtime_fork_join.cc",
+        "kernel_selector.cc",
         "//xla/backends/cpu/runtime:runtime_srcs",
         #"runtime_handle_ffi_call.cc", # TODO(b/338344732): Add  "runtime_handle_ffi_call.cc".
     ],
@@ -118,6 +119,7 @@ filegroup(
         "runtime_fork_join.h",
         "runtime_lightweight_check.h",
         "runtime_matmul.h",
+        "kernel_selector.h",
         "//xla/backends/cpu/runtime:runtime_hdrs",
         #"runtime_handle_ffi_call.h", # TODO(b/338344732): Add  "runtime_handle_ffi_call.h"
     ],
@@ -195,7 +197,11 @@ cc_library(
     name = "cpu_compiler_pure",
     srcs = ["cpu_compiler.cc"],
     hdrs = ["cpu_compiler.h"],
-    copts = tsl_copts(),
+    copts = tsl_copts() + select({
+        ":enable_blas_mlir": ["-DENABLE_BLAS_MLIR"],
+        ":disable_blas_mlir": [],
+        "//conditions:default": [],
+    }),
     deps = [
         ":buffer_info_util",
         ":conv_canonicalization",
@@ -221,6 +227,7 @@ cc_library(
         ":thunk_emitter",
         ":xla_framework",
         ":xnnpack_ops_rewriter",
+        ":kernel_selector_ops_rewriter",
         "//xla:cpu_function_runtime",
         "//xla:debug_options_flags",
         "//xla:literal",
@@ -420,7 +427,21 @@ cc_library(
         "@llvm-project//llvm:SystemZCodeGen",  # fixdeps: keep
     ]) + if_llvm_x86_available([
         "@llvm-project//llvm:X86CodeGen",  # fixdeps: keep
-    ]),
+    ]) + select({
+        ":enable_blas_mlir": [":libmlir"],
+        ":disable_blas_mlir": [],
+        "//conditions:default": [],
+    }),
+)
+
+config_setting(
+    name = "enable_blas_mlir",
+    define_values = {"ENABLE_BLAS_MLIR": "true"},
+)
+
+config_setting(
+    name = "disable_blas_mlir",
+    define_values = {"ENABLE_BLAS_MLIR": "false"},
 )
 
 cc_library(
@@ -595,7 +616,11 @@ cc_library(
         "windows_compatibility.h",
     ],
     hdrs = ["runtime_symbol_generator.h"],
-    copts = if_enable_acl(["-DXLA_CPU_USE_ACL=1"]) + tsl_copts(),
+    copts = if_enable_acl(["-DXLA_CPU_USE_ACL=1"]) + tsl_copts() + select({
+        ":enable_blas_mlir": ["-DENABLE_BLAS_MLIR"],
+        ":disable_blas_mlir": [],
+        "//conditions:default": [],
+    }),
     deps = [
         ":cpu_runtime",
         ":onednn_convolution",
@@ -621,6 +646,7 @@ cc_library(
         ":runtime_single_threaded_matmul",
         ":runtime_topk",
         ":xnnpack_ops",
+        ":kernel_selector",
         "//xla/service:custom_call_target_registry",
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/strings:string_view",
@@ -842,8 +868,6 @@ cc_library(
         ":onednn_config_proto_cc",
         ":onednn_memory_util",
         ":parallel_loop_emitter",
-        ":xnnpack_ops_rewriter",
-        ":xnnpack_ops",
         "//xla:literal",
         "//xla:literal_util",
         "//xla:shape_util",
@@ -1108,7 +1132,11 @@ cc_library(
         "cpu_runtime.h",
         "xfeed_manager.h",
     ],
-    copts = runtime_copts(),
+    copts = runtime_copts() + select({
+        ":enable_blas_mlir": ["-DENABLE_BLAS_MLIR"],
+        ":disable_blas_mlir": [],
+        "//conditions:default": [],
+    }),
     deps = [
         ":cpu_executable_run_options",
         "//xla:executable_run_options",
@@ -2201,6 +2229,7 @@ cc_library(
         "xnnpack_ops_rewriter.h",
         "xnnpack_pattern_utils.h",
     ],
+    copts = ["-O3"],
     visibility = ["//visibility:public"],
     deps = [
         "//xla/hlo/ir:hlo",
@@ -2216,9 +2245,50 @@ cc_library(
     name = "xnnpack_ops",
     srcs = ["xnnpack_ops.cc"],
     hdrs = ["xnnpack_ops.h"],
+    copts = ["-O3"],
     visibility = ["//visibility:public"],
     deps = [
         "@XNNPACK",
         "@com_google_absl//absl/base",
     ],
+)
+
+cc_library(
+    name = "kernel_selector",
+    srcs = ["kernel_selector.cc"],
+    hdrs = ["kernel_selector.h"],
+    copts = ["-O3"] + select({
+        ":enable_blas_mlir": ["-DENABLE_BLAS_MLIR"],
+        ":disable_blas_mlir": [],
+        "//conditions:default": [],
+    }),
+    visibility = ["//visibility:public"],
+    deps = [
+        ":runtime_lightweight_check",
+        "//xla:executable_run_options",
+        "@eigen_archive//:eigen3",
+        "@local_tsl//tsl/platform:blocking_counter",
+        "@openblas//:openblas",
+    ],
+)
+
+cc_library(
+    name = "kernel_selector_ops_rewriter",
+    srcs = ["kernel_selector_ops_rewriter.cc"],
+    hdrs = ["kernel_selector_ops_rewriter.h"],
+    copts = ["-O3"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":cpu_runtime",
+        "//xla/hlo/ir:hlo",
+        "//xla:literal_util",
+        "//xla/hlo/pass:hlo_pass",
+    ],
+)
+
+cc_import(
+    name = "libmlir",
+    visibility = ["//visibility:public"],
+    shared_library = "//xla/service/libs:libblas_mlir.so",
+    system_provided = 0
 )

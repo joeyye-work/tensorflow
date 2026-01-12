@@ -100,10 +100,11 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
 #ifdef XLA_CPU_USE_ACL
   opts.set_xla_cpu_use_acl(true);
 #endif
-  opts.set_xla_cpu_use_fusion_emitters(true);
-  opts.set_xla_cpu_use_thunk_runtime(true);
+  opts.set_xla_cpu_use_fusion_emitters(false);
+  opts.set_xla_cpu_use_thunk_runtime(false);
   opts.set_xla_cpu_use_xnnpack(false);
   opts.set_xla_cpu_enable_xnnpack(false);  // For softmax
+  opts.set_xla_cpu_use_kernel_selector(false);
   opts.set_xla_cpu_experimental_xnn_graph_fusion_mode(
       DebugOptions::XNN_GRAPH_FUSION_MODE_DISABLED);
   opts.set_xla_cpu_parallel_codegen_split_count(32);
@@ -1000,6 +1001,11 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       bool_setter_for(&DebugOptions::set_xla_cpu_enable_xnnpack),
       debug_options->xla_cpu_enable_xnnpack(),
       "Enable XNNPACK ops rewriter."));
+  flag_list->push_back(tsl::Flag(
+      "xla_cpu_use_kernel_selector",
+      bool_setter_for(&DebugOptions::set_xla_cpu_use_kernel_selector),
+      debug_options->xla_cpu_use_kernel_selector() ,
+      "Replace dot with custom call to libraries."));
   flag_list->push_back(tsl::Flag(
       "xla_cpu_experimental_xnn_graph_fusion_mode",
       setter_for_xla_cpu_experimental_xnn_graph_fusion_mode,
