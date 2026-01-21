@@ -71,6 +71,7 @@ limitations under the License.
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/framework/types.pb.h"
+#include "tensorflow/core/kernels/batch_size_resource.h"
 #include "tensorflow/core/lib/monitoring/counter.h"
 #include "tensorflow/core/platform/env.h"
 #include "tensorflow/core/platform/errors.h"
@@ -1010,11 +1011,16 @@ void XlaRunOp::Compute(OpKernelContext* ctx) {
 
   MarkForCompilationPassFlags* flags = GetMarkForCompilationPassFlags();
   if (flags->tf_xla_enable_dynamic_sizes) {
-    if (auto s = ctx->session_state()) {
-      run_options.set_batch_size(s->GetBatchSize());
-      VLOG(1) << "run_options.batch_size is set to: "
-              << run_options.batch_size();
-    }
+    BatchSizeResource* bsr = nullptr;
+    ScopedStepContainer* step_container = ctx->step_container();
+
+    OP_REQUIRES_OK(ctx, step_container->Lookup<BatchSizeResource>(
+                            ctx->resource_manager(), BatchSizeResourceName, &bsr));
+
+    run_options.set_batch_size(bsr->GetBatchSize());
+    VLOG(1) << "run_options.batch_size is set to: "
+              << run_options.batch_size() << ". step_id: " << ctx->step_id();
+    bsr->Unref();
   }
 
   // Host callbacks used for HLO send/recv.

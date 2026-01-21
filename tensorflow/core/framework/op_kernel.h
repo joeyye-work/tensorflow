@@ -580,9 +580,6 @@ class OpKernelContext {
   struct Params {
     ~Params() { delete eigen_gpu_device; }
 
-    // batch size
-    int64_t batch_size = 0;
-
     // The step being executed.
     int64_t step_id = 0;
 
@@ -709,9 +706,6 @@ class OpKernelContext {
   };
 
   // params must outlive the OpKernelContext.
-  void set_batch_size (int64_t bs) { params_->batch_size = bs; }
-  int64_t batch_size () const { return params_->batch_size; }
-
   explicit OpKernelContext(Params* params);
   OpKernelContext(Params* params, int num_outputs);
   virtual ~OpKernelContext();
