@@ -2486,6 +2486,217 @@ absl::Status IrEmitter::HandleTopK(HloInstruction* hlo) {
   return absl::OkStatus();
 }
 
+absl::Status IrEmitter::HandleXnnPackSoftMax(HloInstruction* hlo) {
+  const HloInstruction* input = hlo->operand(0);
+  Shape shape = input->shape();
+
+  TF_RETURN_IF_ERROR(EmitTargetAddressForOp(hlo));
+  TF_RET_CHECK(input->shape().element_type() == F32);
+  TF_RET_CHECK(shape.dimensions().size() >= 2);
+
+  TF_ASSIGN_OR_RETURN(const BufferAllocation::Slice input_values_slice,
+                      assignment_.GetUniqueSlice(hlo->operand(0), {}));
+  TF_ASSIGN_OR_RETURN(const BufferAllocation::Slice out_values_slice,
+                      assignment_.GetUniqueSlice(hlo, {}));
+
+  llvm::Value* values_ptr = EmitBufferPointer(input_values_slice, shape);
+  llvm::Value* out_values_ptr = EmitBufferPointer(out_values_slice, shape);
+
+  // Flatten the batches into a single dimension.
+  int channels = shape.dimensions(shape.dimensions().size() - 1);
+  int batch_size = 1;
+  for (int i = 0; i < shape.dimensions().size() - 1; i++)
+    batch_size = batch_size * shape.dimensions(i);
+
+  EmitCallToFunc(runtime::kXnnPackSoftMaxNDSymbolName,
+                 {/*run_options=*/GetExecutableRunOptionsArgument(),
+                  /*input*/ values_ptr,
+                  /*output*/ out_values_ptr,
+                  /*batch_size*/ b()->getInt64(batch_size),
+                  /*channels*/ b()->getInt64(channels)},
+                 b()->getVoidTy());
+
+  return absl::OkStatus();
+}
+
+absl::Status IrEmitter::HandleKernelSelectorArgMax(HloInstruction* hlo) {
+   OpMetadata metadata = hlo->metadata();
+
+  const HloInstruction* in1 = hlo->operand(0);
+  const HloInstruction* in2 = hlo->operand(1);
+  const HloInstruction* in3 = hlo->operand(2);
+  const HloInstruction* in4 = hlo->operand(3);
+
+  Shape shape = in1->shape();
+  TF_RET_CHECK(shape.dimensions().size() == 3);
+
+  TF_RETURN_IF_ERROR(EmitTargetAddressForOp(hlo));
+
+  TF_ASSIGN_OR_RETURN(const BufferAllocation::Slice input1_slice,
+                      assignment_.GetUniqueSlice(in1, {}));
+  TF_ASSIGN_OR_RETURN(const BufferAllocation::Slice input2_slice,
+                      assignment_.GetUniqueSlice(in2, {}));
+  TF_ASSIGN_OR_RETURN(const BufferAllocation::Slice out_values_slice,
+                      assignment_.GetUniqueSlice(hlo, {0}));
+  TF_ASSIGN_OR_RETURN(const BufferAllocation::Slice out_indices_slice,
+                      assignment_.GetUniqueSlice(hlo, {1}));
+
+  llvm::Value* values1_ptr = EmitBufferPointer(input1_slice, in1->shape());
+  llvm::Value* values2_ptr = EmitBufferPointer(input2_slice, in2->shape());
+  llvm::Value* out_values_ptr =
+      EmitBufferPointer(out_values_slice, hlo->shape().tuple_shapes(0));
+  llvm::Value* out_indices_ptr =
+      EmitBufferPointer(out_indices_slice, hlo->shape().tuple_shapes(1));
+
+  float cst1_val = in3->literal().Get<float>({});
+  llvm::Constant* cst1 = llvm::ConstantFP::get(b()->getFloatTy(), cst1_val);
+
+  EmitCallToFunc(
+      metadata.op_name(),
+      {/*run_options=*/GetExecutableRunOptionsArgument(),
+       /*B*/ b()->getInt64(shape.dimensions(0)),
+       /*M*/ b()->getInt64(shape.dimensions(1)),
+       /*N*/ b()->getInt64(shape.dimensions(2)),
+       /*invals*/ BitCast(values1_ptr, b()->getInt32Ty()->getPointerTo()),
+       /*inidxs*/ BitCast(values2_ptr, b()->getInt32Ty()->getPointerTo()),
+       /*init_value*/ cst1,
+       /*init_idx*/ b()->getInt32(in4->literal().Get<int>({})),
+       /*outvals*/ BitCast(out_values_ptr, b()->getFloatTy()->getPointerTo()),
+       /*outidxs*/ BitCast(out_indices_ptr, b()->getInt32Ty()->getPointerTo())},
+      b()->getVoidTy());
+
+  llvm_ir::EmitTuple(GetIrArrayFor(hlo), {out_values_ptr, out_indices_ptr},
+                     b());
+  return absl::OkStatus();
+}
+
+absl::Status IrEmitter::HandleKernelSelectorBlas(HloInstruction* custom_call) {
+  OpMetadata metadata = custom_call->metadata();
+
+  bool isGEMV = (metadata.op_type() == runtime::kKernelSelectorOperationGEMV);
+  bool isGEMM = (metadata.op_type() == runtime::kKernelSelectorOperationGEMM);
+  bool isBATCHMATMUL3D =
+      (metadata.op_type() == runtime::kKernelSelectorOperationBATCH3D);
+  bool isBATCHMATMUL4D =
+      (metadata.op_type() == runtime::kKernelSelectorOperationBATCH4D);
+  bool isBATCHMATMUL = isBATCHMATMUL3D | isBATCHMATMUL4D;
+
+  int operand = 0;
+  std::vector<llvm::Value*> arguments;
+
+  //  |               arguments               |
+  //  |  gemm  |  batch3d |  batch4d | gemv   |
+  //  -----------------------------------------
+  //  |  trA   |  trA     |  trA     |  trA   |
+  //  |  trB   |  trB     |  trB     |        |
+  //  |  A     |  A       |  A       |  A     |
+  //  |  B     |  B       |  B       |  X     |
+  //  |        |          |  Q       |        |
+  //  |        |  P       |  P       |        |
+  //  |  M     |  M       |  M       |  M     |
+  //  |  N     |  N       |  N       |  N     |
+  //  |  K     |  K       |  K       |        |
+  //  |  alpha |          |          |  alpha |
+  //  |  beta  |          |          |  beta  |
+
+  arguments.push_back(/*run_options=*/GetExecutableRunOptionsArgument());
+
+  // trA
+  HloInstruction const* trA = custom_call->operand(operand++);
+  bool tranA = trA->literal().Get<bool>({});
+  arguments.push_back(b()->getInt1(tranA));
+
+  if (isGEMM || isBATCHMATMUL) {
+    // trB
+    HloInstruction const* trB = custom_call->operand(operand++);
+    bool tranB = trB->literal().Get<bool>({});
+    arguments.push_back(b()->getInt1(tranB));
+  }
+
+  // A
+  HloInstruction const* A = custom_call->operand(operand++);
+  TF_ASSIGN_OR_RETURN(const BufferAllocation::Slice a_slice,
+                      assignment_.GetUniqueSlice(A, {}));
+  llvm::Value* A_ptr = EmitBufferPointer(a_slice, A->shape());
+  arguments.push_back(A_ptr);
+
+  // B (or X in GEMV)
+  HloInstruction const* B = custom_call->operand(operand++);
+  TF_ASSIGN_OR_RETURN(const BufferAllocation::Slice b_slice,
+                      assignment_.GetUniqueSlice(B, {}));
+  llvm::Value* B_ptr = EmitBufferPointer(b_slice, B->shape());
+  arguments.push_back(B_ptr);
+
+  if (isBATCHMATMUL) {
+    // Q
+    if (isBATCHMATMUL4D) {
+      HloInstruction const* Q = custom_call->operand(operand++);
+      int q = Q->literal().Get<int>({});
+      arguments.push_back(b()->getInt32(q));
+    }
+
+    // P
+    HloInstruction const* P = custom_call->operand(operand++);
+    int p = P->literal().Get<int>({});
+    arguments.push_back(b()->getInt32(p));
+  }
+
+  // M
+  HloInstruction const* M = custom_call->operand(operand++);
+  int m = M->literal().Get<int>({});
+  arguments.push_back(b()->getInt32(m));
+
+  // N
+  HloInstruction const* N = custom_call->operand(operand++);
+  int n = N->literal().Get<int>({});
+  arguments.push_back(b()->getInt32(n));
+
+  if (isGEMM || isBATCHMATMUL) {
+    // K
+    HloInstruction const* K = custom_call->operand(operand++);
+    int k = K->literal().Get<int>({});
+    arguments.push_back(b()->getInt32(k));
+  }
+
+  float beta = 0.0;
+  if (isGEMM || isGEMV) {
+    // Alpha
+    HloInstruction const* Alpha = custom_call->operand(operand++);
+    float alpha = Alpha->literal().Get<float>({});
+    llvm::Constant* alphaConst = llvm::ConstantFP::get(b()->getFloatTy(), alpha);
+    arguments.push_back(alphaConst);
+
+    // Beta
+    HloInstruction const* Beta = custom_call->operand(operand++);
+    beta = Beta->literal().Get<float>({});
+    llvm::Constant* betaConst = llvm::ConstantFP::get(b()->getFloatTy(), beta);
+    arguments.push_back(betaConst);
+  }
+
+  // C (or Y in GEMV)
+  HloInstruction const* C = custom_call;
+
+  TF_ASSIGN_OR_RETURN(const BufferAllocation::Slice c_slice,
+                      assignment_.GetUniqueSlice(C, {}));
+  llvm::Value* C_ptr = EmitBufferPointer(c_slice, C->shape());
+  arguments.push_back(C_ptr);
+
+  TF_RETURN_IF_ERROR(EmitTargetAddressForOp(custom_call));
+
+  EmitCallToFunc(metadata.op_name(), arguments, b()->getVoidTy());
+
+  return absl::OkStatus();
+}
+
+absl::Status IrEmitter::HandleKernelSelector(HloInstruction* custom_call) {
+  OpMetadata metadata = custom_call->metadata();
+
+  if (metadata.op_type() == runtime::kKernelSelectorOperationARGMAX)
+    return HandleKernelSelectorArgMax(custom_call);
+  else
+    return HandleKernelSelectorBlas(custom_call);
+}
+
 #if defined(INTEL_MKL)
 
 // Emits operands alloca vector for oneDNN custom calls.
@@ -2841,6 +3052,12 @@ absl::Status IrEmitter::HandleCustomCall(HloInstruction* custom_call) {
   }
   if (custom_call->custom_call_target() == "TopK") {
     return HandleTopK(custom_call);
+  }
+  if (custom_call->custom_call_target() == "__xnnpack$softmax") {
+    return HandleXnnPackSoftMax(custom_call);
+  }
+  if (custom_call->custom_call_target() == runtime::kCustomCallKernelSelector) {
+    return HandleKernelSelector(custom_call);
   }
 #if defined(INTEL_MKL)
   if (custom_call->custom_call_target() == "__onednn$matmul") {

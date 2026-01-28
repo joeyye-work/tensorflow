@@ -23,6 +23,7 @@ limitations under the License.
 #include <optional>
 #include <string>
 #include <utility>
+#include <algorithm>
 
 #include "absl/functional/any_invocable.h"
 #include "absl/strings/string_view.h"
@@ -56,6 +57,8 @@ limitations under the License.
 #include "xla/service/cpu/runtime_single_threaded_matmul.h"
 #include "xla/service/cpu/runtime_topk.h"
 #include "xla/service/cpu/windows_compatibility.h"
+#include "xla/service/cpu/xnnpack_ops.h"
+#include "xla/service/cpu/kernel_selector.h"
 #include "xla/service/custom_call_target_registry.h"
 #include "tsl/platform/logging.h"
 
@@ -209,6 +212,27 @@ static bool RegisterKnownJITSymbols() {
   REGISTER_CPU_RUNTIME_SYMBOL(TracingStart);
   REGISTER_CPU_RUNTIME_SYMBOL(TracingEnd);
   REGISTER_CPU_RUNTIME_SYMBOL(HandleFfiCall);
+  REGISTER_CPU_RUNTIME_SYMBOL(XnnPackSoftMaxND);
+  REGISTER_CPU_RUNTIME_SYMBOL(ArgMax3DParallel);
+  REGISTER_CPU_RUNTIME_SYMBOL(ArgMax3DSequential);
+  REGISTER_CPU_RUNTIME_SYMBOL(KernelSelectorGEMMSequential);
+  REGISTER_CPU_RUNTIME_SYMBOL(KernelSelectorGEMMParallel);
+  REGISTER_CPU_RUNTIME_SYMBOL(KernelSelectorBatch3DSequential);
+  REGISTER_CPU_RUNTIME_SYMBOL(KernelSelectorBatch3DParallel);
+  REGISTER_CPU_RUNTIME_SYMBOL(KernelSelectorBatch4DSequential);
+  REGISTER_CPU_RUNTIME_SYMBOL(KernelSelectorBatch4DParallel);
+  REGISTER_CPU_RUNTIME_SYMBOL(KernelSelectorGEMV);
+#ifdef ENABLE_BLAS_MLIR
+  REGISTER_CPU_RUNTIME_SYMBOL(KernelSelectorGEMMMLIR);
+  REGISTER_CPU_RUNTIME_SYMBOL(KernelSelectorBatch3DMLIR);
+  REGISTER_CPU_RUNTIME_SYMBOL(KernelSelectorBatch4DMLIR);
+  REGISTER_CPU_RUNTIME_SYMBOL(KernelSelectorGEMVMLIR);
+#endif  // ENABLE_BLAS_MLIR
+  REGISTER_CPU_RUNTIME_SYMBOL(KernelSelectorGEMVEmpty);
+  REGISTER_CPU_RUNTIME_SYMBOL(KernelSelectorGEMMEmpty);
+  REGISTER_CPU_RUNTIME_SYMBOL(KernelSelectorBatch3DEmpty);
+  REGISTER_CPU_RUNTIME_SYMBOL(KernelSelectorBatch4DEmpty);
+  REGISTER_CPU_RUNTIME_SYMBOL(ArgMax3DEmpty);
 #if defined(INTEL_MKL)
   REGISTER_CPU_RUNTIME_SYMBOL(OneDnnMatMul);
   REGISTER_CPU_RUNTIME_SYMBOL(OneDnnSoftmax);

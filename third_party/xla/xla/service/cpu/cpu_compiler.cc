@@ -183,6 +183,8 @@ limitations under the License.
 #include "xla/service/cpu/runtime_symbol_generator.h"
 #include "xla/service/cpu/small_while_loop_hoisting_pass.h"
 #include "xla/service/cpu/thunk_emitter.h"
+#include "xla/service/cpu/xnnpack_ops_rewriter.h"
+#include "xla/service/cpu/kernel_selector_ops_rewriter.h"
 #include "xla/service/cpu_gpu_shape_verifier.h"
 #include "xla/service/dump.h"
 #include "xla/service/dynamic_dimension_inference.h"
@@ -591,6 +593,12 @@ absl::Status CpuCompiler::RunHloPassesThroughLayoutAssn(
   };
   pipeline.AddPass<OperandUpcaster>(upcaster_filter);
 
+  // For softmax, rewrite to custom calls with XNNPACK targets.
+  bool enable_xnnpack =
+      xla::GetDebugOptionsFromFlags().xla_cpu_enable_xnnpack();
+  if (enable_xnnpack)
+    pipeline.AddPass<XnnPackOpsRewriter>();
+
   // Expand random number generation.
   pipeline.AddPass<RngExpander>();
   pipeline.AddPass<RngBitGeneratorExpander>(RandomAlgorithm::RNG_PHILOX);
@@ -831,6 +839,13 @@ absl::Status CpuCompiler::RunHloPassesAfterLayoutAssn(
 
   pipeline.AddPass<ReshapeDecomposer>();
 
+  bool use_kernel_selector =
+      xla::GetDebugOptionsFromFlags().xla_cpu_use_kernel_selector();
+  if (use_kernel_selector) {
+    // This pass rewrites hlo.dot into custom calls.
+    pipeline.AddPass<KernelSelectorOpsRewriter>();
+  }
+
   const int max_parallelism =
       module->config().intra_op_parallelism_threads() > 0
           ? module->config().intra_op_parallelism_threads()
@@ -863,7 +878,10 @@ absl::Status CpuCompiler::RunHloPassesAfterLayoutAssn(
   }
 
   // Add a fusion pass now that layout assignment is done.
-  pipeline.AddPass<CpuInstructionFusion>();
+  if (getenv("SET_CPU_INS_FUSION_NOT_DUPLICATE") != NULL)
+    pipeline.AddPass<CpuInstructionFusion>(/*may_duplicate=*/false);
+  else
+    pipeline.AddPass<CpuInstructionFusion>(/*may_duplicate=*/true);
   if (is_fusion_emitters) {
     pipeline.AddPass<FusionWrapper>();
   }

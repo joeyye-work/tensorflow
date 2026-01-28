@@ -18,6 +18,7 @@ load("//third_party/shardy:workspace.bzl", shardy = "repo")
 load("//third_party/stablehlo:workspace.bzl", stablehlo = "repo")
 load("//third_party/triton:workspace.bzl", triton = "repo")
 load("//third_party/uv:workspace.bzl", uv = "repo")
+load("//third_party/openblas:workspace.bzl", openblas = "repo")
 
 def _initialize_third_party():
     """ Load third party repositories.  See above load() statements. """
@@ -31,6 +32,7 @@ def _initialize_third_party():
     stablehlo()
     triton()
     uv()
+    openblas()
 
 # Define all external repositories required by TensorFlow
 def _tf_repositories():

@@ -197,6 +197,54 @@ extern const char* const kOneDnnMatMulReorderSymbolName =
     "__xla_cpu_runtime_OneDnnMatMulReorder";
 extern const char* const kHandleFfiCallSymbolName =
     "__xla_cpu_runtime_HandleFfiCall";
+extern const char* const kXnnPackSoftMaxNDSymbolName =
+    "__xla_cpu_runtime_XnnPackSoftMaxND";
+extern const char* const kArgMax3DParallelSymbolName =
+    "__xla_cpu_runtime_ArgMax3DParallel";
+extern const char* const kArgMax3DSequentialSymbolName =
+    "__xla_cpu_runtime_ArgMax3DSequential";
+extern const char* const kKernelSelectorGEMVSymbolName =
+    "__xla_cpu_runtime_KernelSelectorGEMV";
+extern const char* const kKernelSelectorGEMMSequentialSymbolName =
+    "__xla_cpu_runtime_KernelSelectorGEMMSequential";
+extern const char* const kKernelSelectorGEMMParallelSymbolName =
+    "__xla_cpu_runtime_KernelSelectorGEMMParallel";
+extern const char* const kKernelSelectorBatch3DSequentialSymbolName =
+    "__xla_cpu_runtime_KernelSelectorBatch3DSequential";
+extern const char* const kKernelSelectorBatch3DParallelSymbolName =
+    "__xla_cpu_runtime_KernelSelectorBatch3DParallel";
+#ifdef ENABLE_BLAS_MLIR
+extern const char* const kKernelSelectorGEMVMLIRSymbolName =
+    "__xla_cpu_runtime_KernelSelectorGEMVMLIR";
+#endif  // ENABLE_BLAS_MLIR
+extern const char* const kKernelSelectorBatch4DSequentialSymbolName =
+    "__xla_cpu_runtime_KernelSelectorBatch4DSequential";
+extern const char* const kKernelSelectorBatch4DParallelSymbolName =
+    "__xla_cpu_runtime_KernelSelectorBatch4DParallel";
+#ifdef ENABLE_BLAS_MLIR
+extern const char* const kKernelSelectorGEMMMLIRSymbolName =
+    "__xla_cpu_runtime_KernelSelectorGEMMMLIR";
+extern const char* const kKernelSelectorBatch3DMLIRSymbolName =
+    "__xla_cpu_runtime_KernelSelectorBatch3DMLIR";
+extern const char* const kKernelSelectorBatch4DMLIRSymbolName =
+    "__xla_cpu_runtime_KernelSelectorBatch4DMLIR";
+#endif  // ENABLE_BLAS_MLIR
+extern const char* const kKernelSelectorGEMVEmptySymbolName =
+    "__xla_cpu_runtime_KernelSelectorGEMVEmpty";
+extern const char* const kKernelSelectorGEMMEmptySymbolName =
+    "__xla_cpu_runtime_KernelSelectorGEMMEmpty";
+extern const char* const kKernelSelectorBatch3DEmptySymbolName =
+    "__xla_cpu_runtime_KernelSelectorBatch3DEmpty";
+extern const char* const kKernelSelectorBatch4DEmptySymbolName =
+    "__xla_cpu_runtime_KernelSelectorBatch4DEmpty";
+extern const char* const kArgMax3DEmptySymbolName =
+    "__xla_cpu_runtime_ArgMax3DEmpty";
+extern const char* const kKernelSelectorOperationGEMV = "GEMV";
+extern const char* const kKernelSelectorOperationGEMM = "GEMM";
+extern const char* const kKernelSelectorOperationBATCH3D = "BATCH3D";
+extern const char* const kKernelSelectorOperationBATCH4D = "BATCH4D";
+extern const char* const kKernelSelectorOperationARGMAX = "ARGMAX";
+extern const char* const kCustomCallKernelSelector = "KernelSelector";
 
 namespace {
 

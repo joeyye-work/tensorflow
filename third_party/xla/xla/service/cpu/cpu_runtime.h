@@ -97,6 +97,36 @@ extern const char* const kOneDnnLayerNormSymbolName;
 extern const char* const kOneDnnConvolutionSymbolName;
 extern const char* const kOneDnnMatMulReorderSymbolName;
 extern const char* const kHandleFfiCallSymbolName;
+extern const char* const kXnnPackSoftMaxNDSymbolName;
+extern const char* const kArgMax3DParallelSymbolName;
+extern const char* const kArgMax3DSequentialSymbolName;
+extern const char* const kKernelSelectorGEMVSymbolName;
+extern const char* const kKernelSelectorGEMMSequentialSymbolName;
+extern const char* const kKernelSelectorGEMMParallelSymbolName;
+extern const char* const kKernelSelectorBatch3DSequentialSymbolName;
+extern const char* const kKernelSelectorBatch3DParallelSymbolName;
+extern const char* const kKernelSelectorBatch4DSequentialSymbolName;
+extern const char* const kKernelSelectorBatch4DParallelSymbolName;
+#ifdef ENABLE_BLAS_MLIR
+extern const char* const kKernelSelectorGEMVMLIRSymbolName;
+extern const char* const kKernelSelectorGEMMMLIRSymbolName;
+extern const char* const kKernelSelectorBatch3DMLIRSymbolName;
+extern const char* const kKernelSelectorBatch4DMLIRSymbolName;
+#endif  // ENABLE_BLAS_MLIR
+extern const char* const kKernelSelectorGEMVEmptySymbolName;
+extern const char* const kKernelSelectorGEMMEmptySymbolName;
+extern const char* const kKernelSelectorBatch3DEmptySymbolName;
+extern const char* const kKernelSelectorBatch4DEmptySymbolName;
+extern const char* const kArgMax3DEmptySymbolName;
+
+// Kernel selector operation names.
+extern const char* const kKernelSelectorOperationGEMV;
+extern const char* const kKernelSelectorOperationGEMM;
+extern const char* const kKernelSelectorOperationBATCH3D;
+extern const char* const kKernelSelectorOperationBATCH4D;
+extern const char* const kKernelSelectorOperationARGMAX;
+
+extern const char* const kCustomCallKernelSelector;
 
 // All symbol names for XLA CPU runtime functions need to start with this
 // prefix.
