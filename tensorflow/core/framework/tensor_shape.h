@@ -28,7 +28,7 @@ limitations under the License.
 #include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/platform/status.h"
 #include "tensorflow/core/platform/statusor.h"
-#include "xla/shape.h"
+#include "xla/shape_dynexpr.h"
 
 namespace tensorflow {
 
