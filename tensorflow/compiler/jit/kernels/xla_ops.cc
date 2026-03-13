@@ -1097,7 +1097,7 @@ XlaRunOp::XlaRunOp(OpKernelConstruction* ctx)
 void XlaRunOp::Compute(OpKernelContext* ctx) {
   VLOG(3) << "XlaRunOp " << def().name();
   Tensor key_tensor = ctx->input(ctx->num_inputs() - 1);
-
+  std::vector<const Tensor*> inputs = InputsFromContext(ctx);
   bool use_pjrt =
       GetXlaOpsCommonFlags()
           ->tf_xla_use_device_api.IsEnabledInXlaCompileAndRunForDevice(
@@ -1181,22 +1181,54 @@ void XlaRunOp::Compute(OpKernelContext* ctx) {
 
   MarkForCompilationPassFlags* flags = GetMarkForCompilationPassFlags();
   if (flags->tf_xla_enable_dynamic_sizes) {
-    BatchSizeResource* bsr = nullptr;
-    ScopedStepContainer* step_container = ctx->step_container();
-
-    absl::Status st = step_container->Lookup<BatchSizeResource>(
-        ctx->resource_manager(), BatchSizeResourceName, &bsr);
-
-    if (st.ok()) {
-      run_options.set_batch_size(bsr->GetBatchSize());
-      VLOG(1) << "run_options.batch_size is set to: "
-              << run_options.batch_size() << ". step_id: " << ctx->step_id();
-      bsr->Unref();
-
-    } else if (IsNotFound(st)) {
-      VLOG(1) << "Warning: Not found BatchSizeResource in step_container.";
+    bool is_set = false;
+    std::set<int64_t> dyn_vals;
+    for (int i = 0; i < closure.compilation_result()->xla_input_shapes.size(); i++) {
+      const auto& xlaShape = closure.compilation_result()->xla_input_shapes[i];
+      if (!xlaShape.IsArray() || xlaShape.expressions().empty()) continue;
+      for (int dim = 0; dim < xlaShape.expressions().size(); dim++) {
+        xla::DynExpr* expr = xlaShape.expressions(dim);
+        if (expr && expr->is_dynamic()) {
+          int64_t size = inputs[i]->shape().dim_size(dim);
+          int64_t dyn_val = expr->solve(size); // TODO: check if the result is correct later.
+          VLOG(1) << "Found dynamic input, real size is: " << size
+                        << ", dyn_val is " << dyn_val;
+          if (dyn_val == -1) {
+            VLOG(1) << "Warning: Failed to solve the expression";
+            continue;
+          }
+          dyn_vals.insert(dyn_val);
+        }
+      }
+    }
+  
+    if (dyn_vals.size() == 1) {
+      run_options.set_batch_size(*(dyn_vals.begin()));
+      is_set = true;
     } else {
-      OP_REQUIRES_OK(ctx, st);
+      // Found multiple variables
+      VLOG(1) << "Warning: Found multiple variables";
+    }
+    
+    if (!is_set) {
+      // TODO: Fallback to BatchSizeResource for now. Remove it later.
+      BatchSizeResource* bsr = nullptr;
+      ScopedStepContainer* step_container = ctx->step_container();
+
+      absl::Status st = step_container->Lookup<BatchSizeResource>(
+          ctx->resource_manager(), BatchSizeResourceName, &bsr);
+
+      if (st.ok()) {
+        run_options.set_batch_size(bsr->GetBatchSize());
+        VLOG(1) << "run_options.batch_size is set to: "
+                << run_options.batch_size() << ". step_id: " << ctx->step_id();
+        bsr->Unref();
+
+      } else if (IsNotFound(st)) {
+        VLOG(1) << "Warning: Not found BatchSizeResource in step_container.";
+      } else {
+        OP_REQUIRES_OK(ctx, st);
+      }
     }
   }
 
@@ -1228,7 +1260,8 @@ void XlaRunOp::Compute(OpKernelContext* ctx) {
       launch_context.PopulateOutputs(
           ctx, closure.compilation_result(), execution_output->ConsumeResult(),
           /*missing_ctx_input_prefix=*/closure.num_constant_args(),
-          absl::MakeSpan(*variable_infos), input_output_alias, snapshot_ptrs));
+          absl::MakeSpan(*variable_infos), input_output_alias, snapshot_ptrs,
+          &run_options));
 }
 
 XlaMergeOp::XlaMergeOp(OpKernelConstruction* ctx) : OpKernel(ctx) {}

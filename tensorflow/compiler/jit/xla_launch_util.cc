@@ -362,7 +362,8 @@ absl::Status XlaComputationLaunchContext::PopulateOutputs(
     ScopedShapedBuffer output, int missing_ctx_input_prefix,
     absl::Span<VariableInfo> variable_infos,
     const xla::HloInputOutputAliasConfig& input_output_alias,
-    const std::map<int, const Tensor*>& resource_vars) {
+    const std::map<int, const Tensor*>& resource_vars,
+    const xla::ExecutableRunOptions* run_options) {
   se::Stream* stream =
       ctx->op_device_context() ? ctx->op_device_context()->stream() : nullptr;
   Allocator* allocator = ctx->device()->GetAllocator({});
@@ -439,19 +440,28 @@ absl::Status XlaComputationLaunchContext::PopulateOutputs(
       TF_RETURN_IF_ERROR(XLAShapeToTensorShape(subshape, &shape));
       bool has_dynamic = false;
 
-      for(int i = 0 ; i < subshape.expressions().size(); ++i){
-        auto expr = subshape.expressions(i);
-        if (expr->is_dynamic()){
+      for(int dim = 0 ; dim < subshape.expressions().size(); ++dim){
+        auto expr = subshape.expressions(dim);
+        if (expr->is_dynamic()) {
           has_dynamic = true;
-          BatchSizeResource* bsr = nullptr;
-          ScopedStepContainer* step_container = ctx->step_container();
-          TF_RETURN_IF_ERROR(step_container->Lookup<BatchSizeResource>(
-                        ctx->resource_manager(), BatchSizeResourceName, &bsr));
-          xla::DynExpr* batch_size = xla::DynExpr::_(bsr->GetBatchSize());
-          // Just substitute Var(1) for now.
-          xla::DynExpr* subst_expr = expr->substitute(1, batch_size)->s();
-          shape.set_dim(i, subst_expr->get_val());
-          bsr->Unref();
+          VLOG(1) << "Current expression is " << expr;
+          if (run_options) {
+            xla::DynExpr* batch_size = xla::DynExpr::_(run_options->batch_size());
+            xla::DynExpr* subst_expr = expr->substitute(1, batch_size)->s();
+            shape.set_dim(dim, subst_expr->get_val());
+          } else {
+            // TODO: Fallback to BatchSizeResource for now. Remove it later.
+            VLOG(1) << "Warning: Didn't find run_options";
+            BatchSizeResource* bsr = nullptr;
+            ScopedStepContainer* step_container = ctx->step_container();
+            TF_RETURN_IF_ERROR(step_container->Lookup<BatchSizeResource>(
+                          ctx->resource_manager(), BatchSizeResourceName, &bsr));
+            xla::DynExpr* batch_size = xla::DynExpr::_(bsr->GetBatchSize());
+            // Just substitute Var(1) for now.
+            xla::DynExpr* subst_expr = expr->substitute(1, batch_size)->s();
+            shape.set_dim(dim, subst_expr->get_val());
+            bsr->Unref();
+          }
         }
       }
       if (has_dynamic) {
