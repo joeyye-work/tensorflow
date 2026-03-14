@@ -1997,30 +1997,40 @@ class SymbolicShapeRefiner {
       ShapeHandle s = ic->output(out);
 
       if (!ic->RankKnown(s)) {
+        bool recovered_rank = false;
         auto it = node->attr().find("_output_shapes");
-        if (it == node->attr().end() || out >= it->second.list().shape_size()) {
+        if (it != node->attr().end() && out < it->second.list().shape_size()) {
+          const TensorShapeProto& proto = it->second.list().shape(out);
+          if (!proto.unknown_rank()) {
+            std::vector<DimensionHandle> dims;
+            dims.reserve(proto.dim_size());
+
+            for (int d = 0; d < proto.dim_size(); ++d) {
+              int64_t size = proto.dim(d).size();
+              if (size >= 0) {
+                dims.push_back(ic->MakeDim(size));
+              } else {
+                dims.push_back(GetUnknownOutputDim(node, out, d));
+              }
+            }
+            s = ic->MakeShape(dims);
+            ic->set_output(out, s);
+            recovered_rank = true;
+          }
+        }
+
+        if (!recovered_rank && node->op() == "_Arg") {
+          DimensionHandle d0 = GetUnknownOutputDim(node, out, /*dim_id=*/0);
+          ShapeHandle vec = ic->MakeShape({d0});
+          ic->set_output(out, vec);
+          s = vec;
+          recovered_rank = true;
+        }
+
+        if (!recovered_rank) {
           VLOG(1) << "RANK still unknown. " << node->name();
           continue;
         }
-
-        const TensorShapeProto& proto = it->second.list().shape(out);
-        if (proto.unknown_rank()) {
-          continue;
-        }
-
-        std::vector<DimensionHandle> dims;
-        dims.reserve(proto.dim_size());
-
-        for (int d = 0; d < proto.dim_size(); ++d) {
-          int64_t size = proto.dim(d).size();
-          if (size >= 0) {
-            dims.push_back(ic->MakeDim(size));
-          } else {
-            dims.push_back(GetUnknownOutputDim(node, out, d));
-          }
-        }
-        s = ic->MakeShape(dims);
-        ic->set_output(out, s);
       }
 
       if (!ic->RankKnown(s)) {
