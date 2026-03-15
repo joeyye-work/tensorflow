@@ -820,8 +820,13 @@ void LogExpressionsViaGraphProperties(const tensorflow::Graph& graph) {
       const auto& tp = outs[out_idx];
       const TensorShapeProto& shp = tp.shape();
 
-      if (shp.unknown_rank()) continue;
       std::vector<std::unique_ptr<DimExpr>> exprs;
+      if (shp.unknown_rank()) {
+        // Add two dummy variables to represent the unknown rank
+        exprs.push_back(std::make_unique<Variable>(-888));
+        exprs.push_back(std::make_unique<Variable>(-889));
+      }
+
       for (int d = 0; d < shp.dim_size(); ++d) {
         const auto& dim = shp.dim(d);
 
