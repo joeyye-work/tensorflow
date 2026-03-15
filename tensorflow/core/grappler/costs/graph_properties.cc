@@ -2000,7 +2000,7 @@ class SymbolicShapeRefiner {
         bool recovered_rank = false;
         auto it = node->attr().find("_output_shapes");
         if(it != node->attr().end() && out < it->second.list().shape_size()){
-          it = node->attr().find("shapes");
+          it = node->attr().find("shape");
         }
         if (it != node->attr().end() && out < it->second.list().shape_size()) {
           const TensorShapeProto& proto = it->second.list().shape(out);
