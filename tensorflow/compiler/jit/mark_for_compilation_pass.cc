@@ -2079,11 +2079,23 @@ absl::StatusOr<bool> MarkForCompilationPassImpl::TryToContractEdge(
 
   if (debug_options_.cluster_single_dynamic_dim) {
     if (from->dim_vars().size() > 1 || to->dim_vars().size() > 1) {
+      std::string from_str = "from node dim vars: ";
+      for (auto id : from->dim_vars()) {
+        from_str += ", " + std::to_string(id);
+      }
+      std::string to_str = "to node dim vars: ";
+      for (auto id : to->dim_vars()) {
+        to_str += ", " + std::to_string(id);
+      }
+      LOG(INFO) << "The two nodes have multiple dynamic dimensions, from node: " << from->DebugString() << ": " << from_str
+                << ", to node: " << to->DebugString();
       return LogNotContractableAndReturnFalse(
         from, to, "the two nodes have multiple dynamic dimensions");
     }
     if (from->dim_vars().size() == 1 && to->dim_vars().size() == 1 &&
         from->dim_vars() != to->dim_vars()) {
+      LOG(INFO) << "The two nodes have different dynamic dimensions, from node: " << from->DebugString() << ", dim vars: " << from->dim_vars().size() == 1 ? std::to_string(*from->dim_vars().begin()) : "none"
+                    << ", to node: " << to->DebugString() << ", dim vars: " << to->dim_vars().size() == 1 ? std::to_string(*to->dim_vars().begin()) : "none";
       return LogNotContractableAndReturnFalse(
         from, to, "the two nodes have different dynamic dimensions");
     }
