@@ -256,7 +256,6 @@ void LogExpressionsViaGraphProperties(const tensorflow::Graph& graph) {
       const auto& tp = outs[out_idx];
       const TensorShapeProto& shp = tp.shape();
 
-      if (shp.unknown_rank()) continue;
       std::vector<std::unique_ptr<DimExpr>> exprs;
       for (int d = 0; d < shp.dim_size(); ++d) {
         const auto& dim = shp.dim(d);
@@ -273,6 +272,7 @@ void LogExpressionsViaGraphProperties(const tensorflow::Graph& graph) {
 
         ++found;
       }
+      if (shp.dim_size() == 0 && shp.unknown_rank()) continue;
       list_exprs[out_idx] = std::move(exprs);
     }
     expr_map[n.name()] = std::move(list_exprs);
