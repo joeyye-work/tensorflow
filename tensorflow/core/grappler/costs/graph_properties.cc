@@ -2051,6 +2051,18 @@ class SymbolicShapeRefiner {
           dims.push_back(dim);
           continue;
         }
+        auto output_shapes_it = node->attr().find("_output_shapes");
+        if (output_shapes_it != node->attr().end() &&
+            out < output_shapes_it->second.list().shape_size() &&
+            d < output_shapes_it->second.list().shape(out).dim_size()) {
+          const int64_t annotated_size =
+              output_shapes_it->second.list().shape(out).dim(d).size();
+          if (annotated_size >= 0) {
+            changed = true;
+            dims.push_back(ic->MakeDim(annotated_size));
+            continue;
+          }
+        }
         // If already tagged with expr, keep it.
         if (ic->GetDimExpr(dim) != nullptr) {
           dims.push_back(dim);
