@@ -253,6 +253,7 @@ void AllocateAndParseFlags() {
   mark_for_compilation_flags->tf_xla_max_cluster_size =
       std::numeric_limits<int32>::max();
   mark_for_compilation_flags->tf_xla_annotate_cluster_id = false;
+  mark_for_compilation_flags->tf_xla_cluster_single_dynamic_dim = false;
   mark_for_compilation_flags->tf_xla_cluster_parallel = false;
   mark_for_compilation_flags->tf_xla_clustering_debug = false;
   mark_for_compilation_flags->tf_xla_cpu_global_jit = false;
