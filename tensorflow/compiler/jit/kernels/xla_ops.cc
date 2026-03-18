@@ -593,7 +593,7 @@ absl::Status CompileToLocalExecutable(
           if (e->is_dynamic()) {
             int64_t old = shp.dim_size(j);
             old_vars.push_back({i, j, old});
-          shp.set_dim(j, filled_batch);
+            shp.set_dim(j, filled_batch);
             // Necessary because set_dim removes the expression:
             shp.set_expression(j, e);
           }
@@ -605,13 +605,23 @@ absl::Status CompileToLocalExecutable(
           if (arg.constant_value.dtype() == DT_INT32) {
             auto flat = arg.constant_value.flat<int32>();
             int64_t old = flat(0);
-            flat(0) = static_cast<int32>(filled_batch);
-            old_vars.push_back({i, -1, old});
+            // TODO: checking if this constant equals to batch number
+            // is just hacky. It may happen that this constant is not a shape
+            // size but happens to equal to batch number.
+            // The proper way is to have the compiler pass to explicitly
+            // mark which constant argument is used as shape size
+            // and need to be rewritten
+            if (old == old_batch) {
+              flat(0) = static_cast<int32>(filled_batch);
+              old_vars.push_back({i, -1, old});
+            }
           } else if (arg.constant_value.dtype() == DT_INT64) {
             auto flat = arg.constant_value.flat<int64>();
             int64_t old = flat(0);
-            flat(0) = static_cast<int64_t>(filled_batch);
-            old_vars.push_back({i, -1, old});
+            if (old == old_batch) {
+              flat(0) = static_cast<int64_t>(filled_batch);
+              old_vars.push_back({i, -1, old});
+            }
           }
         }
       }
