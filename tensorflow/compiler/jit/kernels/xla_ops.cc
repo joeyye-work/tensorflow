@@ -604,19 +604,28 @@ absl::Status CompileToLocalExecutable(
       }
 
       if (arg.constant_value.dtype() == DT_INT32) {
-        auto flat = arg.constant_value.flat<int32>();
+        const int32 old_value = arg.constant_value.flat<int32>()(0);
         // Heuristic: rewrite only scalar constants whose runtime value matches
         // the observed dynamic batch size.
-        if (flat(0) == dynamic_dim_value) {
-          old_vars.push_back({arg_index, -1, flat(0)});
-          flat(0) = static_cast<int32>(filled_batch);
+        if (old_value == dynamic_dim_value) {
+          // Deep-copy before rewrite so the compile-time patch does not mutate
+          // a Tensor buffer shared with caller-visible inputs.
+          Tensor scalar_copy(arg.constant_value.dtype(),
+                             arg.constant_value.shape());
+          scalar_copy.flat<int32>()(0) = old_value;
+          arg.constant_value = std::move(scalar_copy);
+          arg.constant_value.flat<int32>()(0) =
+              static_cast<int32>(filled_batch);
         }
       } else if (arg.constant_value.dtype() == DT_INT64) {
-        auto flat = arg.constant_value.flat<int64_t>();
+        const int64_t old_value = arg.constant_value.flat<int64_t>()(0);
         // Same heuristic for int64 scalar constants.
-        if (flat(0) == dynamic_dim_value) {
-          old_vars.push_back({arg_index, -1, flat(0)});
-          flat(0) = filled_batch;
+        if (old_value == dynamic_dim_value) {
+          Tensor scalar_copy(arg.constant_value.dtype(),
+                             arg.constant_value.shape());
+          scalar_copy.flat<int64_t>()(0) = old_value;
+          arg.constant_value = std::move(scalar_copy);
+          arg.constant_value.flat<int64_t>()(0) = filled_batch;
         }
       }
     };
@@ -624,6 +633,8 @@ absl::Status CompileToLocalExecutable(
     // restore the original runtime sizes after compilation. Some scalar
     // constants are actually runtime batch sizes folded by earlier TF passes,
     // so rewrite only those that match the detected dynamic runtime value.
+    // Scalar constants are deep-copied before rewrite so the change stays
+    // local to norm_args and does not require restoration.
     if (filled_batch) {
       for (int i = 0; i < norm_args.size(); ++i) {
         TensorShape& shp = std::get<TensorShape>(norm_args[i].shape);
@@ -646,17 +657,6 @@ absl::Status CompileToLocalExecutable(
     // Restore the original runtime dimensions after compilation.
     if (filled_batch) {
       for (const auto& old_var : old_vars) {
-        if (old_var.dyn_dim == -1) {
-          auto& arg = norm_args[old_var.arg_index];
-          if (arg.constant_value.dtype() == DT_INT32) {
-            arg.constant_value.flat<int32>()(0) =
-                static_cast<int32>(old_var.old_value);
-          } else if (arg.constant_value.dtype() == DT_INT64) {
-            arg.constant_value.flat<int64_t>()(0) = old_var.old_value;
-          }
-          continue;
-        }
-
         TensorShape& shp =
             std::get<TensorShape>(norm_args[old_var.arg_index].shape);
         shp.set_dim(old_var.dyn_dim, old_var.old_value);
