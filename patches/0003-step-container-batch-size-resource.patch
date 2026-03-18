@@ -1,0 +1,537 @@
+diff --git a/tensorflow/compiler/jit/device_compilation_profiler.cc b/tensorflow/compiler/jit/device_compilation_profiler.cc
+index 5e1b3b26e8e..f8a742ccc01 100644
+--- a/tensorflow/compiler/jit/device_compilation_profiler.cc
++++ b/tensorflow/compiler/jit/device_compilation_profiler.cc
+@@ -21,6 +21,7 @@ limitations under the License.
+ #include <utility>
+ 
+ #include "absl/strings/str_cat.h"
++#include "tensorflow/compiler/jit/flags.h"
+ #include "tensorflow/compiler/jit/xla_activity.pb.h"
+ #include "tensorflow/compiler/jit/xla_activity_listener.h"
+ #include "tensorflow/core/framework/attr_value.pb.h"
+@@ -32,9 +33,30 @@ limitations under the License.
+ namespace tensorflow {
+ namespace {
+ bool ShouldBeMegamorphic(int64_t compile_count, int64_t execution_count) {
+-  const int64_t kCompileThreshold = 10;
++  int64_t kCompileThreshold = 10;
+   const int64_t kMinExecutionsPerCompile = 50;
+ 
++  int64_t tf_xla_threshold_for_megamorphic =
++      GetMarkForCompilationPassFlags()->tf_xla_threshold_for_megamorphic;
++
++  // Negative values other that -1 cannot be used
++  if (tf_xla_threshold_for_megamorphic < -1) {
++    LOG(FATAL) << "The value for the tf_xla_threshold_for_megamorphic flag "
++               << "is out of range.\n"
++               << "Allowed ranges are (-1) to "
++               << std::numeric_limits<int64_t>::max()
++               << " got " << tf_xla_threshold_for_megamorphic << ".";
++  }
++
++  // -1: setting clusters as Megamorphic is disabled
++  //  0 Default behaviour in Tensorflow
++  //  Any other number sets the compilation threshold
++  if (tf_xla_threshold_for_megamorphic == -1) {
++    return false;
++  } else if (tf_xla_threshold_for_megamorphic > 0) {
++    kCompileThreshold = tf_xla_threshold_for_megamorphic;
++  }
++
+   // This heuristic is trying to capture the following property: have we sunk a
+   // certain minimum amount of compile time into the cluster that didn't quite
+   // "pay off"?
+diff --git a/tensorflow/compiler/jit/flags.cc b/tensorflow/compiler/jit/flags.cc
+index b3b383d7530..5d8a1904ab4 100644
+--- a/tensorflow/compiler/jit/flags.cc
++++ b/tensorflow/compiler/jit/flags.cc
+@@ -187,6 +187,11 @@ void AppendMarkForCompilationPassFlagsInternal(std::vector<Flag>* flag_list) {
+            &mark_for_compilation_flags->tf_xla_persistent_cache_prefix,
+            "Specifies the persistance cache prefix. Default is "
+            "\"xla_compile_cache\""),
++     Flag("tf_xla_threshold_for_megamorphic",
++           &mark_for_compilation_flags->tf_xla_threshold_for_megamorphic,
++           "Sets the threshold for marking a cluster megamorphic. "
++           "Setting it to -1 disables marking clusters megamorphic."
++           "Setting it to 0 uses the default behaviour of TensorFlow."),
+       Flag("tf_xla_sparse_core_disable_table_stacking",
+            &sparse_core_flags->tf_xla_sparse_core_disable_table_stacking,
+            "Disable table stacking for all the tables passed to the SparseCore"
+@@ -250,6 +255,7 @@ void AllocateAndParseFlags() {
+   mark_for_compilation_flags->tf_xla_cpu_global_jit = false;
+   mark_for_compilation_flags->tf_xla_clustering_fuel =
+       std::numeric_limits<int64_t>::max();
++  mark_for_compilation_flags->tf_xla_threshold_for_megamorphic = 0;
+   mark_for_compilation_flags
+       ->tf_xla_disable_deadness_safety_checks_for_debugging = false;
+   mark_for_compilation_flags
+diff --git a/tensorflow/compiler/jit/flags.h b/tensorflow/compiler/jit/flags.h
+index ebb6b7a5181..971dd8a7a38 100644
+--- a/tensorflow/compiler/jit/flags.h
++++ b/tensorflow/compiler/jit/flags.h
+@@ -120,6 +120,11 @@ struct MarkForCompilationPassFlags {
+ 
+   // Specifies the persistance cache prefix. Default is "xla_compile_cache"
+   string tf_xla_persistent_cache_prefix;
++
++  // Sets the threshold for marking a cluster megamorphic.
++  // Setting it to -1 disables marking clusters megamorphic.
++  // Setting it to 0 uses the default behaviour of TensorFlow.
++  int64_t tf_xla_threshold_for_megamorphic;
+ };
+ 
+ // Flags associated with XLA Sparse Core.
+diff --git a/tensorflow/compiler/jit/kernels/xla_ops.cc b/tensorflow/compiler/jit/kernels/xla_ops.cc
+index 42264a4df28..f6917448a7b 100644
+--- a/tensorflow/compiler/jit/kernels/xla_ops.cc
++++ b/tensorflow/compiler/jit/kernels/xla_ops.cc
+@@ -65,6 +65,7 @@ limitations under the License.
+ #include "xla/tsl/concurrency/async_value_ref.h"
+ #include "xla/tsl/protobuf/error_codes.pb.h"
+ #include "tensorflow/core/framework/allocator.h"
++#include "tensorflow/core/framework/batch_size_resource.h"
+ #include "tensorflow/core/framework/node_def_util.h"
+ #include "tensorflow/core/framework/op_kernel.h"
+ #include "tensorflow/core/framework/op_requires.h"
+@@ -1010,10 +1011,22 @@ void XlaRunOp::Compute(OpKernelContext* ctx) {
+ 
+   MarkForCompilationPassFlags* flags = GetMarkForCompilationPassFlags();
+   if (flags->tf_xla_enable_dynamic_sizes) {
+-    if (auto s = ctx->session_state()) {
+-      run_options.set_batch_size(s->GetBatchSize());
++    BatchSizeResource* bsr = nullptr;
++    ScopedStepContainer* step_container = ctx->step_container();
++
++    absl::Status st = step_container->Lookup<BatchSizeResource>(
++        ctx->resource_manager(), BatchSizeResourceName, &bsr);
++
++    if (st.ok()) {
++      run_options.set_batch_size(bsr->GetBatchSize());
+       VLOG(1) << "run_options.batch_size is set to: "
+-              << run_options.batch_size();
++              << run_options.batch_size() << ". step_id: " << ctx->step_id();
++      bsr->Unref();
++
++    } else if (IsNotFound(st)) {
++      VLOG(1) << "Warning: Not found BatchSizeResource in step_container.";
++    } else {
++      OP_REQUIRES_OK(ctx, st);
+     }
+   }
+ 
+diff --git a/tensorflow/compiler/jit/xla_launch_util.cc b/tensorflow/compiler/jit/xla_launch_util.cc
+index 588161df309..3f0e5df76b8 100644
+--- a/tensorflow/compiler/jit/xla_launch_util.cc
++++ b/tensorflow/compiler/jit/xla_launch_util.cc
+@@ -47,6 +47,7 @@ limitations under the License.
+ #include "tensorflow/core/common_runtime/gpu/gpu_serving_device_selector.h"
+ #include "tensorflow/core/common_runtime/gpu_device_context.h"
+ #include "tensorflow/core/framework/allocator.h"
++#include "tensorflow/core/framework/batch_size_resource.h"
+ #include "tensorflow/core/framework/op.h"
+ #include "tensorflow/core/framework/op_kernel.h"
+ #include "tensorflow/core/framework/resource_mgr.h"
+@@ -430,10 +431,32 @@ absl::Status XlaComputationLaunchContext::PopulateOutputs(
+     }
+   } else {
+     for (int i = 0; i < ctx->num_outputs(); ++i) {
+-      output_tensor_shapes.push_back(compilation_result->outputs[i].shape);
++      xla::Shape output_host_shape = output.on_host_shape();
++      const xla::Shape& subshape = xla::ShapeUtil::GetSubshape(output_host_shape, {i});
++      VLOG(2) << "PopulateOutputs: subshape[" << i << "]: "<< subshape;
++      TensorShape shape;
++      TF_RETURN_IF_ERROR(XLAShapeToTensorShape(subshape, &shape));
++      if (subshape.outer_multiplier() > 0) {
++        BatchSizeResource* bsr = nullptr;
++        ScopedStepContainer* step_container = ctx->step_container();
++        TF_RETURN_IF_ERROR(step_container->Lookup<BatchSizeResource>(
++                       ctx->resource_manager(), BatchSizeResourceName, &bsr));
++        auto bsm = bsr->GetBatchSize() * subshape.outer_multiplier() ;
++        shape.set_dim(0, bsm);
++        output_tensor_shapes.push_back(shape);
++        bsr->Unref();
++      }
++      else {
++        output_tensor_shapes.push_back(compilation_result->outputs[i].shape);
++      }
+     }
+   }
+ 
++  VLOG(2) << "output_tensor_shapes:";
++  for (auto s:output_tensor_shapes) {
++    VLOG(2) << s;
++  }
++
+   // Copy XLA results to the OpOutputList.
+   int output_num = 0;
+   for (int i = 0, end = ctx->num_outputs(); i < end; ++i) {
+diff --git a/tensorflow/core/framework/BUILD b/tensorflow/core/framework/BUILD
+index 09142e303e3..711c148aec9 100644
+--- a/tensorflow/core/framework/BUILD
++++ b/tensorflow/core/framework/BUILD
+@@ -62,6 +62,7 @@ package(
+ exports_files(
+     srcs = [
+         "allocator_registry.h",
++        "batch_size_resource.h",
+         "collective.h",
+         "control_flow.h",
+         "dataset.h",
+@@ -195,6 +196,7 @@ filegroup(
+         "allocator.h",
+         "allocator_registry.h",
+         "attr_value_util.h",
++        "batch_size_resource.h",
+         "bfloat16.h",
+         "bounds_check.h",
+         "cancellation.h",
+diff --git a/tensorflow/core/framework/batch_size_resource.h b/tensorflow/core/framework/batch_size_resource.h
+new file mode 100644
+index 00000000000..e457b65e329
+--- /dev/null
++++ b/tensorflow/core/framework/batch_size_resource.h
+@@ -0,0 +1,16 @@
++#include "tensorflow/core/framework/resource_mgr.h"
++
++namespace tensorflow {
++const string BatchSizeResourceName = "BatchSizeResource_";
++class BatchSizeResource : public ResourceBase {
++  public:
++    ~BatchSizeResource() override {
++      VLOG(1) << "BatchSizeResource destroyed with batch size: " << batch_size_;
++    }
++    string DebugString() const override { return BatchSizeResourceName; }
++    void SetBatchSize(size_t s) { batch_size_ = s; }
++    size_t GetBatchSize() { return batch_size_; }
++  private:
++    size_t batch_size_ = 0;
++};
++}
+diff --git a/tensorflow/core/framework/op_kernel.h b/tensorflow/core/framework/op_kernel.h
+index a36d1cacc53..66864b4f97b 100644
+--- a/tensorflow/core/framework/op_kernel.h
++++ b/tensorflow/core/framework/op_kernel.h
+@@ -580,9 +580,6 @@ class OpKernelContext {
+   struct Params {
+     ~Params() { delete eigen_gpu_device; }
+ 
+-    // batch size
+-    int64_t batch_size = 0;
+-
+     // The step being executed.
+     int64_t step_id = 0;
+ 
+@@ -709,9 +706,6 @@ class OpKernelContext {
+   };
+ 
+   // params must outlive the OpKernelContext.
+-  void set_batch_size (int64_t bs) { params_->batch_size = bs; }
+-  int64_t batch_size () const { return params_->batch_size; }
+-
+   explicit OpKernelContext(Params* params);
+   OpKernelContext(Params* params, int num_outputs);
+   virtual ~OpKernelContext();
+diff --git a/tensorflow/core/framework/session_state.h b/tensorflow/core/framework/session_state.h
+index 01029063848..d102e153c00 100644
+--- a/tensorflow/core/framework/session_state.h
++++ b/tensorflow/core/framework/session_state.h
+@@ -43,17 +43,12 @@ class SessionState {
+ 
+   static const char* kTensorHandleResourceTypeName;
+ 
+-  int64_t GetBatchSize(void) { return batch_size_; }
+-  void SetBatchSize(int64_t bs) { batch_size_ = bs; }
+-
+  private:
+   mutex state_lock_;
+ 
+   // For generating unique ids for tensors stored in the session.
+   int64_t tensor_id_ = 0;
+ 
+-  int64_t batch_size_ = 0;
+-
+   // The live tensors in the session. A map from tensor handle to tensor.
+   std::unordered_map<string, Tensor> tensors_;
+ };
+diff --git a/tensorflow/core/grappler/optimizers/remapper.cc b/tensorflow/core/grappler/optimizers/remapper.cc
+index a5a48347f07..c468801a6a7 100644
+--- a/tensorflow/core/grappler/optimizers/remapper.cc
++++ b/tensorflow/core/grappler/optimizers/remapper.cc
+@@ -741,6 +741,16 @@ bool IsBiasSemanticAdd(const RemapperContext& ctx,
+   return false;
+ }
+ 
++bool MaybeCopyOutputShapesAttr(const NodeDef& from, NodeDef* fused_op) {
++  const string output_shape_attr_name = "_output_shapes";
++  if (from.attr().count(output_shape_attr_name) > 0) {
++    auto shape_attrs = from.attr().at(output_shape_attr_name);
++    AddNodeAttr(output_shape_attr_name, shape_attrs, fused_op);
++    return true;
++  }
++  return false;
++}
++
+ void AddInputShapesAttr(const RemapperContext& ctx, int node_index) {
+   auto mutable_node = ctx.graph_view.graph()->mutable_node(node_index);
+ 
+@@ -3334,6 +3344,7 @@ absl::Status AddFusedContractionNode(RemapperContext* ctx,
+   }
+ 
+   SetFusedOpAttributes(&fused_op, {"BiasAdd"});
++  MaybeCopyOutputShapesAttr(bias_add, &fused_op);
+   utils::Mutation* mutation = ctx->graph_view.GetMutationBuilder();
+   absl::Status status;
+   mutation->AddNode(std::move(fused_op), &status);
+@@ -3439,6 +3450,7 @@ absl::Status AddFusedContractionNode(
+   }
+ 
+   SetFusedOpAttributes(&fused_op, {"BiasAdd", activation.op()});
++  MaybeCopyOutputShapesAttr(activation, &fused_op);
+ 
+   utils::Mutation* mutation = ctx->graph_view.GetMutationBuilder();
+   absl::Status status;
+@@ -3630,6 +3642,7 @@ absl::Status AddFusedContractionNode(
+   }
+ 
+   SetFusedOpAttributes(&contraction_node, {"BiasAdd", "Add"}, 2);
++  MaybeCopyOutputShapesAttr(add, &contraction_node);
+ 
+   utils::Mutation* mutation = ctx->graph_view.GetMutationBuilder();
+   absl::Status status;
+@@ -3729,6 +3742,7 @@ absl::Status AddFusedContractionNode(
+   }
+ 
+   SetFusedOpAttributes(&fused_conv, {"BiasAdd", "Add", activation.op()}, 2);
++  MaybeCopyOutputShapesAttr(add, &fused_conv);
+ 
+   utils::Mutation* mutation = ctx->graph_view.GetMutationBuilder();
+   absl::Status status;
+diff --git a/tensorflow/core/kernels/function_ops.cc b/tensorflow/core/kernels/function_ops.cc
+index 2124ac9ff96..eec275448c5 100644
+--- a/tensorflow/core/kernels/function_ops.cc
++++ b/tensorflow/core/kernels/function_ops.cc
+@@ -24,6 +24,7 @@ limitations under the License.
+ #include "tensorflow/core/common_runtime/gradients.h"
+ #include "tensorflow/core/common_runtime/graph_constructor.h"
+ #include "tensorflow/core/common_runtime/memory_types.h"
++#include "tensorflow/core/framework/batch_size_resource.h"
+ #include "tensorflow/core/framework/cancellation.h"
+ #include "tensorflow/core/framework/full_type.pb.h"
+ #include "tensorflow/core/framework/full_type_util.h"
+@@ -42,6 +43,13 @@ static constexpr const char* const kGradientOp =
+ ArgOp::ArgOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
+   OP_REQUIRES_OK(ctx, ctx->GetAttr("T", &dtype_));
+   OP_REQUIRES_OK(ctx, ctx->GetAttr("index", &index_));
++
++  Status s = ctx->GetAttr("_is_batch", &is_batch_);
++  if (IsNotFound(s)) {
++    is_batch_ = false;
++  } else {
++    OP_REQUIRES_OK(ctx, s);
++  }
+ }
+ 
+ void ArgOp::Compute(OpKernelContext* ctx) {
+@@ -71,40 +79,29 @@ void ArgOp::Compute(OpKernelContext* ctx) {
+     ctx->set_output(0, *val);
+   }
+   if (is_batch_) {
+-    SessionState * ss = ctx->session_state();
+-    if (ss) {
+-      int64_t cur_val = ss->GetBatchSize();
+-      // Current batch size in the Session state can have 3 conditions:
+-      // == 0: initial value. Can be set to the newly found batch size
+-      // >0: previously set batch size exist.
+-      // < 0: conflict detected already. Do nothing
+-      // Batch size conflict is detected if in the same session but different
+-      // Arg operators get different batch sizes. To be conservtive once
+-      // conflict is detected the session batch size will always be -1
+-      if (cur_val == 0) {
+-        int64_t batch_size = val->dim_size(0);
+-        ss->SetBatchSize(batch_size);
+-        ctx->set_batch_size(batch_size);
+-        VLOG(4) << "Setting batch size of SessionState to " << batch_size;
+-      }
+-      else if (cur_val > 0) {
+-        int64_t batch_size = val->dim_size(0);
+-        int64_t ctx_batch_size = ctx->batch_size();
+-        VLOG(4) << "Context batch_size: " << ctx_batch_size << " new batch size: " << batch_size;
+-        if (ctx_batch_size == 0 || batch_size == ctx_batch_size) {
+-          ss->SetBatchSize(batch_size);
+-          ctx->set_batch_size(batch_size);
+-          VLOG(4) << "Setting batch size of SessionState to " << batch_size;
+-        }
+-        else {
+-          // In this case batch size of the same context don't agree. We cannot
+-          // Assume any batch size
+-          ss->SetBatchSize(-1);
+-          VLOG(4) << "Conflict detected. Setting batch size of SessionState to " << -1;
+-        }
+-      }
+-      // else if cur_val < 0: do nothing
++    BatchSizeResource* bsr = nullptr;
++    ScopedStepContainer* step_container = ctx->step_container();
++
++    OP_REQUIRES_OK(ctx, step_container->LookupOrCreate<BatchSizeResource>(
++                            ctx->resource_manager(), BatchSizeResourceName, &bsr,
++                            [](BatchSizeResource** ret) -> Status {
++                              *ret = new BatchSizeResource();
++                              return OkStatus();
++                            }));
++
++    const int64_t batch_size = val->dim_size(0);
++    if (bsr->GetBatchSize() == 0) {
++      bsr->SetBatchSize(batch_size);
++      VLOG(1) << "Set batch_size from 0 to " << batch_size
++              << ". step_id: " << ctx->step_id();
++    } else if (bsr->GetBatchSize() != batch_size) {
++      VLOG(1) << "Warning: Set batch_size from " << bsr->GetBatchSize()
++              << ". step_id: " << ctx->step_id();
++      bsr->SetBatchSize(batch_size);
++    } else {
++      VLOG(1) << "batch_size already set to " << batch_size;
+     }
++    bsr->Unref();
+   }
+ }
+ 
+diff --git a/third_party/xla/xla/service/cpu/cpu_executable.cc b/third_party/xla/xla/service/cpu/cpu_executable.cc
+index e161f760a5d..a215511c5ab 100644
+--- a/third_party/xla/xla/service/cpu/cpu_executable.cc
++++ b/third_party/xla/xla/service/cpu/cpu_executable.cc
+@@ -377,13 +377,15 @@ absl::StatusOr<ExecutionOutput> CpuExecutable::CreateResultShapedBuffer(
+     absl::Span<MaybeOwningDeviceMemory> buffers,
+     absl::Span<ExecutionInput> arguments) {
+   se::Stream* stream = run_options->stream();
+-  ExecutionOutput result(/*on_device_shape=*/result_shape(),
+-                         run_options->allocator(),
+-                         stream->parent()->device_ordinal());
+   const HloInputOutputAliasConfig& input_output_alias =
+       module().input_output_alias_config();
+   HloInstruction* root = hlo_module_->entry_computation()->root_instruction();
+   const Shape& root_shape = root->shape();
++  // Use root_shape to initialize ExecutionOuput as the batch multiplier info
++  // is only attached the ROOT
++  ExecutionOutput result(/*on_device_shape=*/root_shape, //result_shape(),
++                         run_options->allocator(),
++                         stream->parent()->device_ordinal());
+ 
+   // Move se::OwningDeviceMemory values which contain the array(s) of the result
+   // into the respective location in ScopedShapedBuffer which is returned to the
+diff --git a/third_party/xla/xla/service/layout_assignment.cc b/third_party/xla/xla/service/layout_assignment.cc
+index b7bea1e5570..b5adc212b53 100644
+--- a/third_party/xla/xla/service/layout_assignment.cc
++++ b/third_party/xla/xla/service/layout_assignment.cc
+@@ -2571,7 +2571,7 @@ absl::Status LayoutAssignment::PropagateComputationLayouts(
+     *result_layout = computed_computation_layout.result_layout();
+   } else {
+     TF_RET_CHECK(
+-        Shape::Equal().IgnoreDynamicDimension().MinorToMajorOnlyInLayout()(
++        Shape::Equal().IgnoreDynamicDimension().MinorToMajorOnlyInLayout().IgnoreBatch()(
+             computed_computation_layout.result_layout().shape(),
+             result_layout->shape()));
+   }
+diff --git a/third_party/xla/xla/shape.cc b/third_party/xla/xla/shape.cc
+index 1cee38146fb..dbfe4d185dc 100644
+--- a/third_party/xla/xla/shape.cc
++++ b/third_party/xla/xla/shape.cc
+@@ -136,6 +136,7 @@ absl::StatusOr<Shape> Shape::FromProto(const ShapeProto& shape_proto) {
+     TF_ASSIGN_OR_RETURN(*shape.mutable_layout(),
+                         Layout::FromProto(shape_proto.layout()));
+   }
++  shape.set_outer_multiplier(shape_proto.batch_multiplier());
+   return shape;
+ }
+ 
+@@ -163,6 +164,7 @@ ShapeProto Shape::ToProto() const {
+     proto.mutable_tuple_shapes()->Reserve(1);
+     *proto.add_tuple_shapes() = state->buffer_shape[0].ToProto();
+   }
++  proto.set_batch_multiplier(outer_multiplier());
+   return proto;
+ }
+ 
+@@ -509,6 +511,10 @@ bool Shape::Equal::operator()(const Shape& lhs, const Shape& rhs) {
+            rhs.is_unbounded_dynamic_dimension(i))) {
+         continue;
+       }
++      if (i == 0 && ignore_batch_ && (lhs.outer_multiplier() > 0 || rhs.outer_multiplier() > 0)) {
++        VLOG(3) << "CompareShapes: batch dimension found. Forcely compatible";
++        continue;
++      }
+       if (lhs.dimensions(i) != rhs.dimensions(i)) {
+         VLOG(3) << "CompareShapes: lhs dimensions != rhs dimensions";
+         return false;
+diff --git a/third_party/xla/xla/shape.h b/third_party/xla/xla/shape.h
+index d9dc14ad4de..a53297d18ec 100644
+--- a/third_party/xla/xla/shape.h
++++ b/third_party/xla/xla/shape.h
+@@ -434,6 +434,10 @@ class Shape {
+ 
+     bool operator()(const Shape& lhs, const Shape& rhs);
+ 
++    Equal& IgnoreBatch(bool ignore_batch = true) {
++      ignore_batch_ = ignore_batch;
++      return *this;
++    }
+     Equal& IgnoreLayout(bool ignore_layout = true) {
+       ignore_layout_ = ignore_layout;
+       return *this;
+@@ -488,6 +492,7 @@ class Shape {
+     }
+ 
+    private:
++    bool ignore_batch_ = false;
+     bool ignore_layout_ = false;
+     bool ignore_tiles_in_layout_ = false;
+     bool ignore_element_size_in_layout_ = false;
+diff --git a/third_party/xla/xla/shape_util.cc b/third_party/xla/xla/shape_util.cc
+index 4f92ce19adb..e0a327e29e5 100644
+--- a/third_party/xla/xla/shape_util.cc
++++ b/third_party/xla/xla/shape_util.cc
+@@ -753,6 +753,11 @@ Shape ShapeUtil::PrependMajorDimension(int64_t bound, Shape shape) {
+     return;
+   }
+   PrintHumanString(printer, shape);
++  if (shape.outer_multiplier() > 0) {
++    printer->Append("(bm=");
++    printer->Append(shape.outer_multiplier());
++    printer->Append(")");
++  }
+   if (!shape.IsArray()) return;
+   if (!shape.has_layout()) return;
+   if (IsScalar(shape)) {
+@@ -811,6 +816,10 @@ Shape ShapeUtil::PrependMajorDimension(int64_t bound, Shape shape) {
+                                             const Shape& rhs) {
+   if (!SameRank(lhs, rhs)) return false;
+   for (int i = 0; i < lhs.dimensions().size(); ++i) {
++      if (i == 0 && (lhs.outer_multiplier() > 0 || rhs.outer_multiplier() > 0)) {
++        VLOG(3) << "CompareShapes: batch dimension found. Forcely compatible";
++        continue;
++      }
+     if (!lhs.is_unbounded_dynamic_dimension(i) &&
+         !rhs.is_unbounded_dynamic_dimension(i) &&
+         lhs.dimensions(i) != rhs.dimensions(i)) {
+@@ -826,7 +835,7 @@ Shape ShapeUtil::PrependMajorDimension(int64_t bound, Shape shape) {
+ }
+ 
+ /* static */ bool ShapeUtil::Compatible(const Shape& lhs, const Shape& rhs) {
+-  return Shape::Equal().IgnoreDynamicDimension().IgnoreLayout()(lhs, rhs);
++  return Shape::Equal().IgnoreDynamicDimension().IgnoreLayout().IgnoreBatch()(lhs, rhs);
+ }
+ 
+ /* static */ bool ShapeUtil::CompatibleIgnoringElementType(const Shape& lhs,
+diff --git a/third_party/xla/xla/xla_data.proto b/third_party/xla/xla/xla_data.proto
+index 98462a4f6eb..85ad79ae841 100644
+--- a/third_party/xla/xla/xla_data.proto
++++ b/third_party/xla/xla/xla_data.proto
+@@ -361,6 +361,8 @@ message ShapeProto {
+   // The layout used to back this shape.
+   LayoutProto layout = 5;
+ 
++  int64 batch_multiplier = 7;
++
+   // Important: if any field is added, be sure to modify ShapeUtil::Equal(),
+   // ShapeUtil::Compatible() and Shape::Hash() appropriately to account for the
+   // new field.

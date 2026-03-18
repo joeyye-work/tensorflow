@@ -1,0 +1,2216 @@
+diff --git a/tensorflow/compiler/jit/encapsulate_subgraphs_pass.cc b/tensorflow/compiler/jit/encapsulate_subgraphs_pass.cc
+index 1dc719ccea7..31f3246f4b1 100644
+--- a/tensorflow/compiler/jit/encapsulate_subgraphs_pass.cc
++++ b/tensorflow/compiler/jit/encapsulate_subgraphs_pass.cc
+@@ -256,7 +256,6 @@ void LogExpressionsViaGraphProperties(const tensorflow::Graph& graph) {
+       const auto& tp = outs[out_idx];
+       const TensorShapeProto& shp = tp.shape();
+ 
+-      if (shp.unknown_rank()) continue;
+       std::vector<std::unique_ptr<DimExpr>> exprs;
+       for (int d = 0; d < shp.dim_size(); ++d) {
+         const auto& dim = shp.dim(d);
+@@ -265,14 +264,15 @@ void LogExpressionsViaGraphProperties(const tensorflow::Graph& graph) {
+         if (expr.node_type_case() == ExpressionProto::NODE_TYPE_NOT_SET)
+           continue;
+ 
+-        VLOG(1) << "Node " << n.name() << " has expression "
+-                << ExprProtoToString(expr);
++        VLOG(1) << "Node " << n.name() << " is inferred to have expression "
++                << ExprProtoToString(expr) << " on dimension #" << d;
+ 
+         auto ex = ExprFromProto(expr);
+         exprs.push_back(std::move(ex));
+ 
+         ++found;
+       }
++      if (shp.dim_size() == 0 && shp.unknown_rank()) continue;
+       list_exprs[out_idx] = std::move(exprs);
+     }
+     expr_map[n.name()] = std::move(list_exprs);
+@@ -680,14 +680,16 @@ absl::Status Encapsulator::Subgraph::RecordArg(
+         ExpressionProto* eproto = tsp->add_expressions();
+         ExprToProto(ee, eproto);
+       }
+-        builder.Attr("_output_shapes", {*tsp});
++      VLOG(1) << "Adding following output shapes for node " << src_node->name()
++              << " : " << tsp->DebugString();
++      builder.Attr("_output_shapes", {*tsp});
+     } else {
+       // if cluster argument is the real argument.
+-      auto build_attr = attrs.FindByString("_is_batch");
++      auto build_attr = attrs.FindByString("_dynamic_dim");
+       if (build_attr) {
+         VLOG(1) << "Found Dynamic dimension in " << src_node->name() << ":"
+                 << src_slot;
+-          builder.Attr("_dynamic_dim", 0);
++        builder.Attr("_dynamic_dim", *build_attr);
+       }
+     }
+     absl::Status s = builder.Finalize(&arg_def);
+diff --git a/tensorflow/compiler/jit/flags.cc b/tensorflow/compiler/jit/flags.cc
+index 5d8a1904ab4..2ca5b09ff99 100644
+--- a/tensorflow/compiler/jit/flags.cc
++++ b/tensorflow/compiler/jit/flags.cc
+@@ -110,10 +110,13 @@ void AppendMarkForCompilationPassFlagsInternal(std::vector<Flag>* flag_list) {
+            "Maximum number of operators in an XLA compilation."),
+       Flag("tf_xla_annotate_cluster_id",
+            &mark_for_compilation_flags->tf_xla_annotate_cluster_id,
+-           "Allow operator names to influence clustering scheume."
++           "Allow operator names to influence clustering scheme."
+            "Operators whose name starting with .cluster.{id} will likely"
+            "to be clustered together if the ids are the same number. "
+            ".cluster.none will not be clustered with those having numbered id"),
++      Flag("tf_xla_cluster_single_dynamic_dim",
++           &mark_for_compilation_flags->tf_xla_cluster_single_dynamic_dim,
++           "Only allow clustering of a single dynamic dimension."),
+       Flag("tf_xla_cluster_parallel",
+            &mark_for_compilation_flags->tf_xla_cluster_parallel,
+            "Split parallel compute subgraph info different clusters"),
+@@ -250,6 +253,7 @@ void AllocateAndParseFlags() {
+   mark_for_compilation_flags->tf_xla_max_cluster_size =
+       std::numeric_limits<int32>::max();
+   mark_for_compilation_flags->tf_xla_annotate_cluster_id = false;
++  mark_for_compilation_flags->tf_xla_cluster_single_dynamic_dim = false;
+   mark_for_compilation_flags->tf_xla_cluster_parallel = false;
+   mark_for_compilation_flags->tf_xla_clustering_debug = false;
+   mark_for_compilation_flags->tf_xla_cpu_global_jit = false;
+diff --git a/tensorflow/compiler/jit/flags.h b/tensorflow/compiler/jit/flags.h
+index 971dd8a7a38..93fdc016860 100644
+--- a/tensorflow/compiler/jit/flags.h
++++ b/tensorflow/compiler/jit/flags.h
+@@ -125,6 +125,8 @@ struct MarkForCompilationPassFlags {
+   // Setting it to -1 disables marking clusters megamorphic.
+   // Setting it to 0 uses the default behaviour of TensorFlow.
+   int64_t tf_xla_threshold_for_megamorphic;
++
++  bool tf_xla_cluster_single_dynamic_dim;  // New flag for single dynamic dim clustering
+ };
+ 
+ // Flags associated with XLA Sparse Core.
+diff --git a/tensorflow/compiler/jit/kernels/xla_ops.cc b/tensorflow/compiler/jit/kernels/xla_ops.cc
+index 5b9c6500ce2..e18cd6cdc20 100644
+--- a/tensorflow/compiler/jit/kernels/xla_ops.cc
++++ b/tensorflow/compiler/jit/kernels/xla_ops.cc
+@@ -497,9 +497,9 @@ absl::Status CompileToLocalExecutable(
+ 
+   MarkForCompilationPassFlags* flags = GetMarkForCompilationPassFlags();
+   if (flags->tf_xla_enable_dynamic_sizes) {
+-    // Rewriting the argument with the magic number if they have dynamic
+-    // dimension, detecting dynamic dimension via _is_batch attr in the
+-    // argument.
++    // Rewriting the argument with expressions if they have dynamic
++    // dimension, detecting dynamic dimension via either _dynamic_dim or
++    // _output_shapes attr in the argument.
+     std::vector<XlaCompiler::Argument> norm_args(args.begin(), args.end());
+     int64_t filled_batch = 0;
+     int64_t old_batch = 0;
+@@ -593,7 +593,7 @@ absl::Status CompileToLocalExecutable(
+           if (e->is_dynamic()) {
+             int64_t old = shp.dim_size(j);
+             old_vars.push_back({i, j, old});
+-          shp.set_dim(j, filled_batch);
++            shp.set_dim(j, filled_batch);
+             // Necessary because set_dim removes the expression:
+             shp.set_expression(j, e);
+           }
+@@ -605,13 +605,23 @@ absl::Status CompileToLocalExecutable(
+           if (arg.constant_value.dtype() == DT_INT32) {
+             auto flat = arg.constant_value.flat<int32>();
+             int64_t old = flat(0);
+-            flat(0) = static_cast<int32>(filled_batch);
+-            old_vars.push_back({i, -1, old});
++            // TODO: checking if this constant equals to batch number
++            // is just hacky. It may happen that this constant is not a shape
++            // size but happens to equal to batch number.
++            // The proper way is to have the compiler pass to explicitly
++            // mark which constant argument is used as shape size
++            // and need to be rewritten
++            if (old == old_batch) {
++              flat(0) = static_cast<int32>(filled_batch);
++              old_vars.push_back({i, -1, old});
++            }
+           } else if (arg.constant_value.dtype() == DT_INT64) {
+             auto flat = arg.constant_value.flat<int64>();
+             int64_t old = flat(0);
+-            flat(0) = static_cast<int64_t>(filled_batch);
+-            old_vars.push_back({i, -1, old});
++            if (old == old_batch) {
++              flat(0) = static_cast<int64_t>(filled_batch);
++              old_vars.push_back({i, -1, old});
++            }
+           }
+         }
+       }
+@@ -1097,7 +1107,6 @@ XlaRunOp::XlaRunOp(OpKernelConstruction* ctx)
+ void XlaRunOp::Compute(OpKernelContext* ctx) {
+   VLOG(3) << "XlaRunOp " << def().name();
+   Tensor key_tensor = ctx->input(ctx->num_inputs() - 1);
+-
+   bool use_pjrt =
+       GetXlaOpsCommonFlags()
+           ->tf_xla_use_device_api.IsEnabledInXlaCompileAndRunForDevice(
+@@ -1181,22 +1190,64 @@ void XlaRunOp::Compute(OpKernelContext* ctx) {
+ 
+   MarkForCompilationPassFlags* flags = GetMarkForCompilationPassFlags();
+   if (flags->tf_xla_enable_dynamic_sizes) {
+-    BatchSizeResource* bsr = nullptr;
+-    ScopedStepContainer* step_container = ctx->step_container();
+-
+-    absl::Status st = step_container->Lookup<BatchSizeResource>(
+-        ctx->resource_manager(), BatchSizeResourceName, &bsr);
+-
+-    if (st.ok()) {
+-      run_options.set_batch_size(bsr->GetBatchSize());
+-      VLOG(1) << "run_options.batch_size is set to: "
+-              << run_options.batch_size() << ". step_id: " << ctx->step_id();
+-      bsr->Unref();
+-
+-    } else if (IsNotFound(st)) {
+-      VLOG(1) << "Warning: Not found BatchSizeResource in step_container.";
++    bool is_set = false;
++    std::set<int64_t> dyn_vals;
++    const auto* comp_result = closure.compilation_result();
++    const int num_constant_args = closure.num_constant_args();
++    for (int i = 0; i < comp_result->xla_input_shapes.size(); i++) {
++      const auto& xla_shape = closure.compilation_result()->xla_input_shapes[i];
++      if (!xla_shape.IsArray() || xla_shape.expressions().empty()) continue;
++
++      for (int dim = 0; dim < xla_shape.expressions().size(); dim++) {
++        xla::DynExpr* expr = xla_shape.expressions(dim);
++        if (expr && expr->is_dynamic()) {
++          int input_idx = comp_result->input_mapping[i] - num_constant_args;
++          if (input_idx < 0 || input_idx >= ctx->num_inputs()) {
++            VLOG(1) << "Warning: Input index is out of range";
++            continue;
++          }
++          VLOG(1) << "input shape is " << ctx->input(input_idx).shape()
++                  << ", corresponding xla input shape is " << xla_shape;
++          int64_t size = ctx->input(input_idx).shape().dim_size(dim);
++          int64_t dyn_val = expr->solve(size); // TODO: check if the result is correct later.
++          VLOG(1) << "Found dynamic input. Real size is: " << size
++                        << ", solved dynamic value is " << dyn_val;
++          if (dyn_val == -1) {
++            VLOG(1) << "Warning: Failed to solve the expression";
++            continue;
++          }
++          dyn_vals.insert(dyn_val);
++        }
++      }
++    }
++  
++    if (dyn_vals.size() == 1) {
++      run_options.set_batch_size(*(dyn_vals.begin()));
++      is_set = true;
+     } else {
+-      OP_REQUIRES_OK(ctx, st);
++      // Found multiple variables
++      VLOG(1) << "Warning: Found multiple variables";
++    }
++    
++    if (!is_set) {
++      // TODO: Fallback to BatchSizeResource for now. Remove it later.
++      BatchSizeResource* bsr = nullptr;
++      ScopedStepContainer* step_container = ctx->step_container();
++
++      absl::Status st = step_container->Lookup<BatchSizeResource>(
++          ctx->resource_manager(), BatchSizeResourceName, &bsr);
++
++      if (st.ok()) {
++        run_options.set_batch_size(bsr->GetBatchSize());
++        VLOG(1) << "run_options.batch_size is set to: "
++                << run_options.batch_size() << ". step_id: " << ctx->step_id();
++        bsr->Unref();
++
++      } else if (IsNotFound(st)) {
++        VLOG(1) << "Warning: Not found BatchSizeResource in step_container.";
++      } else {
++        OP_REQUIRES_OK(ctx, st);
++      }
+     }
+   }
+ 
+@@ -1228,7 +1279,8 @@ void XlaRunOp::Compute(OpKernelContext* ctx) {
+       launch_context.PopulateOutputs(
+           ctx, closure.compilation_result(), execution_output->ConsumeResult(),
+           /*missing_ctx_input_prefix=*/closure.num_constant_args(),
+-          absl::MakeSpan(*variable_infos), input_output_alias, snapshot_ptrs));
++          absl::MakeSpan(*variable_infos), input_output_alias, snapshot_ptrs,
++          &run_options));
+ }
+ 
+ XlaMergeOp::XlaMergeOp(OpKernelConstruction* ctx) : OpKernel(ctx) {}
+diff --git a/tensorflow/compiler/jit/mark_for_compilation_pass.cc b/tensorflow/compiler/jit/mark_for_compilation_pass.cc
+index 0b33abc4612..ba3925d1956 100644
+--- a/tensorflow/compiler/jit/mark_for_compilation_pass.cc
++++ b/tensorflow/compiler/jit/mark_for_compilation_pass.cc
+@@ -135,6 +135,8 @@ class MarkForCompilationPassImpl {
+     int annotate_cluster_id;
+ 
+     bool enable_cluster_parallel;
++
++    bool cluster_single_dynamic_dim;  // New flag to control single dynamic dim clustering
+   };
+ 
+   MarkForCompilationPassImpl(DebugOptions debug_options, Graph* graph,
+@@ -261,9 +263,12 @@ class MarkForCompilationPassImpl {
+     void set_annotated_id(int id) { annotated_id_ = id; }
+     int chain_id() const {return chain_id_;}
+     void set_chain_id(int id) {chain_id_ = id;}
++    void add_dim_var(int dim_var) { dim_vars_.insert(dim_var); }
++    const std::set<int>& dim_vars() const { return dim_vars_; }
+ 
+    private:
+     int annotated_id_ = -1;
++    std::set<int> dim_vars_;
+     int chain_id_ = -1;
+     int cluster_size_ = 1;
+     int cycles_graph_node_id_;
+@@ -337,6 +342,7 @@ class MarkForCompilationPassImpl {
+   }
+ 
+   absl::Status AssignAnnotatedClusterIDs();
++  absl::Status AssignDimVars();
+   void collectInputNodes(std::set<Node*> &path_nodes);
+   void collectMergeNodes(const std::vector<Node*>& nodeSet,
+                          std::set<Node*> &merger_nodes);
+@@ -680,6 +686,171 @@ absl::Status IgnoreResourceOpForSafetyAnalysis(
+   }
+   return absl::OkStatus();
+ }
++// node mapping to multiple vectors of expressions (one for each output in
++// order)
++static std::map<std::string, std::vector<std::vector<std::unique_ptr<DimExpr>>>>
++    expr_map;
++// Helper to convert ExpressionProto to a readable string.
++std::string ExprProtoToString(const ExpressionProto& e) {
++  switch (e.node_type_case()) {
++    case ExpressionProto::kConstantValue:
++      return std::to_string(e.constant_value());
++    case ExpressionProto::kVariableId:
++      return absl::StrCat("Var(", e.variable_id(), ")");
++    case ExpressionProto::kAddNode:
++      return absl::StrCat("(", ExprProtoToString(e.add_node().lhs()), " + ",
++                         ExprProtoToString(e.add_node().rhs()), ")");
++    case ExpressionProto::kSubNode:
++      return absl::StrCat("(", ExprProtoToString(e.sub_node().lhs()), " - ",
++                         ExprProtoToString(e.sub_node().rhs()), ")");
++    case ExpressionProto::kMulNode:
++      return absl::StrCat("(", ExprProtoToString(e.mul_node().lhs()), " * ",
++                         ExprProtoToString(e.mul_node().rhs()), ")");
++    case ExpressionProto::kDivNode:
++      return absl::StrCat("(", ExprProtoToString(e.div_node().lhs()), " / ",
++                         ExprProtoToString(e.div_node().rhs()), ")");
++    default:
++      return "<none>";
++  }
++}
++
++std::unique_ptr<DimExpr> ExprFromProto(const ExpressionProto& proto) {
++  switch (proto.node_type_case()) {
++    case ExpressionProto::kConstantValue:
++      return DimExpr::Cons(proto.constant_value());
++    case ExpressionProto::kVariableId:
++      return DimExpr::Var(proto.variable_id());
++    case ExpressionProto::kAddNode: {
++      auto lhs = ExprFromProto(proto.add_node().lhs());
++      auto rhs = ExprFromProto(proto.add_node().rhs());
++      // Note: These are owning pointers, but ExprAdd takes raw pointers.
++      // The caller must manage lifetime appropriately.
++      return std::make_unique<ExprAdd>(lhs.release(), rhs.release());
++    }
++    case ExpressionProto::kSubNode: {
++      auto lhs = ExprFromProto(proto.sub_node().lhs());
++      auto rhs = ExprFromProto(proto.sub_node().rhs());
++      return std::make_unique<ExprSub>(lhs.release(), rhs.release());
++    }
++    case ExpressionProto::kMulNode: {
++      auto lhs = ExprFromProto(proto.mul_node().lhs());
++      auto rhs = ExprFromProto(proto.mul_node().rhs());
++      return std::make_unique<ExprMul>(lhs.release(), rhs.release());
++    }
++    case ExpressionProto::kDivNode: {
++      auto lhs = ExprFromProto(proto.div_node().lhs());
++      auto rhs = ExprFromProto(proto.div_node().rhs());
++      return std::make_unique<ExprDiv>(lhs.release(), rhs.release());
++    }
++    case ExpressionProto::NODE_TYPE_NOT_SET:
++    default:
++      return nullptr;
++  }
++}
++
++static xla::DynExpr* DimExprToDynExpr(const DimExpr* e) {
++  switch (e->kind()) {
++    case DimExpr::Kind::kConstant: {
++      auto* ac = static_cast<const Constant*>(e);
++      return xla::DynExpr::_(ac->value());
++    }
++    case DimExpr::Kind::kVariable: {
++      auto* av = static_cast<const Variable*>(e);
++      return xla::DynExpr::V(av->id());  // Use 1 all the time for now
++    }
++    case DimExpr::Kind::kAdd: {
++      auto* ee = static_cast<const ExprAdd*>(e);
++      return *DimExprToDynExpr(ee->lhs()) + *DimExprToDynExpr(ee->rhs());
++    }
++    case DimExpr::Kind::kSub: {
++      auto* ee = static_cast<const ExprSub*>(e);
++      return *DimExprToDynExpr(ee->lhs()) - *DimExprToDynExpr(ee->rhs());
++    }
++    case DimExpr::Kind::kMul: {
++      auto* ee = static_cast<const ExprMul*>(e);
++      return *DimExprToDynExpr(ee->lhs()) * *DimExprToDynExpr(ee->rhs());
++    }
++    case DimExpr::Kind::kDiv: {
++      auto* ee = static_cast<const ExprDiv*>(e);
++      return *DimExprToDynExpr(ee->lhs()) / *DimExprToDynExpr(ee->rhs());
++    }
++  }
++  return nullptr;
++}
++
++// Runs Grappler static inference and logs any ExpressionProto found in output
++// tensor shapes (from GraphProperties, not from _output_shapes attrs).
++void LogExpressionsViaGraphProperties(const tensorflow::Graph& graph) {
++  using tensorflow::ExpressionProto;
++  using tensorflow::GraphDef;
++  using tensorflow::NodeDef;
++  using tensorflow::TensorShapeProto;
++  using tensorflow::grappler::GraphProperties;
++  using tensorflow::grappler::GrapplerItem;
++
++  GraphDef graph_def;
++  graph.ToGraphDef(&graph_def);
++
++  GrapplerItem item;
++  item.id = "mark_for_compilation_pass_expr_dump";
++  item.graph = graph_def;
++
++  GraphProperties props(item);
++
++  absl::Status st = props.InferStatically(
++      /*assume_valid_feeds=*/false,
++      /*aggressive_shape_inference=*/false,
++      /*include_input_tensor_values=*/false,
++      /*include_output_tensor_values=*/false);
++
++  if (!st.ok()) {
++    LOG(ERROR) << "[EXPR][GP] InferStatically failed: " << st.message();
++    return;
++  }
++
++  int found = 0;
++  VLOG(1) << "[EXPR][GP] === GraphProperties output expr dump ===";
++
++
++  for (const NodeDef& n : graph_def.node()) {
++    if (!props.HasOutputProperties(n.name())) continue;
++    const auto& outs = props.GetOutputProperties(n.name());
++    std::vector<std::vector<std::unique_ptr<DimExpr>>> list_exprs(outs.size());
++    for (int out_idx = 0; out_idx < static_cast<int>(outs.size()); ++out_idx) {
++      const auto& tp = outs[out_idx];
++      const TensorShapeProto& shp = tp.shape();
++
++      std::vector<std::unique_ptr<DimExpr>> exprs;
++      for (int d = 0; d < shp.dim_size(); ++d) {
++        const auto& dim = shp.dim(d);
++
++        const ExpressionProto& expr = dim.expr();
++        if (expr.node_type_case() == ExpressionProto::NODE_TYPE_NOT_SET)
++          continue;
++
++        VLOG(1) << "Node " << n.name() << " has expression "
++                << ExprProtoToString(expr);
++
++        auto ex = ExprFromProto(expr);
++        exprs.push_back(std::move(ex));
++
++        ++found;
++      }
++      if (shp.dim_size() == 0 && shp.unknown_rank()) {
++        // Add two dummy variables to represent the unknown rank
++        exprs.push_back(std::make_unique<Variable>(-888));
++        exprs.push_back(std::make_unique<Variable>(-889));
++      }
++
++      list_exprs[out_idx] = std::move(exprs);
++    }
++    expr_map[n.name()] = std::move(list_exprs);
++
++  }
++
++  VLOG(1) << "[EXPR][GP] === Found " << found
++          << " expressions via GraphProperties ===";
++}
+ 
+ absl::StatusOr<bool> MarkForCompilationPassImpl::Initialize() {
+   TF_RET_CHECK(!initialized_ && !edges_contracted_ && !clusters_created_);
+@@ -721,6 +892,10 @@ absl::StatusOr<bool> MarkForCompilationPassImpl::Initialize() {
+   if (debug_options_.annotate_cluster_id) {
+     TF_RETURN_IF_ERROR(AssignAnnotatedClusterIDs());
+   }
++  if (debug_options_.cluster_single_dynamic_dim) {
++    LogExpressionsViaGraphProperties(*graph_);
++    TF_RETURN_IF_ERROR(AssignDimVars());
++  }
+   if (debug_options_.enable_cluster_parallel) {
+     TF_RETURN_IF_ERROR(AssignParallelChains());
+   }
+@@ -1626,6 +1801,56 @@ absl::Status MarkForCompilationPassImpl::AssignAnnotatedClusterIDs(void) {
+   return absl::OkStatus();
+ }
+ 
++absl::Status MarkForCompilationPassImpl::AssignDimVars(void) {
++  for (Node* node : graph_->nodes()) {
++    auto node_name = node->name();
++    Cluster * cluster = GetClusterForNode(node);
++    if (!cluster) continue;
++    for (const tensorflow::Edge* edge : node->in_edges()) {
++      if (edge->IsControlEdge()) {
++          // Skip control edges if you are only interested in data edges
++          continue;
++      }
++
++      const tensorflow::Node* input = edge->src(); // Source node of the edge
++      auto it = expr_map.find(input->name());
++      if (it == expr_map.end()) {
++        VLOG(2) << "No expression found for node " << input->name();
++        continue;
++      }
++
++      auto output_index = edge->src_output(); // Output index of the source node
++      if (output_index >= (it->second).size()) {
++        LOG(INFO) << "Warning: Output index " << output_index << " is out of bounds for node " << input->name();
++        continue;
++      }
++      for (auto& pDim: (it->second)[output_index]) {
++        DimExpr * d= pDim.get();
++        xla::DynExpr * dyn = DimExprToDynExpr(d);
++        auto new_ids = dyn->get_all_ids();
++        for (auto id : new_ids) {
++          cluster->add_dim_var(id);
++          VLOG(2) << "Add dim var " << id << " to cluster of node "<< node_name;
++        }
++      }
++    }
++    // create a for loop for each dim vars in cluster and print each dim var
++    if (VLOG_IS_ON(2)) {
++      if (cluster->dim_vars().empty()) {
++        VLOG(2) << "Cluster of node " << node_name << " has no dim vars.";
++      }
++      else {
++        std::string id_str;
++        for (auto id : cluster->dim_vars()) {
++          id_str += "Dim var " + std::to_string(id) + ", ";
++        }
++        VLOG(2) << "Cluster of node " << node_name << " has dim vars:\n" << id_str;
++      }
++    }
++  }
++  return absl::OkStatus();
++}
++
+ bool MarkForCompilationPassImpl::LogNotContractableAndReturnFalse(
+     Cluster* from, Cluster* to, absl::string_view reason) {
+   VLOG(3) << EdgeContractionFailureMsg(from, to, reason);
+@@ -1852,6 +2077,33 @@ absl::StatusOr<bool> MarkForCompilationPassImpl::TryToContractEdge(
+         from, to, "the two nodes do not have same annotated ids");
+   }
+ 
++  if (debug_options_.cluster_single_dynamic_dim) {
++    if (from->dim_vars().size() > 1 || to->dim_vars().size() > 1) {
++      std::string from_str = "from_vars: ";
++      for (auto id : from->dim_vars()) {
++        from_str += std::to_string(id) + ", ";
++      }
++      std::string to_str = "to_vars: ";
++      for (auto id : to->dim_vars()) {
++        to_str += std::to_string(id) + ", ";
++      }
++      return LogNotContractableAndReturnFalse(
++        from, to, absl::StrCat("the two nodes have multiple dynamic dimensions: ",
++        from_str, " and ", to_str));
++    }
++    if (from->dim_vars().size() == 1 && to->dim_vars().size() == 1 &&
++        from->dim_vars() != to->dim_vars()) {
++      return LogNotContractableAndReturnFalse(
++        from, to,
++        absl::StrCat("the two nodes have different dynamic dimensions: ",
++                     from->dim_vars().size() == 1
++                       ? std::to_string(*from->dim_vars().begin()) : "none",
++                     " and ",
++                     to->dim_vars().size() == 1
++                       ? std::to_string(*to->dim_vars().begin()) : "none"));
++    }
++  }
++
+   TF_ASSIGN_OR_RETURN(bool devices_compatible,
+                       AreDevicesCompatible(*from, *to));
+   if (!devices_compatible) {
+@@ -2248,6 +2500,8 @@ absl::Status MarkForCompilationPass::Run(
+   debug_options.dump_graphs = flags->tf_xla_clustering_debug;
+   debug_options.annotate_cluster_id = flags->tf_xla_annotate_cluster_id;
+   debug_options.enable_cluster_parallel = flags->tf_xla_cluster_parallel;
++  debug_options.cluster_single_dynamic_dim =
++      flags->tf_xla_cluster_single_dynamic_dim;  // Updated option name
+ 
+   return MarkForCompilation(options, debug_options);
+ }
+diff --git a/tensorflow/compiler/jit/xla_batch_matcher.cc b/tensorflow/compiler/jit/xla_batch_matcher.cc
+index 1e30b055497..3cea1b8a3d1 100644
+--- a/tensorflow/compiler/jit/xla_batch_matcher.cc
++++ b/tensorflow/compiler/jit/xla_batch_matcher.cc
+@@ -90,13 +90,13 @@ void XlaBatchMatcher::print_all_batches() {
+ void XlaBatchMatcher::parse_env_config() {
+   // If the env var not set or is empty, filled with the nearest power of two by default
+   if (!env_str_) {
+-    LOG(INFO) << "[XLA_BATCH_WARN] Env var " << "--tf_xla_compile_batch_sizes" <<
++    VLOG(2) << "[XLA_BATCH_WARN] Env var " << "--tf_xla_compile_batch_sizes" <<
+       " not set, filled with the nearest power of two by default";
+     return;
+   }
+ 
+   if (std::string(env_str_).empty()) {
+-    LOG(INFO) << "[XLA_BATCH_WARN] Env var " << "--tf_xla_compile_batch_sizes" <<
++    VLOG(2) << "[XLA_BATCH_WARN] Env var " << "--tf_xla_compile_batch_sizes" <<
+         "is empty, filled with the nearest power of two by default";
+     return;
+   }
+@@ -176,10 +176,10 @@ int64_t XlaBatchMatcher::get_xla_compile_batch(int64_t real_batch) {
+   int64_t selected = find_min_larger_batch(real_batch);
+   if (real_batch != last_batch_ || all_batches_.empty()) {
+     last_batch_ = real_batch;
+-    LOG(INFO) << "[XLA_BATCH_INFO] Real batch: " << real_batch
++    VLOG(2) << "[XLA_BATCH_INFO] Real batch: " << real_batch
+       << " -> Selected compile batch: " << selected;
+   }
+   return selected;
+ }
+ 
+-}  // namespace tensorflow
+\ No newline at end of file
++}  // namespace tensorflow
+diff --git a/tensorflow/compiler/jit/xla_launch_util.cc b/tensorflow/compiler/jit/xla_launch_util.cc
+index a045280b48b..06196e8d78f 100644
+--- a/tensorflow/compiler/jit/xla_launch_util.cc
++++ b/tensorflow/compiler/jit/xla_launch_util.cc
+@@ -362,7 +362,8 @@ absl::Status XlaComputationLaunchContext::PopulateOutputs(
+     ScopedShapedBuffer output, int missing_ctx_input_prefix,
+     absl::Span<VariableInfo> variable_infos,
+     const xla::HloInputOutputAliasConfig& input_output_alias,
+-    const std::map<int, const Tensor*>& resource_vars) {
++    const std::map<int, const Tensor*>& resource_vars,
++    const xla::ExecutableRunOptions* run_options) {
+   se::Stream* stream =
+       ctx->op_device_context() ? ctx->op_device_context()->stream() : nullptr;
+   Allocator* allocator = ctx->device()->GetAllocator({});
+@@ -439,19 +440,28 @@ absl::Status XlaComputationLaunchContext::PopulateOutputs(
+       TF_RETURN_IF_ERROR(XLAShapeToTensorShape(subshape, &shape));
+       bool has_dynamic = false;
+ 
+-      for(int i = 0 ; i < subshape.expressions().size(); ++i){
+-        auto expr = subshape.expressions(i);
+-        if (expr->is_dynamic()){
++      for (int dim = 0; dim < subshape.expressions().size(); ++dim) {
++        auto expr = subshape.expressions(dim);
++        if (expr != nullptr && expr->is_dynamic()) {
+           has_dynamic = true;
+-          BatchSizeResource* bsr = nullptr;
+-          ScopedStepContainer* step_container = ctx->step_container();
+-          TF_RETURN_IF_ERROR(step_container->Lookup<BatchSizeResource>(
+-                        ctx->resource_manager(), BatchSizeResourceName, &bsr));
+-          xla::DynExpr* batch_size = xla::DynExpr::_(bsr->GetBatchSize());
+-          // Just substitute Var(1) for now.
+-          xla::DynExpr* subst_expr = expr->substitute(1, batch_size)->s();
+-          shape.set_dim(i, subst_expr->get_val());
+-          bsr->Unref();
++          VLOG(1) << "Current expression is " << expr;
++          if (run_options) {
++            xla::DynExpr* batch_size = xla::DynExpr::_(run_options->batch_size());
++            xla::DynExpr* subst_expr = expr->substitute(1, batch_size)->s();
++            shape.set_dim(dim, subst_expr->get_val());
++          } else {
++            // TODO: Fallback to BatchSizeResource for now. Remove it later.
++            VLOG(1) << "Warning: Didn't find run_options";
++            BatchSizeResource* bsr = nullptr;
++            ScopedStepContainer* step_container = ctx->step_container();
++            TF_RETURN_IF_ERROR(step_container->Lookup<BatchSizeResource>(
++                          ctx->resource_manager(), BatchSizeResourceName, &bsr));
++            xla::DynExpr* batch_size = xla::DynExpr::_(bsr->GetBatchSize());
++            // Just substitute Var(1) for now.
++            xla::DynExpr* subst_expr = expr->substitute(1, batch_size)->s();
++            shape.set_dim(dim, subst_expr->get_val());
++            bsr->Unref();
++          }
+         }
+       }
+       if (has_dynamic) {
+diff --git a/tensorflow/compiler/jit/xla_launch_util.h b/tensorflow/compiler/jit/xla_launch_util.h
+index 5e5128d515b..a2986c704f5 100644
+--- a/tensorflow/compiler/jit/xla_launch_util.h
++++ b/tensorflow/compiler/jit/xla_launch_util.h
+@@ -29,6 +29,7 @@ limitations under the License.
+ #include "xla/client/local_client.h"
+ #include "xla/pjrt/pjrt_client.h"
+ #include "xla/service/shaped_buffer.h"
++#include "xla/executable_run_options.h"
+ #include "xla/stream_executor/device_memory_allocator.h"
+ #include "tensorflow/core/framework/allocation_description.pb.h"
+ #include "tensorflow/core/framework/tensor.h"
+@@ -208,7 +209,8 @@ class XlaComputationLaunchContext {
+       xla::ScopedShapedBuffer output, int missing_ctx_input_prefix,
+       absl::Span<VariableInfo> variable_infos,
+       const xla::HloInputOutputAliasConfig& input_output_alias,
+-      const std::map<int, const Tensor*>& resource_vars);
++      const std::map<int, const Tensor*>& resource_vars,
++      const xla::ExecutableRunOptions* run_options = nullptr);
+ 
+  private:
+   xla::LocalClient* client_;
+diff --git a/tensorflow/compiler/tf2xla/kernels/dynamic_stitch_op.cc b/tensorflow/compiler/tf2xla/kernels/dynamic_stitch_op.cc
+index cb7e4f6f964..6674fc6cde0 100644
+--- a/tensorflow/compiler/tf2xla/kernels/dynamic_stitch_op.cc
++++ b/tensorflow/compiler/tf2xla/kernels/dynamic_stitch_op.cc
+@@ -174,9 +174,12 @@ class DynamicStitchOp : public XlaOpKernel {
+       TensorShape new_shape;
+       // first reshaped dimension is the number of indices for this input.
+       new_shape.AddDim(indices[input_num].shape().dimensions(0));
++      new_shape.AddExpression(
++          xla::DynExpr::_(indices[input_num].shape().dimensions(0)));
+       // Then the rest are the common extra shape.
+       for (int d = indices0_shape.dims(); d < data0_shape.dims(); d++) {
+         new_shape.AddDim(data0_shape.dim_size(d));
++        new_shape.AddExpression(data0_shape.get_expression(d));
+       }
+       // Get the data, shaped appropriately.
+       auto handle = data[input_num];
+diff --git a/tensorflow/compiler/tf2xla/kernels/matrix_diag_ops.cc b/tensorflow/compiler/tf2xla/kernels/matrix_diag_ops.cc
+index ac798db3460..54a61a33d44 100644
+--- a/tensorflow/compiler/tf2xla/kernels/matrix_diag_ops.cc
++++ b/tensorflow/compiler/tf2xla/kernels/matrix_diag_ops.cc
+@@ -328,7 +328,9 @@ class MatrixDiagOp : public XlaOpKernel {
+     TensorShape output_shape = diag_shape;
+     output_shape.RemoveLastDims((num_diags == 1) ? 1 : 2);
+     output_shape.AddDim(num_rows);
++    output_shape.AddExpression(xla::DynExpr::_(num_rows));
+     output_shape.AddDim(num_cols);
++    output_shape.AddExpression(xla::DynExpr::_(num_cols));
+     xla::XlaOp output = xla::Broadcast(padding_value, output_shape.dim_sizes(),
+                                        output_shape.get_expressions());
+     xla::XlaOp diag = context->Input(0);
+@@ -406,11 +408,15 @@ class MatrixDiagPartOp : public XlaOpKernel {
+     TensorShape output_shape = input_shape;
+     output_shape.RemoveLastDims(2);
+     const int num_diags = upper_diag_index - lower_diag_index + 1;
+-    if (num_diags > 1) output_shape.AddDim(num_diags);
++    if (num_diags > 1) {
++      output_shape.AddDim(num_diags);
++      output_shape.AddExpression(xla::DynExpr::_(num_diags));
++    }
+     const int32_t max_diag_len =
+         std::min(num_rows + std::min(upper_diag_index, int64_t{0}),
+                  num_cols - std::max(lower_diag_index, int64_t{0}));
+     output_shape.AddDim(max_diag_len);
++    output_shape.AddExpression(xla::DynExpr::_(max_diag_len));
+ 
+     // Computes output.
+     xla::XlaOp input = context->Input(0);
+@@ -522,11 +528,15 @@ class MatrixSetDiagOp : public XlaOpKernel {
+ 
+     TensorShape expected_diag_shape = input_shape;
+     expected_diag_shape.RemoveLastDims(2);
+-    if (num_diags > 1) expected_diag_shape.AddDim(num_diags);
++    if (num_diags > 1) {
++      expected_diag_shape.AddDim(num_diags);
++      expected_diag_shape.AddExpression(xla::DynExpr::_(num_diags));
++    }
+     const int32_t max_diag_len =
+         std::min(num_rows + std::min(upper_diag_index, int64_t{0}),
+                  num_cols - std::max(lower_diag_index, int64_t{0}));
+     expected_diag_shape.AddDim(max_diag_len);
++    expected_diag_shape.AddExpression(xla::DynExpr::_(max_diag_len));
+     OP_REQUIRES(
+         context, expected_diag_shape == diag_shape,
+         errors::InvalidArgument(
+diff --git a/tensorflow/compiler/tf2xla/kernels/matrix_triangular_solve_op.cc b/tensorflow/compiler/tf2xla/kernels/matrix_triangular_solve_op.cc
+index a6d618d1b78..4d1139ed76b 100644
+--- a/tensorflow/compiler/tf2xla/kernels/matrix_triangular_solve_op.cc
++++ b/tensorflow/compiler/tf2xla/kernels/matrix_triangular_solve_op.cc
+@@ -96,7 +96,9 @@ MatrixTriangularSolveOp::Broadcast(xla::XlaOp lhs, const TensorShape& lhs_shape,
+ 
+   TensorShape lhs_broadcast_shape(broadcast_helper.output_batch_shape());
+   lhs_broadcast_shape.AddDim(m);
++  lhs_broadcast_shape.AddExpression(xla::DynExpr::_(m));
+   lhs_broadcast_shape.AddDim(m);
++  lhs_broadcast_shape.AddExpression(xla::DynExpr::_(m));
+   auto lhs_output = BroadcastTo(lhs, lhs_broadcast_shape.dim_sizes(),
+                                 lhs_broadcast_shape.get_expressions());
+   if (!lhs_output.ok()) {
+@@ -106,7 +108,9 @@ MatrixTriangularSolveOp::Broadcast(xla::XlaOp lhs, const TensorShape& lhs_shape,
+ 
+   TensorShape rhs_broadcast_shape(broadcast_helper.output_batch_shape());
+   rhs_broadcast_shape.AddDim(m);
++  rhs_broadcast_shape.AddExpression(xla::DynExpr::_(m));
+   rhs_broadcast_shape.AddDim(n);
++  rhs_broadcast_shape.AddExpression(xla::DynExpr::_(n));
+   auto rhs_output = BroadcastTo(rhs, rhs_broadcast_shape.dim_sizes(),
+                                 rhs_broadcast_shape.get_expressions());
+   if (!rhs_output.ok()) {
+diff --git a/tensorflow/compiler/tf2xla/kernels/reshape_op.cc b/tensorflow/compiler/tf2xla/kernels/reshape_op.cc
+index 81646061c49..8fc06eb0424 100644
+--- a/tensorflow/compiler/tf2xla/kernels/reshape_op.cc
++++ b/tensorflow/compiler/tf2xla/kernels/reshape_op.cc
+@@ -84,16 +84,17 @@ class ReshapeOp : public XlaOpKernel {
+                     errors::InvalidArgument(
+                         "size ", d, " must be non-negative, not ", size));
+         shape.AddDim(size);
+-        if (d < input_shape.dims() &&
+-            input_shape.get_expression(d)->is_dynamic()) {
++        xla::DynExpr* input_expr =
++            d < input_shape.dims() ? input_shape.get_expression(d) : nullptr;
++        if (input_expr != nullptr && input_expr->is_dynamic()) {
+           int old = input_shape.dim_size(d);
+           bool is_split = (old > size);
+           int local_ratio = ratio * (is_split ? old / size : size / old);
+           xla::DynExpr* new_expr =
+               (size > old)
+-                  ? *input_shape.get_expression(d) *
++                  ? *input_expr *
+                         *xla::DynExpr::_(local_ratio)  // Split [xy] -> [x/y,y]
+-                  : *input_shape.get_expression(d) /
++                  : *input_expr /
+                         *xla::DynExpr::_(local_ratio);  // Reduce [x,y] -> [x*y]
+ 
+           // Pass ratio to next dimension if this is a split, otherwise just
+@@ -170,10 +171,7 @@ class ReshapeOp : public XlaOpKernel {
+       shape.set_expression(
+           unknown_index, missing_expr->s());
+     }
+-    if(shape.num_elements() != input_shape.num_elements()){
+-      LOG(INFO) << "ERROR SHAPE IS " << shape;
+-      LOG(INFO) << "ERROR INPUT IS " << input_shape;
+-    }
++
+     OP_REQUIRES(ctx, shape.num_elements() == input_shape.num_elements(),
+                 errors::InvalidArgument("Input to reshape is a tensor with ",
+                                         input_shape.num_elements(),
+diff --git a/tensorflow/compiler/tf2xla/kernels/strided_slice_op.cc b/tensorflow/compiler/tf2xla/kernels/strided_slice_op.cc
+index 0555e3cf79c..df7deaaf80d 100644
+--- a/tensorflow/compiler/tf2xla/kernels/strided_slice_op.cc
++++ b/tensorflow/compiler/tf2xla/kernels/strided_slice_op.cc
+@@ -162,8 +162,10 @@ class StridedSliceOp : public XlaOpKernel {
+       auto zero = xla::Zero(ctx->builder(), ctx->InputXlaType("begin"));
+       xla::XlaOp begin_index, end_index;
+       int64_t sparse_index = shape_spec.processing_to_sparse_mapping[i];
+-      bool xla_input_is_dynamic = input_xla_shape.is_dynamic_dimension(i) ||
+-                                  input_xla_shape.expressions(i)->is_dynamic();
++      xla::DynExpr* input_expr = input_xla_shape.expressions(i);
++      bool xla_input_is_dynamic =
++          input_xla_shape.is_dynamic_dimension(i) ||
++          (input_expr != nullptr && input_expr->is_dynamic());
+       xla::XlaOp dim_size;
+       if (xla_input_is_dynamic) {
+         dim_size = xla::GetDimensionSize(ctx->Input(0), i);
+diff --git a/tensorflow/compiler/tf2xla/kernels/tensor_array_ops.cc b/tensorflow/compiler/tf2xla/kernels/tensor_array_ops.cc
+index 2fb7f134283..f436472195c 100644
+--- a/tensorflow/compiler/tf2xla/kernels/tensor_array_ops.cc
++++ b/tensorflow/compiler/tf2xla/kernels/tensor_array_ops.cc
+@@ -165,6 +165,7 @@ class TensorArrayOp : public XlaOpKernel {
+       CHECK(element_shape_.AsTensorShape(&shape));
+       TensorShape ta_shape;
+       ta_shape.AddDim(size);
++      ta_shape.AddExpression(xla::DynExpr::_(size));
+       ta_shape.AppendShape(shape);
+       xla::XlaOp zero = XlaHelpers::Zero(b, dtype_);
+       value = xla::Broadcast(zero, ta_shape.dim_sizes(),
+diff --git a/tensorflow/core/framework/tensor_shape.cc b/tensorflow/core/framework/tensor_shape.cc
+index b615a51ad7e..f8f75d9a70a 100644
+--- a/tensorflow/core/framework/tensor_shape.cc
++++ b/tensorflow/core/framework/tensor_shape.cc
+@@ -293,6 +293,9 @@ absl::Status TensorShapeBase<Shape>::BuildTensorShapeBase(
+         }
+       }
+     }
++    for (const auto& e : proto.expressions()) {
++      out->AddExpression(ExprFromProto(e));
++    }
+   }
+   return absl::OkStatus();
+ }
+@@ -477,6 +480,19 @@ void TensorShapeRep::Clear() {
+   set_data_type(DT_INVALID);
+ }
+ 
++void TensorShapeRep::set_expression(int d, xla::DynExpr* expr) {
++  expressions_[d] = expr;
++}
++
++void TensorShapeRep::AddExpression(xla::DynExpr* expr) {
++  CHECK_LT(expressions_.size(), ndims_byte());
++  expressions_.push_back(expr);
++}
++
++void TensorShapeRep::set_expressions(std::vector<xla::DynExpr*> exprs) {
++  expressions_ = exprs;
++}
++
+ void TensorShapeRep::ClearAllButDataType() {
+   if (tag() == REP_OUT_OF_LINE) {
+     delete as64()->dims_;
+@@ -717,8 +733,6 @@ void TensorShapeBase<Shape>::set_dim(int d, int64_t size) {
+ 
+ template <class Shape>
+ absl::Status TensorShapeBase<Shape>::SetDimWithStatus(int d, int64_t size) {
+-  if (get_expressions().size() > d) set_expression(d, xla::DynExpr::_(size));
+-
+   if (TF_PREDICT_FALSE(d < 0)) {
+     return errors::InvalidArgument("Index must be non-negative, got ", d);
+   }
+@@ -754,6 +768,7 @@ absl::Status TensorShapeBase<Shape>::SetDimWithStatus(int d, int64_t size) {
+     }
+   }
+ 
++  if (get_expressions().size() > d) set_expression(d, xla::DynExpr::_(size));
+   return RecomputeNumElements();
+ }
+ 
+@@ -818,7 +833,6 @@ absl::Status TensorShapeBase<Shape>::RemoveDimRangeWithStatus(int begin,
+       return s;
+     }
+   }
+-
+   return RecomputeNumElements();
+ }
+ 
+diff --git a/tensorflow/core/framework/tensor_shape.h b/tensorflow/core/framework/tensor_shape.h
+index f271714fc98..f2731f2cb44 100644
+--- a/tensorflow/core/framework/tensor_shape.h
++++ b/tensorflow/core/framework/tensor_shape.h
+@@ -28,7 +28,7 @@ limitations under the License.
+ #include "tensorflow/core/platform/macros.h"
+ #include "tensorflow/core/platform/status.h"
+ #include "tensorflow/core/platform/statusor.h"
+-#include "xla/shape.h"
++#include "xla/shape_dynexpr.h"
+ 
+ namespace tensorflow {
+ 
+@@ -74,18 +74,12 @@ class TensorShapeRep {
+   std::string DebugString() const;
+   static std::string DebugString(const TensorShapeProto& proto);
+ 
+-  void set_expression(int d, xla::DynExpr* expr){
+-    expressions_[d] = expr;
+-  }
++  void set_expression(int d, xla::DynExpr* expr);
+ 
+-  void AddExpression(xla::DynExpr* expr){
+-    expressions_.push_back(expr);
+-  }
++  void AddExpression(xla::DynExpr* expr);
+ 
+   // Set the array of dynamic multipliers.
+-  void set_expressions(std::vector<xla::DynExpr*> exprs) {
+-    expressions_ = exprs;
+-  }
++  void set_expressions(std::vector<xla::DynExpr*> exprs);
+ 
+   // Get the array of dynamic multipliers.
+   std::vector<xla::DynExpr*> get_expressions() const {
+@@ -95,10 +89,13 @@ class TensorShapeRep {
+   // Return the multiplier for a specific dynamic dimension.
+   // -1 if the dimension is not dynamic.
+   xla::DynExpr* get_expression(int64_t dimension) const {
+-    if (dimension >= expressions_.size()) {
+-      return nullptr;
++    if (dimension < 0) return xla::DynExpr::_(-999);
++    const size_t dim = static_cast<size_t>(dimension);
++    if (dim >= expressions_.size()) {
++      return xla::DynExpr::_(-999);
+     }
+-    return expressions_[dimension];
++    return expressions_[dim] != nullptr ? expressions_[dim]
++                                        : xla::DynExpr::_(-999);
+   }
+ 
+  protected:
+diff --git a/tensorflow/core/graph/subgraph.cc b/tensorflow/core/graph/subgraph.cc
+index 0d66e1f868c..d1616e23965 100644
+--- a/tensorflow/core/graph/subgraph.cc
++++ b/tensorflow/core/graph/subgraph.cc
+@@ -84,9 +84,14 @@ absl::Status FeedInputs(
+     const AttrValue* shape_attr = node_attrs.FindByString("_output_shapes");
+     if (shape_attr && shape_attr->has_list()) {
+       const TensorShapeProto& shape = shape_attr->list().shape(0);
+-      if (shape.dim_size() >= 1 && shape.dim(0).size() == -1) {
+-        feed_node->AddAttr("_is_batch", true);
++      for (int i = 0; i < shape.dim_size(); ++i) {
++        if (shape.dim(i).size() == -1) {
++          feed_node->AddAttr("_dynamic_dim", i);
++          break;
++        }
+       }
++      // Keep _output_shapes for further runs of shape inference
++      feed_node->AddAttr("_output_shapes", *shape_attr);
+     }
+     // Update name_index
+     (*name_index)[feed_node->name()] = feed_node;
+diff --git a/tensorflow/core/grappler/costs/graph_properties.cc b/tensorflow/core/grappler/costs/graph_properties.cc
+index 56fc7a5afe8..6a24831fd8f 100644
+--- a/tensorflow/core/grappler/costs/graph_properties.cc
++++ b/tensorflow/core/grappler/costs/graph_properties.cc
+@@ -1996,38 +1996,50 @@ class SymbolicShapeRefiner {
+     for (int out = 0; out < ic->num_outputs(); ++out) {
+       ShapeHandle s = ic->output(out);
+ 
+-      if (!ic->RankKnown(s) && node->op() == "_Arg") {
+-        // Treat batched function arguments as vectors with batch dim at dim0.
+-        DimensionHandle d0 = GetUnknownOutputDim(node, out, /*dim_index=*/0);
+-        ShapeHandle vec = ic->MakeShape({d0});
+-        ic->set_output(out, vec);
+-        s = vec;
+-      }
+-
+-      if (!ic->RankKnown(s)){
+-        //if Rank is not realized yet, get it from attr.
++      if (!ic->RankKnown(s)) {
++        bool recovered_rank = false;
+         auto it = node->attr().find("_output_shapes");
+-        if (it != node->attr().end() && it->second.list().shape_size()>0){
++        if(it != node->attr().end() && out < it->second.list().shape_size()){
++          it = node->attr().find("shape");
++        }
++        if (it != node->attr().end() && out < it->second.list().shape_size()) {
+           const TensorShapeProto& proto = it->second.list().shape(out);
+-
+-          std::vector<DimensionHandle> dims;
+-          dims.reserve(proto.dim_size());
+-
+-          for(int d=0; d<proto.dim_size();++d){
+-            int64_t size = proto.dim(d).size();
+-            if (size >=0){
+-              dims.push_back(ic->MakeDim(size));
+-            } else {
+-              dims.push_back(GetUnknownOutputDim(node, out, d));
++          if (!proto.unknown_rank()) {
++            std::vector<DimensionHandle> dims;
++            dims.reserve(proto.dim_size());
++
++            for (int d = 0; d < proto.dim_size(); ++d) {
++              int64_t size = proto.dim(d).size();
++              if (size >= 0) {
++                dims.push_back(ic->MakeDim(size));
++              } else {
++                dims.push_back(GetUnknownOutputDim(node, out, d));
++              }
+             }
++            s = ic->MakeShape(dims);
++            ic->set_output(out, s);
++            recovered_rank = true;
+           }
+-          s = ic->MakeShape(dims);
+-          ic->set_output(out,s);
+-        }else {
+-          VLOG(1) << "RANK still unknown." << node->name();
++        }
++
++        if (!recovered_rank && node->op() == "_Arg") {
++          DimensionHandle d0 = GetUnknownOutputDim(node, out, /*dim_id=*/0);
++          ShapeHandle vec = ic->MakeShape({d0});
++          ic->set_output(out, vec);
++          s = vec;
++          recovered_rank = true;
++        }
++
++        if (!recovered_rank) {
++          VLOG(1) << "RANK still unknown. " << node->name();
+           continue;
+         }
+       }
++
++      if (!ic->RankKnown(s)) {
++        continue;
++      }
++
+       bool changed = false;
+       std::vector<DimensionHandle> dims;
+       dims.reserve(ic->Rank(s));
+@@ -2040,10 +2052,23 @@ class SymbolicShapeRefiner {
+           continue;
+         }
+         // If already tagged with expr, keep it.
+-        if (ic->GetDimExpr(dim) != nullptr) {
++        auto* dim_expr = ic->GetDimExpr(dim);
++        if (dim_expr != nullptr) {
+           dims.push_back(dim);
+           continue;
+         }
++        auto output_shapes_it = node->attr().find("_output_shapes");
++        if (output_shapes_it != node->attr().end() &&
++            out < output_shapes_it->second.list().shape_size() &&
++            d < output_shapes_it->second.list().shape(out).dim_size()) {
++          const int64_t annotated_size =
++              output_shapes_it->second.list().shape(out).dim(d).size();
++          if (annotated_size >= 0) {
++            changed = true;
++            dims.push_back(ic->MakeDim(annotated_size));
++            continue;
++          }
++        }
+         // Canonicalize ALL unknown dims.
+         DimensionHandle canon = GetUnknownOutputDim(node, out, d);
+         changed |= !dim.SameHandle(canon);
+@@ -2248,20 +2273,16 @@ class SymbolicShapeManager {
+         int64_t d = dims_.GetMergedValue(dim);
+         auto* out_dim = properties->mutable_shape()->add_dim();
+         out_dim->set_size(d < 0 ? -1 : d);
+-        // Serialize expression for unknown dims
+-        if (out_dim->size() < 0) {
+-          void* root = dims_.RootId(dim);
+-          DimExpr* expr = nullptr;
+-          if (auto it = dim_root_expr_.find(root); it != dim_root_expr_.end()) {
+-            expr = it->second;
+-          } else {
+-            // Fallback to checking the dim handle directly
+-            expr = GetExprFromDimHandle(dim);
+-          }
+-          if (expr != nullptr) {
+-            expr->ToProto(out_dim->mutable_expr());
+-            // TODO: Apply simplification?
+-          }
++        void* root = dims_.RootId(dim);
++        DimExpr* expr = nullptr;
++        if (auto it = dim_root_expr_.find(root); it != dim_root_expr_.end()) {
++          expr = it->second;
++        } else {
++          expr = ExprForDim(dim);
++        }
++        if (expr != nullptr) {
++          expr->ToProto(out_dim->mutable_expr());
++          // TODO: Apply simplification?
+         }
+       }
+     }
+@@ -2350,6 +2371,25 @@ class SymbolicShapeManager {
+     return d->expr_;
+   }
+ 
++  DimExpr* ExprForDim(const DimensionHandle& d) {
++    if (!d.IsSet()) return nullptr;
++    if (DimExpr* expr = GetExprFromDimHandle(d)) {
++      return expr;
++    }
++    if (!InferenceContext::ValueKnown(d)) {
++      return nullptr;
++    }
++    const int64_t value = InferenceContext::Value(d);
++    auto it = const_exprs_.find(value);
++    if (it != const_exprs_.end()) {
++      return it->second.get();
++    }
++    auto expr = DimExpr::Cons(value);
++    DimExpr* expr_ptr = expr.get();
++    const_exprs_.emplace(value, std::move(expr));
++    return expr_ptr;
++  }
++
+   absl::Status MergeDimsWithExpr(DimensionHandle d1, DimensionHandle d2) {
+     if (!d1.IsSet() || !d2.IsSet()) return absl::OkStatus();
+ 
+@@ -2360,7 +2400,7 @@ class SymbolicShapeManager {
+     auto get_best = [&](void* r, DimensionHandle d) -> DimExpr* {
+       auto it = dim_root_expr_.find(r);
+       if (it != dim_root_expr_.end()) return it->second;
+-      return GetExprFromDimHandle(d);  // may be null
++      return ExprForDim(d);  // may be null
+     };
+ 
+     DimExpr* e1 = get_best(r1, d1);
+@@ -2401,6 +2441,7 @@ class SymbolicShapeManager {
+     return absl::OkStatus();
+   }
+   DisjointSet<shape_inference::ShapeHandle> shapes_;
++  absl::flat_hash_map<int64_t, std::unique_ptr<DimExpr>> const_exprs_;
+   // Map from union-find root pointer to the best expression for that set.
+   absl::flat_hash_map<void*, DimExpr*> dim_root_expr_;
+   DisjointSet<shape_inference::DimensionHandle> dims_;
+diff --git a/tensorflow/core/kernels/function_ops.cc b/tensorflow/core/kernels/function_ops.cc
+index eec275448c5..7f131e3c23e 100644
+--- a/tensorflow/core/kernels/function_ops.cc
++++ b/tensorflow/core/kernels/function_ops.cc
+@@ -44,9 +44,9 @@ ArgOp::ArgOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
+   OP_REQUIRES_OK(ctx, ctx->GetAttr("T", &dtype_));
+   OP_REQUIRES_OK(ctx, ctx->GetAttr("index", &index_));
+ 
+-  Status s = ctx->GetAttr("_is_batch", &is_batch_);
++  Status s = ctx->GetAttr("_dynamic_dim", &dynamic_dim_);
+   if (IsNotFound(s)) {
+-    is_batch_ = false;
++    dynamic_dim_ = -1;
+   } else {
+     OP_REQUIRES_OK(ctx, s);
+   }
+@@ -78,7 +78,7 @@ void ArgOp::Compute(OpKernelContext* ctx) {
+     OP_REQUIRES_OK(ctx, validate_type(*val));
+     ctx->set_output(0, *val);
+   }
+-  if (is_batch_) {
++  if (dynamic_dim_ >= 0) {
+     BatchSizeResource* bsr = nullptr;
+     ScopedStepContainer* step_container = ctx->step_container();
+ 
+@@ -89,7 +89,8 @@ void ArgOp::Compute(OpKernelContext* ctx) {
+                               return OkStatus();
+                             }));
+ 
+-    const int64_t batch_size = val->dim_size(0);
++    const int64_t batch_size = val->dim_size(dynamic_dim_);
++    VLOG(1) << "Found batch_size in dimension #" << dynamic_dim_;
+     if (bsr->GetBatchSize() == 0) {
+       bsr->SetBatchSize(batch_size);
+       VLOG(1) << "Set batch_size from 0 to " << batch_size
+diff --git a/tensorflow/core/kernels/function_ops.h b/tensorflow/core/kernels/function_ops.h
+index c9e8fdcd894..fed05ead200 100644
+--- a/tensorflow/core/kernels/function_ops.h
++++ b/tensorflow/core/kernels/function_ops.h
+@@ -38,7 +38,7 @@ class ArgOp : public OpKernel {
+  private:
+   int index_;
+   DataType dtype_;
+-  bool is_batch_;
++  int dynamic_dim_;
+ 
+   ArgOp(const ArgOp&) = delete;
+   void operator=(const ArgOp&) = delete;
+@@ -55,7 +55,7 @@ class RetvalOp : public OpKernel {
+  private:
+   int index_;
+   DataType dtype_;
+-  bool is_batch_;
++  int dynamic_dim_;
+ 
+   RetvalOp(const RetvalOp&) = delete;
+   void operator=(const RetvalOp&) = delete;
+diff --git a/tensorflow/core/kernels/padding_fifo_queue.cc b/tensorflow/core/kernels/padding_fifo_queue.cc
+index 5cf8e4a6cfb..a7dee8ab1d3 100644
+--- a/tensorflow/core/kernels/padding_fifo_queue.cc
++++ b/tensorflow/core/kernels/padding_fifo_queue.cc
+@@ -400,11 +400,14 @@ std::vector<TensorShape> PaddingFIFOQueue::ConvertShapesPartialDimensionsToZero(
+   for (size_t i = 0; i < shapes.size(); ++i) {
+     const PartialTensorShape& partial = partial_shapes[i];
+     TensorShape& shape = shapes[i];
+-    for (int64_t s : partial.dim_sizes()) shape.AddDim(s < 0 ? 0 : s);
+-    for (auto e : partial.get_expressions()){
+-      shape.AddExpression(
+-          e->is_constant() && e->get_val() < 0 ? xla::DynExpr::zero : e);
++    for (int d = 0; d < partial.dims(); ++d) {
++      shape.AddDim(partial.dim_size(d) < 0 ? 0 : partial.dim_size(d));
++      xla::DynExpr* expr = partial.get_expression(d);
++      if (expr != nullptr && expr->is_constant() && expr->get_val() < 0) {
++        expr = xla::DynExpr::zero;
+       }
++      shape.AddExpression(expr);
++    }
+   }
+   return shapes;
+ }
+diff --git a/tensorflow/core/ops/array_ops.cc b/tensorflow/core/ops/array_ops.cc
+index 60acc6c9d0b..8d53c6dbb38 100644
+--- a/tensorflow/core/ops/array_ops.cc
++++ b/tensorflow/core/ops/array_ops.cc
+@@ -210,11 +210,6 @@ absl::Status SetOutputShapeForReshape(InferenceContext* c) {
+       for (int32_t i = 0; i < c->Rank(out); ++i) {
+         DimensionHandle dim = c->Dim(out, i);
+         if (!c->ValueKnown(dim)) {
+-          if (c->GetDimExpr(dim) != nullptr) {
+-            TF_RETURN_IF_ERROR(
+-                c->Multiply(known_out_elems, dim, &known_out_elems));
+-            continue;
+-          }
+           if (out_unknown_idx >= 0) {
+             too_many_unknown = true;
+             break;
+@@ -233,11 +228,6 @@ absl::Status SetOutputShapeForReshape(InferenceContext* c) {
+       for (int32_t i = 0; i < c->Rank(in); ++i) {
+         DimensionHandle dim = c->Dim(in, i);
+         if (!c->ValueKnown(dim)) {
+-          if (c->GetDimExpr(dim) != nullptr) {
+-            TF_RETURN_IF_ERROR(
+-                c->Multiply(known_in_elems, dim, &known_in_elems));
+-            continue;
+-          }
+           if (in_unknown_idx >= 0) {
+             too_many_unknown = true;
+             break;
+diff --git a/third_party/xla/xla/BUILD b/third_party/xla/xla/BUILD
+index e94208f90f4..69d78b71088 100644
+--- a/third_party/xla/xla/BUILD
++++ b/third_party/xla/xla/BUILD
+@@ -469,6 +469,7 @@ cc_library(
+         "layout_util.h",
+         "primitive_util.h",
+         "shape.h",
++        "shape_dynexpr.h",
+         "shape_partition.h",
+         "shape_util.h",
+     ],
+diff --git a/third_party/xla/xla/service/elemental_ir_emitter.cc b/third_party/xla/xla/service/elemental_ir_emitter.cc
+index 649e89e1183..b2f20ebcacd 100644
+--- a/third_party/xla/xla/service/elemental_ir_emitter.cc
++++ b/third_party/xla/xla/service/elemental_ir_emitter.cc
+@@ -3289,9 +3289,9 @@ absl::StatusOr<llvm::Value*> ElementalIrEmitter::EmitElementalConcatenate(
+     cases.emplace_back(current_offset, operand);
+     llvm::Value* cdim = source_index.GetConstantWithIndexType(
+         operand->shape().dimensions(concat_dim));
+-    if (operand->shape().expressions(concat_dim)->is_dynamic()) {
+-      cdim = llvm_ir::EmitExpression(
+-          b_, operand->shape().expressions(concat_dim));
++    xla::DynExpr* concat_expr = operand->shape().expressions(concat_dim);
++    if (concat_expr != nullptr && concat_expr->is_dynamic()) {
++      cdim = llvm_ir::EmitExpression(b_, concat_expr);
+     }
+     current_offset = b_->CreateAdd(current_offset, cdim, "current_offset");
+     coffset += operand->shape().dimensions(concat_dim);
+@@ -3626,9 +3626,9 @@ absl::StatusOr<llvm::Value*> ElementalIrEmitter::EmitElementalPad(
+     int64_t shape_dim = hlo->operand(0)->shape().dimensions(i);
+     llvm::Value* bound = index_typed_const(shape_dim);
+ 
+-    if (hlo->operand(0)->shape().expressions(i)->is_dynamic()) {
+-      bound = llvm_ir::EmitExpression(
+-          b_, hlo->operand(0)->shape().expressions(i));
++    xla::DynExpr* operand_expr = hlo->operand(0)->shape().expressions(i);
++    if (operand_expr != nullptr && operand_expr->is_dynamic()) {
++      bound = llvm_ir::EmitExpression(b_, operand_expr);
+     }
+ 
+     in_bounds = And(in_bounds, ICmpSLT(multi_index[i], bound), "in_bounds");
+@@ -3905,10 +3905,10 @@ llvm_ir::ElementGenerator ElementalIrEmitter::MakeElementGenerator(
+         const HloInstruction* operand = hlo->operand(0);
+         std::vector<llvm::Value*> source_multi_index = target_index.multidim();
+         for (int64_t dim : hlo->dimensions()) {
+-          if (hlo->shape().expressions(dim)->is_dynamic()) {
++          xla::DynExpr* dim_expr = hlo->shape().expressions(dim);
++          if (dim_expr != nullptr && dim_expr->is_dynamic()) {
+             llvm::Value* one = target_index.GetConstantWithIndexType(1);
+-            llvm::Value* expr_value =
+-                llvm_ir::EmitExpression(b_, hlo->shape().expressions(dim));
++            llvm::Value* expr_value = llvm_ir::EmitExpression(b_, dim_expr);
+             source_multi_index[dim] =
+                 Sub(Sub(expr_value, one), target_index[dim]);
+           } else {
+@@ -4270,9 +4270,10 @@ absl::StatusOr<llvm::Value*> ElementalIrEmitter::EmitElementalReduceWindow(
+     int64_t dim_bound = reduce_window->inputs()[0]->shape().dimensions(i);
+     llvm::Value* shape_bound = index_typed_const(dim_bound);
+ 
+-    if (reduce_window->inputs()[0]->shape().expressions(i)->is_dynamic()) {
+-      llvm::Value* expr_value = llvm_ir::EmitExpression(
+-          b_, reduce_window->inputs()[0]->shape().expressions(i));
++    xla::DynExpr* window_expr =
++        reduce_window->inputs()[0]->shape().expressions(i);
++    if (window_expr != nullptr && window_expr->is_dynamic()) {
++      llvm::Value* expr_value = llvm_ir::EmitExpression(b_, window_expr);
+       shape_bound = expr_value;
+     }
+ 
+diff --git a/third_party/xla/xla/service/llvm_ir/ir_array.cc b/third_party/xla/xla/service/llvm_ir/ir_array.cc
+index e919ebeb8f0..a2e4c363939 100644
+--- a/third_party/xla/xla/service/llvm_ir/ir_array.cc
++++ b/third_party/xla/xla/service/llvm_ir/ir_array.cc
+@@ -281,10 +281,10 @@ IrArray::Index IrArray::Index::SourceIndexOfReshape(
+       // linear index by each dimension size.
+       for (int64_t i = common_factors[k + 1].first - 1;
+            i >= common_factors[k].first; --i) {
+-        bool is_dynamic = input_shape.expressions(i)->is_dynamic();
++        xla::DynExpr* input_expr = input_shape.expressions(i);
++        bool is_dynamic = input_expr != nullptr && input_expr->is_dynamic();
+         llvm::Value* divisor =
+-            is_dynamic ? llvm_ir::EmitExpression(builder,
+-                                                 input_shape.expressions(i))
++            is_dynamic ? llvm_ir::EmitExpression(builder, input_expr)
+                        : GetConstantWithIndexType(input_shape.dimensions(i));
+         if (input_shape.dimensions(i) == 1) {
+           source_multidim_index[i] = GetConstantWithIndexType(0);
+diff --git a/third_party/xla/xla/service/llvm_ir/loop_emitter.cc b/third_party/xla/xla/service/llvm_ir/loop_emitter.cc
+index aafdd02d753..4156e37bf4c 100644
+--- a/third_party/xla/xla/service/llvm_ir/loop_emitter.cc
++++ b/third_party/xla/xla/service/llvm_ir/loop_emitter.cc
+@@ -200,7 +200,7 @@ std::vector<IrArray::Index> LoopEmitter::EmitIndexAndSetExitBasicBlock(
+   bool dynamic = false;
+   for (int i = 0; i < shape_.dimensions_size(); i++) {
+     auto expr = shape_.expressions(i);
+-    if (expr->is_dynamic()) {
++    if (expr != nullptr && expr->is_dynamic()) {
+       dynamic_dims[i] = xla::llvm_ir::EmitExpression(b_, expr);
+       shape_.set_dynamic_dimension(i, true);
+       dynamic = true;
+diff --git a/third_party/xla/xla/service/shape_inference.cc b/third_party/xla/xla/service/shape_inference.cc
+index f8264e32512..2d0cc3b27cc 100644
+--- a/third_party/xla/xla/service/shape_inference.cc
++++ b/third_party/xla/xla/service/shape_inference.cc
+@@ -3857,7 +3857,7 @@ ShapeInference::InferCollectivePermuteDoneShape(const Shape& operand_shape) {
+       ShapeUtil::MakeShape(operand.element_type(), dimensions, expressions);
+ 
+   if (expressions.empty() && operand.expressions().size() > 0 &&
+-      operand.expressions(0)->is_dynamic()) {
++      operand.expressions(0) != nullptr && operand.expressions(0)->is_dynamic()) {
+     return InvalidArgument("Expressions is empty but operand is dynamic");
+   }
+ 
+diff --git a/third_party/xla/xla/shape.cc b/third_party/xla/xla/shape.cc
+index e949ebf4c80..962984b9225 100644
+--- a/third_party/xla/xla/shape.cc
++++ b/third_party/xla/xla/shape.cc
+@@ -421,7 +421,7 @@ absl::StatusOr<Shape> Shape::FromProto(const ShapeProto& shape_proto) {
+       // value is invalid.
+       DynExpr* expression = (i < num_expressions)
+                                 ? ExprFromProto(shape_proto.expressions(i))
+-                                : DynExpr::_(-30);
++                                : DynExpr::_(shape_proto.dimensions(i));
+       shape.UnsafeAddDimension(shape_proto.dimensions(i), is_dynamic,
+                                expression);
+     }
+@@ -566,7 +566,8 @@ void Shape::add_dimensions(int64_t value, bool is_dynamic, DynExpr* expr) {
+     CHECK_EQ(value, kUnboundedSize)
+         << "dynamic dimension must have size == kUnboundedSize or >= 0.";
+   }
+-  UnsafeAddDimension(value, is_dynamic, expr);
++  UnsafeAddDimension(value, is_dynamic,
++                     expr != nullptr ? expr : DynExpr::_(value));
+ }
+ 
+ void Shape::set_dynamic_dimension(int dimension, bool is_dynamic) {
+@@ -578,14 +579,18 @@ void Shape::set_dynamic_dimension(int dimension, bool is_dynamic) {
+ 
+ void Shape::set_expression(int dimension, DynExpr* e) {
+   auto& state = array_state();
+-  state.expressions[dimension] = e;
++  state.expressions[dimension] =
++      e != nullptr ? e : DynExpr::_(state.dimensions[dimension]);
+ }
+ 
+ void Shape::set_expressions(std::vector<DynExpr*> exps) {
+   auto& state = array_state();
+-  state.expressions.clear();
+-  for (auto e : exps){
+-    state.expressions.push_back(e);
++  CHECK_LE(exps.size(), state.dimensions.size());
++  state.expressions.resize(state.dimensions.size());
++  for (size_t i = 0; i < state.dimensions.size(); ++i) {
++    DynExpr* expr = i < exps.size() ? exps[i] : DynExpr::_(state.dimensions[i]);
++    state.expressions[i] =
++        expr != nullptr ? expr : DynExpr::_(state.dimensions[i]);
+   }
+ }
+ 
+@@ -627,7 +632,7 @@ void Shape::UnsafeAddDimension(int64_t value, bool is_dynamic, DynExpr* exp) {
+       << "where the shape is " << ToString();
+   state.dimensions.push_back(value);
+   state.dynamic_dimensions.push_back(is_dynamic);
+-  state.expressions.push_back(exp);
++  state.expressions.push_back(exp != nullptr ? exp : DynExpr::_(value));
+ }
+ 
+ bool Shape::is_static() const {
+diff --git a/third_party/xla/xla/shape.h b/third_party/xla/xla/shape.h
+index 5d9c5827a95..1c5197ad838 100644
+--- a/third_party/xla/xla/shape.h
++++ b/third_party/xla/xla/shape.h
+@@ -38,358 +38,10 @@ limitations under the License.
+ #include "xla/tsl/platform/logging.h"  // IWYU pragma: keep
+ #include "xla/util.h"
+ #include "xla/xla_data.pb.h"
++#include "xla/shape_dynexpr.h"
+ 
+ namespace xla {
+ 
+-class DynExpr {
+- public:
+-  virtual ~DynExpr() = default;
+-  virtual void print(xla::Printer* printer) const = 0;
+-  virtual void to_proto(xla::ExpressionProto* proto) const = 0;
+-  virtual bool is_constant() const = 0;
+-  virtual int64_t get_val() const { return -1; }
+-  virtual DynExpr* s() = 0; // simplify
+-  virtual DynExpr* substitute(int id, DynExpr* v) = 0;
+-  virtual std::set<int> get_all_ids() = 0;
+-  virtual int64_t solve(int64_t x) = 0;
+-
+-  bool is_dynamic() { return !is_constant(); }
+-
+-  static DynExpr* zero;
+-  static DynExpr* one;
+-  static DynExpr* _(int64_t val);
+-  static DynExpr* V(int var_id);
+-  static DynExpr* _s(DynExpr* expr);
+-  static bool equal(DynExpr* expr1, DynExpr* expr2);
+-
+-  friend std::ostream& operator<<(std::ostream& os, DynExpr* expr);
+-};
+-
+-// constant i
+-class Constant : public DynExpr {
+-  int64_t value;
+-
+- public:
+-  explicit Constant(int64_t v) : value(v) {}
+-  void print(xla::Printer* printer) const override {
+-    if (value < 0) {
+-      printer->Append("(");
+-    }
+-    printer->Append(value);
+-    if (value < 0) {
+-      printer->Append(")");
+-    }
+-  }
+-  void to_proto(xla::ExpressionProto* proto) const override {
+-    proto->set_constant_value(value);
+-  }
+-  bool is_constant() const override { return true; }
+-  int64_t get_val() const override { return value; }
+-  DynExpr* substitute(int id, DynExpr* v) { return this; }
+-  std::set<int> get_all_ids() { return {}; }
+-  int64_t solve(int64_t x) { return -1; }
+-  DynExpr* s() override;
+-};
+-
+-// var id (int)
+-class Variable : public DynExpr {
+-  int id;
+-
+- public:
+-  explicit Variable(int identifier) : id(identifier) {}
+-  void print(xla::Printer* printer) const override {
+-    // printer->Append("(Var ");
+-    char letter = 'A' + (id - 1);
+-    printer->Append(std::string(1, letter));
+-    // printer->Append(")");
+-  }
+-  void to_proto(xla::ExpressionProto* proto) const override {
+-    proto->set_variable_id(id);
+-  }
+-  bool is_constant() const override { return false; }
+-  int get_id() const { return id; }
+-  DynExpr* substitute(int id, DynExpr* v) { return get_id() == id ? v : this;}
+-  std::set<int> get_all_ids() { return {get_id()}; }
+-  int64_t solve(int64_t x) { return x; }
+-  DynExpr* s() override;
+-};
+-
+-// exp = exp + exp
+-class Add : public DynExpr {
+-  DynExpr* lhs;
+-  DynExpr* rhs;
+-
+- public:
+-  Add(DynExpr* l, DynExpr* r) : lhs(std::move(l)), rhs(std::move(r)) {}
+-  void print(xla::Printer* printer) const override {
+-    printer->Append("(");
+-    lhs->print(printer);
+-    printer->Append(" + ");
+-    rhs->print(printer);
+-    printer->Append(")");
+-  }
+-
+-  DynExpr* get_lhs() const { return lhs; }
+-  DynExpr* get_rhs() const { return rhs; }
+-
+-  void to_proto(xla::ExpressionProto* proto) const override {
+-    auto* add_msg = proto->mutable_add_node();
+-    lhs->to_proto(add_msg->mutable_lhs());
+-    rhs->to_proto(add_msg->mutable_rhs());
+-  }
+-
+-  bool is_constant() const override {
+-    return lhs->is_constant() && rhs->is_constant();
+-  }
+-
+-  int64_t get_val() const override { return lhs->get_val() + rhs->get_val(); }
+-
+-  DynExpr* substitute(int id, DynExpr* v) {
+-    return new Add(lhs->substitute(id, v), rhs->substitute(id, v));
+-  }
+-
+-  std::set<int> get_all_ids() {
+-    auto s = lhs->get_all_ids();
+-    s.merge(rhs->get_all_ids());
+-    return s;
+-  }
+-
+-  int64_t solve(int64_t x) {
+-    // Cannot solve if both lhs and rhs are dynamic...
+-    if (lhs->is_dynamic() && rhs->is_dynamic()) return -1;
+-    if (lhs->get_all_ids().size() == 1) {
+-      // (A + c) = x <=> A = x - c => solve A = y with y = x - c
+-      return lhs->solve(x - rhs->get_val());
+-    }
+-    if (rhs->get_all_ids().size() == 1) {
+-      // (c + A) = x <=> A = x - c => solve A = y with y = x - c
+-      return rhs->solve(x - lhs->get_val());
+-    }
+-    // No solution
+-    return -1;
+-  }
+-
+-  DynExpr* s() override;
+-
+-  ~Add() {
+-    delete lhs;
+-    delete rhs;
+-  }
+-};
+-
+-// exp = exp - exp
+-class Sub : public DynExpr {
+-  DynExpr* lhs;
+-  DynExpr* rhs;
+-
+- public:
+-  Sub(DynExpr* l, DynExpr* r) : lhs(std::move(l)), rhs(std::move(r)) {}
+-  void print(xla::Printer* printer) const override {
+-    printer->Append("(");
+-    lhs->print(printer);
+-    printer->Append(" - ");
+-    rhs->print(printer);
+-    printer->Append(")");
+-  }
+-
+-  DynExpr* get_lhs() const { return lhs; }
+-  DynExpr* get_rhs() const { return rhs; }
+-
+-  void to_proto(xla::ExpressionProto* proto) const override {
+-    auto* sub_msg = proto->mutable_sub_node();
+-    lhs->to_proto(sub_msg->mutable_lhs());
+-    rhs->to_proto(sub_msg->mutable_rhs());
+-  }
+-
+-  bool is_constant() const override {
+-    return lhs->is_constant() && rhs->is_constant();
+-  }
+-
+-  int64_t get_val() const override { return lhs->get_val() - rhs->get_val(); }
+-
+-  DynExpr* substitute(int id, DynExpr* v) {
+-    return new Sub(lhs->substitute(id, v), rhs->substitute(id, v));
+-  }
+-
+-  std::set<int> get_all_ids() {
+-    auto s = lhs->get_all_ids();
+-    s.merge(rhs->get_all_ids());
+-    return s;
+-  }
+-
+-  int64_t solve(int64_t x) {
+-    // Cannot solve if both lhs and rhs are dynamic...
+-    if (lhs->is_dynamic() && rhs->is_dynamic()) return -1;
+-    if (lhs->get_all_ids().size() == 1) {
+-      // (A - c) = x <=> A = x + c => solve A = y with y = x + c
+-      return lhs->solve(x + rhs->get_val());
+-    }
+-    if (rhs->get_all_ids().size() == 1) {
+-      // (c + A) = x <=> A = x - c => solve A = y with y = x + c
+-      return rhs->solve(x + lhs->get_val());
+-    }
+-    // No solution
+-    return -1;
+-  }
+-
+-  DynExpr* s() override;
+-
+-  ~Sub() {
+-    delete lhs;
+-    delete rhs;
+-  }
+-};
+-
+-// exp = exp * exp
+-class Mul : public DynExpr {
+-  DynExpr* lhs;
+-  DynExpr* rhs;
+-
+- public:
+-  Mul(DynExpr* l, DynExpr* r) : lhs(std::move(l)), rhs(std::move(r)) {}
+-  void print(xla::Printer* printer) const override {
+-    printer->Append("(");
+-    lhs->print(printer);
+-    printer->Append(" * ");
+-    rhs->print(printer);
+-    printer->Append(")");
+-  }
+-
+-  DynExpr* get_lhs() const { return lhs; }
+-  DynExpr* get_rhs() const { return rhs; }
+-
+-  void to_proto(xla::ExpressionProto* proto) const override {
+-    auto* mul_msg = proto->mutable_mul_node();
+-    lhs->to_proto(mul_msg->mutable_lhs());
+-    rhs->to_proto(mul_msg->mutable_rhs());
+-  }
+-
+-  bool is_constant() const override {
+-    return lhs->is_constant() && rhs->is_constant();
+-  }
+-
+-  int64_t get_val() const override { return lhs->get_val() * rhs->get_val(); }
+-
+-  DynExpr* substitute(int id, DynExpr* v) {
+-    return new Mul(lhs->substitute(id, v), rhs->substitute(id, v));
+-  }
+-
+-  std::set<int> get_all_ids() {
+-    auto s = lhs->get_all_ids();
+-    s.merge(rhs->get_all_ids());
+-    return s;
+-  }
+-
+-  int64_t solve(int64_t x) {
+-    // Cannot solve if both lhs and rhs are dynamic...
+-    if (lhs->is_dynamic() && rhs->is_dynamic()) return -1;
+-    if (lhs->get_all_ids().size() == 1) {
+-      // (A * c) = x <=> A = x / c => solve A = y with y = x / c
+-      int64_t c = rhs->get_val();
+-      if (x % c != 0) return -1;
+-      return lhs->solve(x / c);
+-    }
+-    if (rhs->get_all_ids().size() == 1) {
+-      // (c * A) = x <=> A = x / c => solve A = y with y = x / c
+-      int64_t c = lhs->get_val();
+-      if (x % c != 0) return -1;
+-      return rhs->solve(x / c);
+-    }
+-    // No solution
+-    return -1;
+-  }
+-
+-  DynExpr* s() override;
+-
+-  ~Mul() {
+-    delete lhs;
+-    delete rhs;
+-  }
+-};
+-
+-// expr / expr
+-class Div : public DynExpr {
+-  DynExpr* lhs;
+-  DynExpr* rhs;
+-
+- public:
+-  Div(DynExpr* l, DynExpr* r) : lhs(std::move(l)), rhs(std::move(r)) {}
+-  void print(xla::Printer* printer) const override {
+-    printer->Append("(");
+-    lhs->print(printer);
+-    printer->Append(" / ( ");
+-    rhs->print(printer);
+-    printer->Append(") )");
+-  }
+-
+-  DynExpr* get_lhs() const { return lhs; }
+-  DynExpr* get_rhs() const { return rhs; }
+-
+-  void to_proto(xla::ExpressionProto* proto) const override {
+-    auto* div_msg = proto->mutable_div_node();
+-    lhs->to_proto(div_msg->mutable_lhs());
+-    rhs->to_proto(div_msg->mutable_rhs());
+-  }
+-
+-  bool is_constant() const override {
+-    return lhs->is_constant() && rhs->is_constant();
+-  }
+-
+-  int64_t get_val() const override { return lhs->get_val() / rhs->get_val(); }
+-
+-  DynExpr* substitute(int id, DynExpr* v) {
+-    return new Div(lhs->substitute(id, v), rhs->substitute(id, v));
+-  }
+-
+-  std::set<int> get_all_ids() {
+-    auto s = lhs->get_all_ids();
+-    s.merge(rhs->get_all_ids());
+-    return s;
+-  }
+-
+-  DynExpr* s() override;
+-
+-  int64_t solve(int64_t x) {
+-    // Cannot solve if both lhs and rhs are dynamic...
+-    if (lhs->is_dynamic() && rhs->is_dynamic()) return -1;
+-    if (lhs->get_all_ids().size() == 1) {
+-      // (A / c) = x <=> A = x * c => solve A = y with y = x * c
+-      return lhs->solve(x * rhs->get_val());
+-    }
+-    if (rhs->get_all_ids().size() == 1) {
+-      // (c / A) = x <=> A = c / x => solve A = y with y = c / x
+-      int64_t c = lhs->get_val();
+-      if (c % x != 0) return -1;
+-      return rhs->solve(c / x);
+-    }
+-    // No solution
+-    return -1;
+-  }
+-
+-  ~Div() {
+-    delete lhs;
+-    delete rhs;
+-  }
+-};
+-
+-DynExpr* operator*(DynExpr& lhs, DynExpr& rhs);
+-DynExpr* operator*(int64_t k, DynExpr& rhs);
+-DynExpr* operator/(DynExpr& lhs, DynExpr& rhs);
+-DynExpr* operator/(DynExpr& lhs, int64_t d);
+-DynExpr* operator+(DynExpr& lhs, DynExpr& rhs);
+-DynExpr* operator+(DynExpr& lhs, int64_t d);
+-DynExpr* operator-(DynExpr& lhs, DynExpr& rhs);
+-DynExpr* operator-(DynExpr& lhs, int64_t d);
+-bool operator==(DynExpr& lhs, DynExpr& rhs);
+-bool operator==(DynExpr& lhs, int64_t d);
+-
+-inline DynExpr* DynExpr::_(int64_t val) {
+-  if (val == 0) return DynExpr::zero;
+-  if (val == 1) return DynExpr::one;
+-  return new Constant(val);
+-}
+-inline DynExpr* DynExpr::V(int var_id) { return new Variable(var_id); }
+-
+ // A shape describes the number of dimensions in a array, the bounds of each
+ // dimension, and the primitive component type. For tuples, shape describes the
+ // structure (number of elements and nesting).
+@@ -570,7 +222,9 @@ class Shape {
+   bool has_dynamic_expr() const {
+     if (auto* const state = if_array_state()) {
+       return absl::c_any_of(state->expressions,
+-                            [](DynExpr* e) { return e->is_dynamic(); });
++                            [](DynExpr* e) {
++                              return e != nullptr && e->is_dynamic();
++                            });
+     }
+     if (auto* const state = if_tuple_state()) {
+       return absl::c_any_of(state->tuple_shapes, [](Shape subshape) {
+@@ -581,7 +235,11 @@ class Shape {
+   }
+ 
+   DynExpr* expressions(int dimension) const {
+-    return array_state().expressions[dimension];
++    if (dimension < 0) return DynExpr::_(-999);
++    const auto& exprs = array_state().expressions;
++    const size_t dim = static_cast<size_t>(dimension);
++    if (dim >= exprs.size()) return DynExpr::_(-999);
++    return exprs[dim] != nullptr ? exprs[dim] : DynExpr::_(-999);
+   }
+ 
+   // Returns true if the given dimension is statically-sized.
+diff --git a/third_party/xla/xla/shape_dynexpr.h b/third_party/xla/xla/shape_dynexpr.h
+new file mode 100644
+index 00000000000..5c1f5645c25
+--- /dev/null
++++ b/third_party/xla/xla/shape_dynexpr.h
+@@ -0,0 +1,379 @@
++/* Copyright 2018 The OpenXLA Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#ifndef XLA_SHAPE_DYNEXPR_H_
++#define XLA_SHAPE_DYNEXPR_H_
++
++#include <set>
++#include <cstdint>
++#include <ostream>
++
++#include "xla/printer.h"
++#include "xla/xla_data.pb.h"
++
++namespace xla {
++
++class DynExpr {
++ public:
++  virtual ~DynExpr() = default;
++  virtual void print(xla::Printer* printer) const = 0;
++  virtual void to_proto(xla::ExpressionProto* proto) const = 0;
++  virtual bool is_constant() const = 0;
++  virtual int64_t get_val() const { return -1; }
++  virtual DynExpr* s() = 0; // simplify
++  virtual DynExpr* substitute(int id, DynExpr* v) = 0;
++  virtual std::set<int> get_all_ids() = 0;
++  virtual int64_t solve(int64_t x) = 0;
++
++  bool is_dynamic() { return !is_constant(); }
++
++  static DynExpr* zero;
++  static DynExpr* one;
++  static DynExpr* _(int64_t val);
++  static DynExpr* V(int var_id);
++  static DynExpr* _s(DynExpr* expr);
++  static bool equal(DynExpr* expr1, DynExpr* expr2);
++
++  friend std::ostream& operator<<(std::ostream& os, DynExpr* expr);
++};
++
++// constant i
++class Constant : public DynExpr {
++  int64_t value;
++
++ public:
++  explicit Constant(int64_t v) : value(v) {}
++  void print(xla::Printer* printer) const override {
++    if (value < 0) {
++      printer->Append("(");
++    }
++    printer->Append(value);
++    if (value < 0) {
++      printer->Append(")");
++    }
++  }
++  void to_proto(xla::ExpressionProto* proto) const override {
++    proto->set_constant_value(value);
++  }
++  bool is_constant() const override { return true; }
++  int64_t get_val() const override { return value; }
++  DynExpr* substitute(int id, DynExpr* v) { return this; }
++  std::set<int> get_all_ids() { return {}; }
++  int64_t solve(int64_t x) { return -1; }
++  DynExpr* s() override;
++};
++
++// var id (int)
++class Variable : public DynExpr {
++  int id;
++
++ public:
++  explicit Variable(int identifier) : id(identifier) {}
++  void print(xla::Printer* printer) const override {
++    // printer->Append("(Var ");
++    char letter = 'A' + (id - 1);
++    printer->Append(std::string(1, letter));
++    // printer->Append(")");
++  }
++  void to_proto(xla::ExpressionProto* proto) const override {
++    proto->set_variable_id(id);
++  }
++  bool is_constant() const override { return false; }
++  int get_id() const { return id; }
++  DynExpr* substitute(int id, DynExpr* v) { return get_id() == id ? v : this;}
++  std::set<int> get_all_ids() { return {get_id()}; }
++  int64_t solve(int64_t x) { return x; }
++  DynExpr* s() override;
++};
++
++// exp = exp + exp
++class Add : public DynExpr {
++  DynExpr* lhs;
++  DynExpr* rhs;
++
++ public:
++  Add(DynExpr* l, DynExpr* r) : lhs(std::move(l)), rhs(std::move(r)) {}
++  void print(xla::Printer* printer) const override {
++    printer->Append("(");
++    lhs->print(printer);
++    printer->Append(" + ");
++    rhs->print(printer);
++    printer->Append(")");
++  }
++
++  DynExpr* get_lhs() const { return lhs; }
++  DynExpr* get_rhs() const { return rhs; }
++
++  void to_proto(xla::ExpressionProto* proto) const override {
++    auto* add_msg = proto->mutable_add_node();
++    lhs->to_proto(add_msg->mutable_lhs());
++    rhs->to_proto(add_msg->mutable_rhs());
++  }
++
++  bool is_constant() const override {
++    return lhs->is_constant() && rhs->is_constant();
++  }
++
++  int64_t get_val() const override { return lhs->get_val() + rhs->get_val(); }
++
++  DynExpr* substitute(int id, DynExpr* v) {
++    return new Add(lhs->substitute(id, v), rhs->substitute(id, v));
++  }
++
++  std::set<int> get_all_ids() {
++    auto s = lhs->get_all_ids();
++    s.merge(rhs->get_all_ids());
++    return s;
++  }
++
++  int64_t solve(int64_t x) {
++    // Cannot solve if both lhs and rhs are dynamic...
++    if (lhs->is_dynamic() && rhs->is_dynamic()) return -1;
++    if (lhs->get_all_ids().size() == 1) {
++      // (A + c) = x <=> A = x - c => solve A = y with y = x - c
++      return lhs->solve(x - rhs->get_val());
++    }
++    if (rhs->get_all_ids().size() == 1) {
++      // (c + A) = x <=> A = x - c => solve A = y with y = x - c
++      return rhs->solve(x - lhs->get_val());
++    }
++    // No solution
++    return -1;
++  }
++
++  DynExpr* s() override;
++
++  ~Add() {
++    delete lhs;
++    delete rhs;
++  }
++};
++
++// exp = exp - exp
++class Sub : public DynExpr {
++  DynExpr* lhs;
++  DynExpr* rhs;
++
++ public:
++  Sub(DynExpr* l, DynExpr* r) : lhs(std::move(l)), rhs(std::move(r)) {}
++  void print(xla::Printer* printer) const override {
++    printer->Append("(");
++    lhs->print(printer);
++    printer->Append(" - ");
++    rhs->print(printer);
++    printer->Append(")");
++  }
++
++  DynExpr* get_lhs() const { return lhs; }
++  DynExpr* get_rhs() const { return rhs; }
++
++  void to_proto(xla::ExpressionProto* proto) const override {
++    auto* sub_msg = proto->mutable_sub_node();
++    lhs->to_proto(sub_msg->mutable_lhs());
++    rhs->to_proto(sub_msg->mutable_rhs());
++  }
++
++  bool is_constant() const override {
++    return lhs->is_constant() && rhs->is_constant();
++  }
++
++  int64_t get_val() const override { return lhs->get_val() - rhs->get_val(); }
++
++  DynExpr* substitute(int id, DynExpr* v) {
++    return new Sub(lhs->substitute(id, v), rhs->substitute(id, v));
++  }
++
++  std::set<int> get_all_ids() {
++    auto s = lhs->get_all_ids();
++    s.merge(rhs->get_all_ids());
++    return s;
++  }
++
++  int64_t solve(int64_t x) {
++    // Cannot solve if both lhs and rhs are dynamic...
++    if (lhs->is_dynamic() && rhs->is_dynamic()) return -1;
++    if (lhs->get_all_ids().size() == 1) {
++      // (A - c) = x <=> A = x + c => solve A = y with y = x + c
++      return lhs->solve(x + rhs->get_val());
++    }
++    if (rhs->get_all_ids().size() == 1) {
++      // (c + A) = x <=> A = x - c => solve A = y with y = x + c
++      return rhs->solve(x + lhs->get_val());
++    }
++    // No solution
++    return -1;
++  }
++
++  DynExpr* s() override;
++
++  ~Sub() {
++    delete lhs;
++    delete rhs;
++  }
++};
++
++// exp = exp * exp
++class Mul : public DynExpr {
++  DynExpr* lhs;
++  DynExpr* rhs;
++
++ public:
++  Mul(DynExpr* l, DynExpr* r) : lhs(std::move(l)), rhs(std::move(r)) {}
++  void print(xla::Printer* printer) const override {
++    printer->Append("(");
++    lhs->print(printer);
++    printer->Append(" * ");
++    rhs->print(printer);
++    printer->Append(")");
++  }
++
++  DynExpr* get_lhs() const { return lhs; }
++  DynExpr* get_rhs() const { return rhs; }
++
++  void to_proto(xla::ExpressionProto* proto) const override {
++    auto* mul_msg = proto->mutable_mul_node();
++    lhs->to_proto(mul_msg->mutable_lhs());
++    rhs->to_proto(mul_msg->mutable_rhs());
++  }
++
++  bool is_constant() const override {
++    return lhs->is_constant() && rhs->is_constant();
++  }
++
++  int64_t get_val() const override { return lhs->get_val() * rhs->get_val(); }
++
++  DynExpr* substitute(int id, DynExpr* v) {
++    return new Mul(lhs->substitute(id, v), rhs->substitute(id, v));
++  }
++
++  std::set<int> get_all_ids() {
++    auto s = lhs->get_all_ids();
++    s.merge(rhs->get_all_ids());
++    return s;
++  }
++
++  int64_t solve(int64_t x) {
++    // Cannot solve if both lhs and rhs are dynamic...
++    if (lhs->is_dynamic() && rhs->is_dynamic()) return -1;
++    if (lhs->get_all_ids().size() == 1) {
++      // (A * c) = x <=> A = x / c => solve A = y with y = x / c
++      int64_t c = rhs->get_val();
++      if (x % c != 0) return -1;
++      return lhs->solve(x / c);
++    }
++    if (rhs->get_all_ids().size() == 1) {
++      // (c * A) = x <=> A = x / c => solve A = y with y = x / c
++      int64_t c = lhs->get_val();
++      if (x % c != 0) return -1;
++      return rhs->solve(x / c);
++    }
++    // No solution
++    return -1;
++  }
++
++  DynExpr* s() override;
++
++  ~Mul() {
++    delete lhs;
++    delete rhs;
++  }
++};
++
++// expr / expr
++class Div : public DynExpr {
++  DynExpr* lhs;
++  DynExpr* rhs;
++
++ public:
++  Div(DynExpr* l, DynExpr* r) : lhs(std::move(l)), rhs(std::move(r)) {}
++  void print(xla::Printer* printer) const override {
++    printer->Append("(");
++    lhs->print(printer);
++    printer->Append(" / ( ");
++    rhs->print(printer);
++    printer->Append(") )");
++  }
++
++  DynExpr* get_lhs() const { return lhs; }
++  DynExpr* get_rhs() const { return rhs; }
++
++  void to_proto(xla::ExpressionProto* proto) const override {
++    auto* div_msg = proto->mutable_div_node();
++    lhs->to_proto(div_msg->mutable_lhs());
++    rhs->to_proto(div_msg->mutable_rhs());
++  }
++
++  bool is_constant() const override {
++    return lhs->is_constant() && rhs->is_constant();
++  }
++
++  int64_t get_val() const override { return lhs->get_val() / rhs->get_val(); }
++
++  DynExpr* substitute(int id, DynExpr* v) {
++    return new Div(lhs->substitute(id, v), rhs->substitute(id, v));
++  }
++
++  DynExpr* s() override;
++
++  std::set<int> get_all_ids() {
++    auto s = lhs->get_all_ids();
++    s.merge(rhs->get_all_ids());
++    return s;
++  }
++
++  int64_t solve(int64_t x) {
++    // Cannot solve if both lhs and rhs are dynamic...
++    if (lhs->is_dynamic() && rhs->is_dynamic()) return -1;
++    if (lhs->get_all_ids().size() == 1) {
++      // (A / c) = x <=> A = x * c => solve A = y with y = x * c
++      return lhs->solve(x * rhs->get_val());
++    }
++    if (rhs->get_all_ids().size() == 1) {
++      // (c / A) = x <=> A = c / x => solve A = y with y = c / x
++      int64_t c = lhs->get_val();
++      if (c % x != 0) return -1;
++      return rhs->solve(c / x);
++    }
++    // No solution
++    return -1;
++  }
++
++  ~Div() {
++    delete lhs;
++    delete rhs;
++  }
++};
++
++DynExpr* operator*(DynExpr& lhs, DynExpr& rhs);
++DynExpr* operator*(int64_t k, DynExpr& rhs);
++DynExpr* operator/(DynExpr& lhs, DynExpr& rhs);
++DynExpr* operator/(DynExpr& lhs, int64_t d);
++DynExpr* operator+(DynExpr& lhs, DynExpr& rhs);
++DynExpr* operator+(DynExpr& lhs, int64_t d);
++DynExpr* operator-(DynExpr& lhs, DynExpr& rhs);
++DynExpr* operator-(DynExpr& lhs, int64_t d);
++bool operator==(DynExpr& lhs, DynExpr& rhs);
++bool operator==(DynExpr& lhs, int64_t d);
++
++inline DynExpr* DynExpr::_(int64_t val) {
++  if (val == 0) return DynExpr::zero;
++  if (val == 1) return DynExpr::one;
++  return new Constant(val);
++}
++inline DynExpr* DynExpr::V(int var_id) { return new Variable(var_id); }
++
++}  // namespace xla
++
++#endif  // XLA_SHAPE_DYNEXPR_H_
+diff --git a/third_party/xla/xla/shape_util.cc b/third_party/xla/xla/shape_util.cc
+index de0ab94330a..edc8a18e208 100644
+--- a/third_party/xla/xla/shape_util.cc
++++ b/third_party/xla/xla/shape_util.cc
+@@ -759,18 +759,19 @@ Shape ShapeUtil::PrependMajorDimension(int64_t bound, Shape shape) {
+     } else {
+       // Only print constant expression if it is different than the dimension
+       // (i.e. it is wrong!)
+-      bool is_wrong = shape.expressions(i)->is_constant() &&
+-                      shape.expressions(i)->get_val() != shape.dimensions(i);
++      DynExpr* expr = shape.expressions(i);
++      bool is_wrong = expr != nullptr && expr->is_constant() &&
++                      expr->get_val() != shape.dimensions(i);
+       printer->Append(shape.dimensions(i));
+       if (is_wrong) {
+         LOG(ERROR) << "THIS SHOULD NEVER HAPPEN! " << shape.ToString();
+         printer->Append("<!");
+-        shape.expressions(i)->print(printer);
++        expr->print(printer);
+         printer->Append("!>");
+       }
+-      if (shape.expressions(i) && (shape.expressions(i)->is_dynamic())) {
++      if (expr != nullptr && expr->is_dynamic()) {
+         printer->Append("<");
+-        shape.expressions(i)->print(printer);
++        expr->print(printer);
+         printer->Append(">");
+       }
+     }

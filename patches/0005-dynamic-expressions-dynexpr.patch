@@ -1,0 +1,1282 @@
+diff --git a/tensorflow/compiler/jit/encapsulate_subgraphs_pass.cc b/tensorflow/compiler/jit/encapsulate_subgraphs_pass.cc
+index 06629768973..1dc719ccea7 100644
+--- a/tensorflow/compiler/jit/encapsulate_subgraphs_pass.cc
++++ b/tensorflow/compiler/jit/encapsulate_subgraphs_pass.cc
+@@ -145,14 +145,17 @@ std::string ExprProtoToString(const ExpressionProto& e) {
+   }
+ }
+ 
+-std::map<std::string, std::vector<std::unique_ptr<DynExpr>>> test_map;
++// node mapping to multiple vectors of expressions (one for each output in
++// order)
++std::map<std::string, std::vector<std::vector<std::unique_ptr<DimExpr>>>>
++    expr_map;
+ 
+-std::unique_ptr<DynExpr> ExprFromProto(const ExpressionProto& proto) {
++std::unique_ptr<DimExpr> ExprFromProto(const ExpressionProto& proto) {
+   switch (proto.node_type_case()) {
+     case ExpressionProto::kConstantValue:
+-      return DynExpr::Cons(proto.constant_value());
++      return DimExpr::Cons(proto.constant_value());
+     case ExpressionProto::kVariableId:
+-      return DynExpr::Var(proto.variable_id());
++      return DimExpr::Var(proto.variable_id());
+     case ExpressionProto::kAddNode: {
+       auto lhs = ExprFromProto(proto.add_node().lhs());
+       auto rhs = ExprFromProto(proto.add_node().rhs());
+@@ -181,6 +184,36 @@ std::unique_ptr<DynExpr> ExprFromProto(const ExpressionProto& proto) {
+   }
+ }
+ 
++static xla::DynExpr* DimExprToDynExpr(const DimExpr* e) {
++  switch (e->kind()) {
++    case DimExpr::Kind::kConstant: {
++      auto* ac = static_cast<const Constant*>(e);
++      return xla::DynExpr::_(ac->value());
++    }
++    case DimExpr::Kind::kVariable: {
++      auto* av = static_cast<const Variable*>(e);
++      return xla::DynExpr::V(1);  // Use 1 all the time for now
++    }
++    case DimExpr::Kind::kAdd: {
++      auto* ee = static_cast<const ExprAdd*>(e);
++      return *DimExprToDynExpr(ee->lhs()) + *DimExprToDynExpr(ee->rhs());
++    }
++    case DimExpr::Kind::kSub: {
++      auto* ee = static_cast<const ExprSub*>(e);
++      return *DimExprToDynExpr(ee->lhs()) - *DimExprToDynExpr(ee->rhs());
++    }
++    case DimExpr::Kind::kMul: {
++      auto* ee = static_cast<const ExprMul*>(e);
++      return *DimExprToDynExpr(ee->lhs()) * *DimExprToDynExpr(ee->rhs());
++    }
++    case DimExpr::Kind::kDiv: {
++      auto* ee = static_cast<const ExprDiv*>(e);
++      return *DimExprToDynExpr(ee->lhs()) / *DimExprToDynExpr(ee->rhs());
++    }
++  }
++  return nullptr;
++}
++
+ // Runs Grappler static inference and logs any ExpressionProto found in output
+ // tensor shapes (from GraphProperties, not from _output_shapes attrs).
+ void LogExpressionsViaGraphProperties(const tensorflow::Graph& graph) {
+@@ -218,12 +251,13 @@ void LogExpressionsViaGraphProperties(const tensorflow::Graph& graph) {
+   for (const NodeDef& n : graph_def.node()) {
+     if (!props.HasOutputProperties(n.name())) continue;
+     const auto& outs = props.GetOutputProperties(n.name());
++    std::vector<std::vector<std::unique_ptr<DimExpr>>> list_exprs(outs.size());
+     for (int out_idx = 0; out_idx < static_cast<int>(outs.size()); ++out_idx) {
+       const auto& tp = outs[out_idx];
+       const TensorShapeProto& shp = tp.shape();
+ 
+       if (shp.unknown_rank()) continue;
+-      std::vector<std::unique_ptr<DynExpr>> exprs;
++      std::vector<std::unique_ptr<DimExpr>> exprs;
+       for (int d = 0; d < shp.dim_size(); ++d) {
+         const auto& dim = shp.dim(d);
+ 
+@@ -239,8 +273,10 @@ void LogExpressionsViaGraphProperties(const tensorflow::Graph& graph) {
+ 
+         ++found;
+       }
+-      test_map[n.name()] = std::move(exprs);
++      list_exprs[out_idx] = std::move(exprs);
+     }
++    expr_map[n.name()] = std::move(list_exprs);
++
+   }
+ 
+   VLOG(1) << "[EXPR][GP] === Found " << found
+@@ -585,6 +621,31 @@ Node* Encapsulator::Subgraph::MakeNodeImage(const Graph* graph_in, Node* node) {
+ 
+ Graph* Encapsulator::Subgraph::GetGraph() const { return graph_.get(); }
+ 
++void ExprToProto(xla::DynExpr* expr, ExpressionProto* proto) {
++  auto e = expr->s();
++  if (xla::Constant* c = dynamic_cast<xla::Constant*>(e)) {
++    proto->set_constant_value(c->get_val());
++  } else if (xla::Variable* v = dynamic_cast<xla::Variable*>(e)) {
++    proto->set_variable_id(v->get_id());
++  } else if (xla::Add* a = dynamic_cast<xla::Add*>(e)) {
++    auto* add_msg = proto->mutable_add_node();
++    ExprToProto(a->get_lhs(), add_msg->mutable_lhs());
++    ExprToProto(a->get_rhs(), add_msg->mutable_rhs());
++  } else if (xla::Mul* m = dynamic_cast<xla::Mul*>(e)) {
++    auto* mul_msg = proto->mutable_mul_node();
++    ExprToProto(m->get_lhs(), mul_msg->mutable_lhs());
++    ExprToProto(m->get_rhs(), mul_msg->mutable_rhs());
++  } else if (xla::Sub* s = dynamic_cast<xla::Sub*>(e)) {
++    auto* sub_msg = proto->mutable_sub_node();
++    ExprToProto(s->get_lhs(), sub_msg->mutable_lhs());
++    ExprToProto(s->get_rhs(), sub_msg->mutable_rhs());
++  } else if (xla::Div* d = dynamic_cast<xla::Div*>(e)) {
++    auto* div_msg = proto->mutable_div_node();
++    ExprToProto(d->get_lhs(), div_msg->mutable_lhs());
++    ExprToProto(d->get_rhs(), div_msg->mutable_rhs());
++  }
++}
++
+ absl::Status Encapsulator::Subgraph::RecordArg(
+     const Edge* edge,
+     const absl::flat_hash_map<const Node*, Node*>& node_images,
+@@ -607,26 +668,26 @@ absl::Status Encapsulator::Subgraph::RecordArg(
+     AttrSlice attrs = src_node->attrs();
+     auto shape_attr = attrs.FindByString("_output_shapes");
+     if (shape_attr && shape_attr->has_list()) {
++      AttrValue mutable_shape_attr = *shape_attr;
+       const TensorShapeProto& shape = shape_attr->list().shape(src_slot);
+-      std::vector<std::unique_ptr<DynExpr>> expressions =
+-          std::move(test_map[src_node->name()]);
+-      for (const auto& e : expressions) {
+-        if (!e->IsConstant()) {
+-          builder.Attr("_is_batch", true);
+-        }
+-      }
+-      if (shape.dim_size() >= 1 && shape.dim(0).size() == -1) {
+-        VLOG(1) << "Found Dynamic dimension in " << src_node->name() << ":"
+-                << src_slot;
+-        builder.Attr("_is_batch", true);
++      TensorShapeProto* tsp =
++          mutable_shape_attr.mutable_list()->mutable_shape(src_slot);
++      std::vector<std::unique_ptr<DimExpr>> expressions =
++          std::move(expr_map[src_node->name()][src_slot]);
++
++      for (int i = 0; i < expressions.size(); i++) {
++        auto ee = DimExprToDynExpr(std::move(expressions[i]).get())->s();
++        ExpressionProto* eproto = tsp->add_expressions();
++        ExprToProto(ee, eproto);
+       }
++        builder.Attr("_output_shapes", {*tsp});
+     } else {
+       // if cluster argument is the real argument.
+       auto build_attr = attrs.FindByString("_is_batch");
+       if (build_attr) {
+         VLOG(1) << "Found Dynamic dimension in " << src_node->name() << ":"
+                 << src_slot;
+-        builder.Attr("_is_batch", true);
++          builder.Attr("_dynamic_dim", 0);
+       }
+     }
+     absl::Status s = builder.Finalize(&arg_def);
+diff --git a/tensorflow/compiler/jit/kernels/xla_ops.cc b/tensorflow/compiler/jit/kernels/xla_ops.cc
+index 50c57067c62..5b9c6500ce2 100644
+--- a/tensorflow/compiler/jit/kernels/xla_ops.cc
++++ b/tensorflow/compiler/jit/kernels/xla_ops.cc
+@@ -381,6 +381,72 @@ GetXlaCompilerArgsAndSnapshotVariables(
+   return result;
+ }
+ 
++
++std::unique_ptr<DimExpr> ExprFromProto(const ExpressionProto& proto) {
++  switch (proto.node_type_case()) {
++    case ExpressionProto::kConstantValue:
++      return DimExpr::Cons(proto.constant_value());
++    case ExpressionProto::kVariableId:
++      return DimExpr::Var(proto.variable_id());
++    case ExpressionProto::kAddNode: {
++      auto lhs = ExprFromProto(proto.add_node().lhs());
++      auto rhs = ExprFromProto(proto.add_node().rhs());
++      // Note: These are owning pointers, but ExprAdd takes raw pointers.
++      // The caller must manage lifetime appropriately.
++      return std::make_unique<ExprAdd>(lhs.release(), rhs.release());
++    }
++    case ExpressionProto::kSubNode: {
++      auto lhs = ExprFromProto(proto.sub_node().lhs());
++      auto rhs = ExprFromProto(proto.sub_node().rhs());
++      return std::make_unique<ExprSub>(lhs.release(), rhs.release());
++    }
++    case ExpressionProto::kMulNode: {
++      auto lhs = ExprFromProto(proto.mul_node().lhs());
++      auto rhs = ExprFromProto(proto.mul_node().rhs());
++      return std::make_unique<ExprMul>(lhs.release(), rhs.release());
++    }
++    case ExpressionProto::kDivNode: {
++      auto lhs = ExprFromProto(proto.div_node().lhs());
++      auto rhs = ExprFromProto(proto.div_node().rhs());
++      return std::make_unique<ExprDiv>(lhs.release(), rhs.release());
++    }
++    case ExpressionProto::NODE_TYPE_NOT_SET:
++    default:
++      return nullptr;
++  }
++}
++
++static xla::DynExpr* DimExprToDynExpr(const DimExpr* e) {
++  switch (e->kind()) {
++    case DimExpr::Kind::kConstant: {
++      auto* ac = static_cast<const Constant*>(e);
++      return xla::DynExpr::_(ac->value());
++    }
++    case DimExpr::Kind::kVariable: {
++      auto* av = static_cast<const Variable*>(e);
++      return xla::DynExpr::V(1);  // Use 1 all the time for now
++    }
++    case DimExpr::Kind::kAdd: {
++      auto* ee = static_cast<const ExprAdd*>(e);
++      return *DimExprToDynExpr(ee->lhs()) + *DimExprToDynExpr(ee->rhs());
++    }
++    case DimExpr::Kind::kSub: {
++      auto* ee = static_cast<const ExprSub*>(e);
++      return *DimExprToDynExpr(ee->lhs()) - *DimExprToDynExpr(ee->rhs());
++    }
++    case DimExpr::Kind::kMul: {
++      auto* ee = static_cast<const ExprMul*>(e);
++      return *DimExprToDynExpr(ee->lhs()) * *DimExprToDynExpr(ee->rhs());
++    }
++    case DimExpr::Kind::kDiv: {
++      auto* ee = static_cast<const ExprDiv*>(e);
++      return *DimExprToDynExpr(ee->lhs()) / *DimExprToDynExpr(ee->rhs());
++    }
++  }
++  return nullptr;
++}
++
++
+ absl::Status CompileToLocalExecutable(
+     OpKernelContext* ctx, const NameAttrList& function, bool has_ref_vars,
+     const XlaPlatformInfo& platform_info,
+@@ -437,31 +503,73 @@ absl::Status CompileToLocalExecutable(
+     std::vector<XlaCompiler::Argument> norm_args(args.begin(), args.end());
+     int64_t filled_batch = 0;
+     int64_t old_batch = 0;
+-    XlaBatchMatcher* xla_batch_matcher = xla_device_compiler->xla_batch_matcher();
++    XlaBatchMatcher* xla_batch_matcher =
++        xla_device_compiler->xla_batch_matcher();
+     if (options.flib_def != nullptr) {
+       const FunctionDef* fdef = options.flib_def->Find(function.name());
+       if (fdef != nullptr) {
+         for (const auto& kv : fdef->arg_attr()) {
+           int arg_index = kv.first;
+           const auto& attr_map = kv.second.attr();
+-          auto it = attr_map.find("_is_batch");
++          const std::string& node_name =
++              fdef->signature().input_arg(arg_index).name();
+ 
+-          const AttrValue& v = it->second;
+-          if (it == attr_map.end()) continue;
+-
+-          if (!filled_batch && xla_batch_matcher) {
++          // Special case for _dynamic_dim...
++          auto dyn_dim_attr = attr_map.find("_dynamic_dim");
++          if (dyn_dim_attr != attr_map.end()) {
+             TensorShape& shp =
+                 std::get<TensorShape>(norm_args[arg_index].shape);
+-            old_batch = shp.dim_size(0);
+-            filled_batch =
+-                xla_batch_matcher->get_xla_compile_batch(shp.dim_size(0));
++            const AttrValue& v = dyn_dim_attr->second;
++            int64_t idx = v.i();
++            if (!filled_batch && xla_batch_matcher) {
++              TensorShape& shp =
++                  std::get<TensorShape>(norm_args[arg_index].shape);
++              old_batch = shp.dim_size(0);
++              filled_batch =
++                  xla_batch_matcher->get_xla_compile_batch(old_batch);
++            }
++
++            std::vector<xla::DynExpr*> dyn_exprs;
++            for (int d : shp.dim_sizes()) {
++              dyn_exprs.push_back(xla::DynExpr::_(d));
++            }
++            dyn_exprs[idx] = xla::DynExpr::V(1);
++            shp.set_expressions(dyn_exprs);
++            continue;
+           }
++          auto it = attr_map.find("_output_shapes");
++          if (it == attr_map.end()) continue;
++
++          const TensorShapeProto& proto = it->second.list().shape(0);
++          const auto& exp = proto.expressions();
+           TensorShape& shp = std::get<TensorShape>(norm_args[arg_index].shape);
++
++          if (!filled_batch && xla_batch_matcher) {
++            for (int idx = 0; idx < exp.size(); ++idx) {
++              // Look for dynamic expression. If found then compute padding
++              // value and exit loop.
++              auto e = DimExprToDynExpr(ExprFromProto(exp[idx]).get())->s();
++              if (e->is_dynamic()) {
++                const std::string& node_name =
++                    fdef->signature().input_arg(arg_index).name();
++                old_batch = shp.dim_size(idx);
++                filled_batch =
++                    xla_batch_matcher->get_xla_compile_batch(old_batch);
++                break;
++              }
++            }
++          }
++
+           std::vector<xla::DynExpr*> dyn_exprs;
+           for (int d : shp.dim_sizes()) {
+             dyn_exprs.push_back(xla::DynExpr::_(d));
+           }
+-          dyn_exprs[0] = xla::DynExpr::V(1);
++          for (int j = 0; j < exp.size(); ++j) {
++            auto e = DimExprToDynExpr(ExprFromProto(exp[j]).get())->s();
++            if (e->is_dynamic()) {
++              dyn_exprs[j] = e;
++            }
++          }
+           shp.set_expressions(dyn_exprs);
+         }
+       }
+diff --git a/tensorflow/compiler/jit/xla_batch_matcher.cc b/tensorflow/compiler/jit/xla_batch_matcher.cc
+index 088eef41398..1e30b055497 100644
+--- a/tensorflow/compiler/jit/xla_batch_matcher.cc
++++ b/tensorflow/compiler/jit/xla_batch_matcher.cc
+@@ -5,9 +5,9 @@
+ namespace tensorflow {
+ 
+ XlaBatchMatcher::XlaBatchMatcher() {
+-  const std::string& xla_compile_batch_sizes =
++  const std::string xla_compile_batch_sizes =
+       xla::GetDebugOptionsFromFlags().xla_compile_batch_sizes();
+-  env_str_ = std::getenv(xla_compile_batch_sizes.c_str());
++  env_str_ = xla_compile_batch_sizes.c_str();
+   parse_env_config();
+ }
+ 
+diff --git a/tensorflow/compiler/tf2xla/kernels/reshape_op.cc b/tensorflow/compiler/tf2xla/kernels/reshape_op.cc
+index cadbafe2d27..81646061c49 100644
+--- a/tensorflow/compiler/tf2xla/kernels/reshape_op.cc
++++ b/tensorflow/compiler/tf2xla/kernels/reshape_op.cc
+@@ -170,6 +170,10 @@ class ReshapeOp : public XlaOpKernel {
+       shape.set_expression(
+           unknown_index, missing_expr->s());
+     }
++    if(shape.num_elements() != input_shape.num_elements()){
++      LOG(INFO) << "ERROR SHAPE IS " << shape;
++      LOG(INFO) << "ERROR INPUT IS " << input_shape;
++    }
+     OP_REQUIRES(ctx, shape.num_elements() == input_shape.num_elements(),
+                 errors::InvalidArgument("Input to reshape is a tensor with ",
+                                         input_shape.num_elements(),
+diff --git a/tensorflow/core/framework/shape_inference.cc b/tensorflow/core/framework/shape_inference.cc
+index 5a4fe02f147..b1336bf4398 100644
+--- a/tensorflow/core/framework/shape_inference.cc
++++ b/tensorflow/core/framework/shape_inference.cc
+@@ -249,7 +249,7 @@ void InferenceContext::ShapeHandleToProto(ShapeHandle handle,
+     } else {
+       dim_shape->set_size(-1);
+       // Serialize expression if available.
+-      if (DynExpr* expr = DimExpr(dim)) {
++      if (DimExpr* expr = GetDimExpr(dim)) {
+         expr->ToProto(dim_shape->mutable_expr());
+       }
+     }
+@@ -287,25 +287,25 @@ DimensionHandle InferenceContext::NumElements(ShapeHandle s) {
+ }
+ 
+ DimensionHandle InferenceContext::UnknownDimWithExpr(
+-    std::unique_ptr<DynExpr> expr) {
+-  DynExpr* owned = shape_manager_.OwnExpr(std::move(expr));
++    std::unique_ptr<DimExpr> expr) {
++  DimExpr* owned = shape_manager_.OwnExpr(std::move(expr));
+   return shape_manager_.MakeDim(kUnknownDim, /*dynamic_ratio*/0, owned);
+ }
+ 
+-DynExpr* InferenceContext::DimExpr(DimensionHandle d) const {
++DimExpr* InferenceContext::GetDimExpr(DimensionHandle d) const {
+   if (!d.IsSet()) return nullptr;
+   return d->expr_;
+ }
+ 
+-DynExpr* InferenceContext::MakeConstExpr(int64_t v) {
++DimExpr* InferenceContext::MakeConstExpr(int64_t v) {
+   return shape_manager_.OwnExpr(std::make_unique<Constant>(v));
+ }
+ 
+-DynExpr* InferenceContext::ExprForDim(DimensionHandle d) {
++DimExpr* InferenceContext::ExprForDim(DimensionHandle d) {
+   if (!d.IsSet()) return nullptr;
+ 
+   // If already tagged with expr, use it.
+-  if (DynExpr* e = DimExpr(d)) return e;
++  if (DimExpr* e = GetDimExpr(d)) return e;
+ 
+   // Known dim -> const expr.
+   if (ValueKnown(d)) {
+@@ -980,9 +980,9 @@ absl::Status InferenceContext::MakeShapeFromShapeProto(
+       if (dim_proto.has_expr() && dim_proto.expr().node_type_case() !=
+                                       ExpressionProto::NODE_TYPE_NOT_SET) {
+         // Deserialize expression
+-        std::unique_ptr<DynExpr> expr = DynExpr::FromProto(dim_proto.expr());
++        std::unique_ptr<DimExpr> expr = DimExpr::FromProto(dim_proto.expr());
+         if (expr) {
+-          DynExpr* owned = shape_manager_.OwnExpr(std::move(expr));
++          DimExpr* owned = shape_manager_.OwnExpr(std::move(expr));
+           dims.push_back(shape_manager_.MakeDim(kUnknownDim,/*dynamic_ratio */ 0, owned));
+         } else {
+           dims.push_back(UnknownDim());
+@@ -1124,11 +1124,11 @@ absl::Status InferenceContext::Divide(DimensionHandle dividend,
+     return absl::OkStatus();
+   }
+   // At least one operand unknown: try to build expression.
+-  DynExpr* lhs = ExprForDim(dividend);
+-  DynExpr* rhs = divisor.dim.IsSet() ? ExprForDim(divisor.dim)
++  DimExpr* lhs = ExprForDim(dividend);
++  DimExpr* rhs = divisor.dim.IsSet() ? ExprForDim(divisor.dim)
+                                      : MakeConstExpr(divisor.val);
+   if (lhs && rhs) {
+-    DynExpr* node = shape_manager_.OwnExpr(
++    DimExpr* node = shape_manager_.OwnExpr(
+         std::make_unique<ExprDiv>(lhs, rhs));
+     *out = shape_manager_.MakeDim(kUnknownDim, /*dynamic_ratio*/0, node);
+   } else {
+@@ -1166,12 +1166,12 @@ absl::Status InferenceContext::Add(DimensionHandle first,
+   }
+ 
+   // At least one operand unknown: try to build expression.
+-  DynExpr* lhs = ExprForDim(first);
+-  DynExpr* rhs =
++  DimExpr* lhs = ExprForDim(first);
++  DimExpr* rhs =
+       second.dim.IsSet() ? ExprForDim(second.dim) : MakeConstExpr(second.val);
+ 
+   if (lhs && rhs) {
+-    DynExpr* node = shape_manager_.OwnExpr(std::make_unique<ExprAdd>(lhs, rhs));
++    DimExpr* node = shape_manager_.OwnExpr(std::make_unique<ExprAdd>(lhs, rhs));
+     *out = shape_manager_.MakeDim(kUnknownDim, /*dynamic_ratio*/ 0, node);
+   } else {
+     *out = UnknownDim();  // Can't form expr.
+@@ -1202,11 +1202,11 @@ absl::Status InferenceContext::Subtract(DimensionHandle first,
+     return absl::OkStatus();
+   }
+   // At least one operand unknown: try to build expression.
+-  DynExpr* lhs = ExprForDim(first);
+-  DynExpr* rhs =
++  DimExpr* lhs = ExprForDim(first);
++  DimExpr* rhs =
+       second.dim.IsSet() ? ExprForDim(second.dim) : MakeConstExpr(second.val);
+   if (lhs && rhs) {
+-    DynExpr* node = shape_manager_.OwnExpr(std::make_unique<ExprSub>(lhs, rhs));
++    DimExpr* node = shape_manager_.OwnExpr(std::make_unique<ExprSub>(lhs, rhs));
+     *out = shape_manager_.MakeDim(kUnknownDim, /*dynamic_ratio*/ 0, node);
+   } else {
+     *out = UnknownDim();  // Can't form expr.
+@@ -1253,12 +1253,12 @@ absl::Status InferenceContext::Multiply(DimensionHandle first,
+   }
+ 
+   // At least one operand unknown: try to build expression.
+-  DynExpr* lhs = ExprForDim(first);
+-  DynExpr* rhs =
++  DimExpr* lhs = ExprForDim(first);
++  DimExpr* rhs =
+       second.dim.IsSet() ? ExprForDim(second.dim) : MakeConstExpr(second.val);
+ 
+   if (lhs && rhs) {
+-    DynExpr* node = shape_manager_.OwnExpr(std::make_unique<ExprMul>(lhs, rhs));
++    DimExpr* node = shape_manager_.OwnExpr(std::make_unique<ExprMul>(lhs, rhs));
+     *out = shape_manager_.MakeDim(kUnknownDim, /*dynamic_ratio*/ 0, node);
+   } else {
+     *out = UnknownDim();  // Can't form expr.
+diff --git a/tensorflow/core/framework/shape_inference.h b/tensorflow/core/framework/shape_inference.h
+index d49dbf85993..70d09d8fde5 100644
+--- a/tensorflow/core/framework/shape_inference.h
++++ b/tensorflow/core/framework/shape_inference.h
+@@ -117,12 +117,12 @@ class InferenceContext;
+ class Dimension {
+  private:
+   Dimension();
+-  Dimension(int64_t value, int64_t dynamic_ratio = 0, DynExpr* expr = nullptr);
++  Dimension(int64_t value, int64_t dynamic_ratio = 0, DimExpr* expr = nullptr);
+   ~Dimension() {}
+ 
+   const int64_t value_;
+   const int64_t dynamic_ratio_;
+-  DynExpr* expr_;
++  DimExpr* expr_;
+ 
+   friend class InferenceContext;
+   friend class ShapeManager;
+@@ -585,19 +585,19 @@ class InferenceContext {
+ 
+   inline DimensionHandle UnknownDim() { return MakeDim(kUnknownDim); }
+ 
+-  // Create a new unknown dimension (size = -1) tagged with a DynExpr.
++  // Create a new unknown dimension (size = -1) tagged with a DimExpr.
+   // The expression is owned by this context's ShapeManager.
+-  DimensionHandle UnknownDimWithExpr(std::unique_ptr<DynExpr> expr);
++  DimensionHandle UnknownDimWithExpr(std::unique_ptr<DimExpr> expr);
+   // Return the expression pointer for a dimension, or nullptr if none.
+-  DynExpr* DimExpr(DimensionHandle d) const;
+-  // Creates a constant DynExpr node for the given value.
++  DimExpr* GetDimExpr(DimensionHandle d) const;
++  // Creates a constant DimExpr node for the given value.
+   // The expression is owned by this context's ShapeManager.
+-  DynExpr* MakeConstExpr(int64_t v);
++  DimExpr* MakeConstExpr(int64_t v);
+   // Returns the Expr representation for the given dimension:
+   // - If dim has an expr, returns it
+   // - If dim is known, returns a new Const expr
+   // - If dim is unknown with no expr, returns nullptr
+-  DynExpr* ExprForDim(DimensionHandle d);
++  DimExpr* ExprForDim(DimensionHandle d);
+ 
+   // Returns in <val> a scalar value from an input tensor <t>.  The input tensor
+   // must be a 0-dimensional int32 or int64 tensor.  Caller must ensure that the
+@@ -779,7 +779,7 @@ class InferenceContext {
+ 
+     // Returns a new dimension of the given size.  The returned value
+     // is owned by this class.
+-    inline DimensionHandle MakeDim(DimensionOrConstant d, int64_t dynamic_ratio = 0,  DynExpr* expr = nullptr) {
++    inline DimensionHandle MakeDim(DimensionOrConstant d, int64_t dynamic_ratio = 0,  DimExpr* expr = nullptr) {
+       if (d.dim.IsSet()) {
+         return d.dim;
+       } else {
+@@ -788,9 +788,9 @@ class InferenceContext {
+       }
+     }
+     // Takes ownership of an expression and returns a raw pointer to it.
+-    DynExpr* OwnExpr(std::unique_ptr<DynExpr> expr) {
++    DimExpr* OwnExpr(std::unique_ptr<DimExpr> expr) {
+       if (!expr) return nullptr;
+-      DynExpr* ptr = expr.get();
++      DimExpr* ptr = expr.get();
+       all_exprs_.push_back(std::move(expr));
+       return ptr;
+     }
+@@ -798,7 +798,7 @@ class InferenceContext {
+    private:
+     std::vector<Shape*> all_shapes_;    // values are owned.
+     std::vector<Dimension*> all_dims_;  // values are owned.
+-    std::vector<std::unique_ptr<DynExpr>> all_exprs_;   // expressions are owned.
++    std::vector<std::unique_ptr<DimExpr>> all_exprs_;   // expressions are owned.
+   };
+  private:
+ 
+@@ -918,7 +918,7 @@ class InferenceContext {
+ // Template and inline method implementations, please ignore
+ 
+ inline Dimension::Dimension() : value_(InferenceContext::kUnknownDim), dynamic_ratio_(0), expr_(nullptr) {}
+-inline Dimension::Dimension(int64_t value, int64_t dynamic_ratio, DynExpr* expr) : value_(value), dynamic_ratio_(dynamic_ratio), expr_(expr) {
++inline Dimension::Dimension(int64_t value, int64_t dynamic_ratio, DimExpr* expr) : value_(value), dynamic_ratio_(dynamic_ratio), expr_(expr) {
+   DCHECK(value >= 0 || value == InferenceContext::kUnknownDim)
+       << "Dimension must be non-negative or equal to "
+          "InferenceContext::kUnknownDim but got "
+diff --git a/tensorflow/core/framework/tensor_shape.cc b/tensorflow/core/framework/tensor_shape.cc
+index 1146b4916dd..b615a51ad7e 100644
+--- a/tensorflow/core/framework/tensor_shape.cc
++++ b/tensorflow/core/framework/tensor_shape.cc
+@@ -877,9 +877,9 @@ string TensorShapeRep::DebugString() const {
+       strings::StrAppend(&s, dim);
+     }
+     if (shape.get_expression(i) != nullptr) {
+-      strings::StrAppend(&s, "(");
++      strings::StrAppend(&s, "<");
+       strings::StrAppend(&s, ExprToString(shape.get_expression(i)));
+-      strings::StrAppend(&s, ")");
++      strings::StrAppend(&s, ">");
+     }
+   }
+   strings::StrAppend(&s, "]");
+diff --git a/tensorflow/core/framework/tensor_shape_expr.cc b/tensorflow/core/framework/tensor_shape_expr.cc
+index ef3a6b86bbc..37d1f330649 100644
+--- a/tensorflow/core/framework/tensor_shape_expr.cc
++++ b/tensorflow/core/framework/tensor_shape_expr.cc
+@@ -2,55 +2,55 @@
+ 
+ namespace tensorflow {
+ 
+-std::unique_ptr<DynExpr> DynExpr::Cons(int64_t val) {
++std::unique_ptr<DimExpr> DimExpr::Cons(int64_t val) {
+   return std::make_unique<Constant>(val);
+ }
+ 
+-std::unique_ptr<DynExpr> DynExpr::Var(int32_t id) {
++std::unique_ptr<DimExpr> DimExpr::Var(int32_t id) {
+   return std::make_unique<Variable>(id);
+ }
+ 
+-std::string DynExpr::DebugString() const {
++std::string DimExpr::DebugString() const {
+   ExpressionProto proto;
+   ToProto(&proto);
+   return proto.DebugString();
+ }
+ 
+-static bool EqualsImpl(const DynExpr* a, const DynExpr* b) {
++static bool EqualsImpl(const DimExpr* a, const DimExpr* b) {
+   if (a == b) return true;
+   if (a == nullptr || b == nullptr) return false;
+   if (a->kind() != b->kind()) return false;
+ 
+   switch (a->kind()) {
+-    case DynExpr::Kind::kConstant: {
++    case DimExpr::Kind::kConstant: {
+       auto* ac = static_cast<const Constant*>(a);
+       auto* bc = static_cast<const Constant*>(b);
+       return ac->value() == bc->value();
+     }
+-    case DynExpr::Kind::kVariable: {
++    case DimExpr::Kind::kVariable: {
+       auto* av = static_cast<const Variable*>(a);
+       auto* bv = static_cast<const Variable*>(b);
+       return av->id() == bv->id();
+     }
+-    case DynExpr::Kind::kAdd: {
++    case DimExpr::Kind::kAdd: {
+       auto* aa = static_cast<const ExprAdd*>(a);
+       auto* ba = static_cast<const ExprAdd*>(b);
+       return EqualsImpl(aa->lhs(), ba->lhs()) &&
+              EqualsImpl(aa->rhs(), ba->rhs());
+     }
+-    case DynExpr::Kind::kSub: {
++    case DimExpr::Kind::kSub: {
+       auto* as = static_cast<const ExprSub*>(a);
+       auto* bs = static_cast<const ExprSub*>(b);
+       return EqualsImpl(as->lhs(), bs->lhs()) &&
+              EqualsImpl(as->rhs(), bs->rhs());
+     }
+-    case DynExpr::Kind::kMul: {
++    case DimExpr::Kind::kMul: {
+       auto* am = static_cast<const ExprMul*>(a);
+       auto* bm = static_cast<const ExprMul*>(b);
+       return EqualsImpl(am->lhs(), bm->lhs()) &&
+              EqualsImpl(am->rhs(), bm->rhs());
+     }
+-    case DynExpr::Kind::kDiv: {
++    case DimExpr::Kind::kDiv: {
+       auto* ad = static_cast<const ExprDiv*>(a);
+       auto* bd = static_cast<const ExprDiv*>(b);
+       return EqualsImpl(ad->lhs(), bd->lhs()) &&
+@@ -61,16 +61,16 @@ static bool EqualsImpl(const DynExpr* a, const DynExpr* b) {
+   return false;
+ }
+ 
+-bool DynExpr::Equals(const DynExpr* a, const DynExpr* b) {
++bool DimExpr::Equals(const DimExpr* a, const DimExpr* b) {
+   return EqualsImpl(a, b);
+ }
+ 
+-std::unique_ptr<DynExpr> DynExpr::FromProto(const ExpressionProto& proto) {
++std::unique_ptr<DimExpr> DimExpr::FromProto(const ExpressionProto& proto) {
+   switch (proto.node_type_case()) {
+     case ExpressionProto::kConstantValue:
+-      return DynExpr::Cons(proto.constant_value());
++      return DimExpr::Cons(proto.constant_value());
+     case ExpressionProto::kVariableId:
+-      return DynExpr::Var(proto.variable_id());
++      return DimExpr::Var(proto.variable_id());
+     case ExpressionProto::kAddNode: {
+       auto lhs = FromProto(proto.add_node().lhs());
+       auto rhs = FromProto(proto.add_node().rhs());
+@@ -99,29 +99,29 @@ std::unique_ptr<DynExpr> DynExpr::FromProto(const ExpressionProto& proto) {
+   }
+ }
+ 
+-DynExpr* SimplifyExpr(DynExpr* expr,
+-                      std::vector<std::unique_ptr<DynExpr>>* arena) {
++DimExpr* SimplifyExpr(DimExpr* expr,
++                      std::vector<std::unique_ptr<DimExpr>>* arena) {
+   if (!expr) return nullptr;
+ 
+-  auto own = [arena](std::unique_ptr<DynExpr> e) -> DynExpr* {
+-    DynExpr* ptr = e.get();
++  auto own = [arena](std::unique_ptr<DimExpr> e) -> DimExpr* {
++    DimExpr* ptr = e.get();
+     arena->push_back(std::move(e));
+     return ptr;
+   };
+ 
+   switch (expr->kind()) {
+-    case DynExpr::Kind::kConstant:
+-    case DynExpr::Kind::kVariable:
++    case DimExpr::Kind::kConstant:
++    case DimExpr::Kind::kVariable:
+       return expr;
+ 
+-    case DynExpr::Kind::kAdd: {
++    case DimExpr::Kind::kAdd: {
+       auto* add = static_cast<ExprAdd*>(expr);
+-      DynExpr* lhs = SimplifyExpr(add->lhs(), arena);
+-      DynExpr* rhs = SimplifyExpr(add->rhs(), arena);
++      DimExpr* lhs = SimplifyExpr(add->lhs(), arena);
++      DimExpr* rhs = SimplifyExpr(add->rhs(), arena);
+ 
+       // Constant folding
+       if (lhs->IsConstant() && rhs->IsConstant()) {
+-        return own(DynExpr::Cons(lhs->ConstantValue() + rhs->ConstantValue()));
++        return own(DimExpr::Cons(lhs->ConstantValue() + rhs->ConstantValue()));
+       }
+ 
+       // x + 0 → x
+@@ -131,14 +131,14 @@ DynExpr* SimplifyExpr(DynExpr* expr,
+       return own(std::make_unique<ExprAdd>(lhs, rhs));
+     }
+ 
+-    case DynExpr::Kind::kSub: {
++    case DimExpr::Kind::kSub: {
+       auto* sub = static_cast<ExprSub*>(expr);
+-      DynExpr* lhs = SimplifyExpr(sub->lhs(), arena);
+-      DynExpr* rhs = SimplifyExpr(sub->rhs(), arena);
++      DimExpr* lhs = SimplifyExpr(sub->lhs(), arena);
++      DimExpr* rhs = SimplifyExpr(sub->rhs(), arena);
+ 
+       // Constant folding
+       if (lhs->IsConstant() && rhs->IsConstant()) {
+-        return own(DynExpr::Cons(lhs->ConstantValue() - rhs->ConstantValue()));
++        return own(DimExpr::Cons(lhs->ConstantValue() - rhs->ConstantValue()));
+       }
+ 
+       // x - 0 → x
+@@ -147,14 +147,14 @@ DynExpr* SimplifyExpr(DynExpr* expr,
+       return own(std::make_unique<ExprSub>(lhs, rhs));
+     }
+ 
+-    case DynExpr::Kind::kMul: {
++    case DimExpr::Kind::kMul: {
+       auto* mul = static_cast<ExprMul*>(expr);
+-      DynExpr* lhs = SimplifyExpr(mul->lhs(), arena);
+-      DynExpr* rhs = SimplifyExpr(mul->rhs(), arena);
++      DimExpr* lhs = SimplifyExpr(mul->lhs(), arena);
++      DimExpr* rhs = SimplifyExpr(mul->rhs(), arena);
+ 
+       // Constant folding
+       if (lhs->IsConstant() && rhs->IsConstant()) {
+-        return own(DynExpr::Cons(lhs->ConstantValue() * rhs->ConstantValue()));
++        return own(DimExpr::Cons(lhs->ConstantValue() * rhs->ConstantValue()));
+       }
+ 
+       // x * 1 → x
+@@ -163,23 +163,23 @@ DynExpr* SimplifyExpr(DynExpr* expr,
+ 
+       // x * 0 → 0
+       if (rhs->IsConstant() && rhs->ConstantValue() == 0)
+-        return own(DynExpr::Cons(0));
++        return own(DimExpr::Cons(0));
+       if (lhs->IsConstant() && lhs->ConstantValue() == 0)
+-        return own(DynExpr::Cons(0));
++        return own(DimExpr::Cons(0));
+ 
+       return own(std::make_unique<ExprMul>(lhs, rhs));
+     }
+ 
+-    case DynExpr::Kind::kDiv: {
++    case DimExpr::Kind::kDiv: {
+       auto* div = static_cast<ExprDiv*>(expr);
+-      DynExpr* lhs = SimplifyExpr(div->lhs(), arena);
+-      DynExpr* rhs = SimplifyExpr(div->rhs(), arena);
++      DimExpr* lhs = SimplifyExpr(div->lhs(), arena);
++      DimExpr* rhs = SimplifyExpr(div->rhs(), arena);
+ 
+       // Constant folding (avoid div by zero)
+       if (lhs->IsConstant() && rhs->IsConstant()) {
+         int64_t r = rhs->ConstantValue();
+         if (r != 0) {
+-          return own(DynExpr::Cons(lhs->ConstantValue() / r));
++          return own(DimExpr::Cons(lhs->ConstantValue() / r));
+         }
+       }
+ 
+diff --git a/tensorflow/core/framework/tensor_shape_expr.h b/tensorflow/core/framework/tensor_shape_expr.h
+index 04974157af8..2979df64af6 100644
+--- a/tensorflow/core/framework/tensor_shape_expr.h
++++ b/tensorflow/core/framework/tensor_shape_expr.h
+@@ -18,7 +18,7 @@ class ExprSub;
+ class ExprMul;
+ class ExprDiv;
+ 
+-// DynExpr: Base class for symbolic expressions representing dynamic dimension
++// DimExpr: Base class for symbolic expressions representing dynamic dimension
+ // sizes. These expressions form a DAG that tracks how unknown dimensions relate
+ // to each other through arithmetic operations.
+ //
+@@ -28,7 +28,7 @@ class ExprDiv;
+ //   - Add/Sub/Mul/Div(lhs, rhs): Binary arithmetic operations
+ //
+ // INVARIANT: An unknown dimension is not just -1, it is -1 + Var(sym).
+-class DynExpr {
++class DimExpr {
+  public:
+   enum class Kind : uint8_t {
+     kConstant,
+@@ -39,7 +39,7 @@ class DynExpr {
+     kDiv,
+   };
+ 
+-  virtual ~DynExpr() = default;
++  virtual ~DimExpr() = default;
+ 
+   virtual Kind kind() const = 0;
+   virtual void ToProto(ExpressionProto* proto) const = 0;
+@@ -48,24 +48,24 @@ class DynExpr {
+   virtual int64_t ConstantValue() const { return 0; }
+ 
+   // Factory methods - return owning pointers
+-  static std::unique_ptr<DynExpr> Cons(int64_t val);
+-  static std::unique_ptr<DynExpr> Var(int32_t var_id);
++  static std::unique_ptr<DimExpr> Cons(int64_t val);
++  static std::unique_ptr<DimExpr> Var(int32_t var_id);
+ 
+   // Structural equality check
+-  static bool Equals(const DynExpr* a, const DynExpr* b);
++  static bool Equals(const DimExpr* a, const DimExpr* b);
+ 
+   // Build from proto (owns all returned nodes)
+-  static std::unique_ptr<DynExpr> FromProto(const ExpressionProto& proto);
++  static std::unique_ptr<DimExpr> FromProto(const ExpressionProto& proto);
+ 
+   // Debug representation
+   std::string DebugString() const;
+ 
+  protected:
+-  DynExpr() = default;
++  DimExpr() = default;
+ };
+ 
+ // Constant expression node: represents a known integer value
+-class Constant final : public DynExpr {
++class Constant final : public DimExpr {
+  public:
+   explicit Constant(int64_t value) : value_(value) {}
+ 
+@@ -84,7 +84,7 @@ class Constant final : public DynExpr {
+ };
+ 
+ // Variable expression node: represents a symbolic unknown dimension
+-class Variable final : public DynExpr {
++class Variable final : public DimExpr {
+  public:
+   explicit Variable(int32_t id) : id_(id) {}
+ 
+@@ -100,9 +100,9 @@ class Variable final : public DynExpr {
+ };
+ 
+ // Addition expression node
+-class ExprAdd final : public DynExpr {
++class ExprAdd final : public DimExpr {
+  public:
+-  ExprAdd(DynExpr* lhs, DynExpr* rhs) : lhs_(lhs), rhs_(rhs) {}
++  ExprAdd(DimExpr* lhs, DimExpr* rhs) : lhs_(lhs), rhs_(rhs) {}
+ 
+   Kind kind() const override { return Kind::kAdd; }
+   void ToProto(ExpressionProto* proto) const override {
+@@ -118,18 +118,18 @@ class ExprAdd final : public DynExpr {
+     return lhs_->ConstantValue() + rhs_->ConstantValue();
+   }
+ 
+-  DynExpr* lhs() const { return lhs_; }
+-  DynExpr* rhs() const { return rhs_; }
++  DimExpr* lhs() const { return lhs_; }
++  DimExpr* rhs() const { return rhs_; }
+ 
+  private:
+-  DynExpr* lhs_;
+-  DynExpr* rhs_;
++  DimExpr* lhs_;
++  DimExpr* rhs_;
+ };
+ 
+ // Subtraction expression node
+-class ExprSub final : public DynExpr {
++class ExprSub final : public DimExpr {
+  public:
+-  ExprSub(DynExpr* lhs, DynExpr* rhs) : lhs_(lhs), rhs_(rhs) {}
++  ExprSub(DimExpr* lhs, DimExpr* rhs) : lhs_(lhs), rhs_(rhs) {}
+ 
+   Kind kind() const override { return Kind::kSub; }
+   void ToProto(ExpressionProto* proto) const override {
+@@ -145,18 +145,18 @@ class ExprSub final : public DynExpr {
+     return lhs_->ConstantValue() - rhs_->ConstantValue();
+   }
+ 
+-  DynExpr* lhs() const { return lhs_; }
+-  DynExpr* rhs() const { return rhs_; }
++  DimExpr* lhs() const { return lhs_; }
++  DimExpr* rhs() const { return rhs_; }
+ 
+  private:
+-  DynExpr* lhs_;
+-  DynExpr* rhs_;
++  DimExpr* lhs_;
++  DimExpr* rhs_;
+ };
+ 
+ // Multiplication expression node
+-class ExprMul final : public DynExpr {
++class ExprMul final : public DimExpr {
+  public:
+-  ExprMul(DynExpr* lhs, DynExpr* rhs) : lhs_(lhs), rhs_(rhs) {}
++  ExprMul(DimExpr* lhs, DimExpr* rhs) : lhs_(lhs), rhs_(rhs) {}
+ 
+   Kind kind() const override { return Kind::kMul; }
+   void ToProto(ExpressionProto* proto) const override {
+@@ -172,18 +172,18 @@ class ExprMul final : public DynExpr {
+     return lhs_->ConstantValue() * rhs_->ConstantValue();
+   }
+ 
+-  DynExpr* lhs() const { return lhs_; }
+-  DynExpr* rhs() const { return rhs_; }
++  DimExpr* lhs() const { return lhs_; }
++  DimExpr* rhs() const { return rhs_; }
+ 
+  private:
+-  DynExpr* lhs_;
+-  DynExpr* rhs_;
++  DimExpr* lhs_;
++  DimExpr* rhs_;
+ };
+ 
+ // Division expression node
+-class ExprDiv final : public DynExpr {
++class ExprDiv final : public DimExpr {
+  public:
+-  ExprDiv(DynExpr* lhs, DynExpr* rhs) : lhs_(lhs), rhs_(rhs) {}
++  ExprDiv(DimExpr* lhs, DimExpr* rhs) : lhs_(lhs), rhs_(rhs) {}
+ 
+   Kind kind() const override { return Kind::kDiv; }
+   void ToProto(ExpressionProto* proto) const override {
+@@ -200,19 +200,19 @@ class ExprDiv final : public DynExpr {
+     return (r == 0) ? 0 : lhs_->ConstantValue() / r;
+   }
+ 
+-  DynExpr* lhs() const { return lhs_; }
+-  DynExpr* rhs() const { return rhs_; }
++  DimExpr* lhs() const { return lhs_; }
++  DimExpr* rhs() const { return rhs_; }
+ 
+  private:
+-  DynExpr* lhs_;
+-  DynExpr* rhs_;
++  DimExpr* lhs_;
++  DimExpr* rhs_;
+ };
+ 
+ // Simplify an expression tree: constant folding and algebraic identities.
+ // Returns a NEW expression (does not mutate input).
+ // The arena parameter is used to allocate nodes that will be owned externally.
+-DynExpr* SimplifyExpr(DynExpr* expr,
+-                      std::vector<std::unique_ptr<DynExpr>>* arena);
++DimExpr* SimplifyExpr(DimExpr* expr,
++                      std::vector<std::unique_ptr<DimExpr>>* arena);
+ 
+ }  // namespace tensorflow
+ 
+diff --git a/tensorflow/core/grappler/costs/graph_properties.cc b/tensorflow/core/grappler/costs/graph_properties.cc
+index cecf7459ab5..56fc7a5afe8 100644
+--- a/tensorflow/core/grappler/costs/graph_properties.cc
++++ b/tensorflow/core/grappler/costs/graph_properties.cc
+@@ -1420,9 +1420,9 @@ class SymbolicShapeRefiner {
+     if (node->op() == "_Arg") {
+       var_id *= -1;
+       // var_id would be minus when it's argument.
+-      dim = c->UnknownDimWithExpr(DynExpr::Var(var_id));
++      dim = c->UnknownDimWithExpr(DimExpr::Var(var_id));
+     } else {
+-      dim = c->UnknownDimWithExpr(DynExpr::Var(var_id));
++      dim = c->UnknownDimWithExpr(DimExpr::Var(var_id));
+     }
+     VLOG(1) << "[EXPR] GetUnknownOutputDim: node=" << node->name()
+             << " out=" << index << " dim=" << dim_id << " -> Var(" << var_id
+@@ -2040,7 +2040,7 @@ class SymbolicShapeRefiner {
+           continue;
+         }
+         // If already tagged with expr, keep it.
+-        if (ic->DimExpr(dim) != nullptr) {
++        if (ic->GetDimExpr(dim) != nullptr) {
+           dims.push_back(dim);
+           continue;
+         }
+@@ -2251,7 +2251,7 @@ class SymbolicShapeManager {
+         // Serialize expression for unknown dims
+         if (out_dim->size() < 0) {
+           void* root = dims_.RootId(dim);
+-          DynExpr* expr = nullptr;
++          DimExpr* expr = nullptr;
+           if (auto it = dim_root_expr_.find(root); it != dim_root_expr_.end()) {
+             expr = it->second;
+           } else {
+@@ -2291,32 +2291,32 @@ class SymbolicShapeManager {
+ 
+  private:
+   // Get the variable ID from an expression, or -1 if not a variable.
+-  static int32_t GetVarId(const DynExpr* e) {
+-    if (!e || e->kind() != DynExpr::Kind::kVariable) return -1;
++  static int32_t GetVarId(const DimExpr* e) {
++    if (!e || e->kind() != DimExpr::Kind::kVariable) return -1;
+     return static_cast<const Variable*>(e)->id();
+   }
+ 
+-  static bool IsConst(const DynExpr* e) {
+-    return e && e->kind() == DynExpr::Kind::kConstant;
++  static bool IsConst(const DimExpr* e) {
++    return e && e->kind() == DimExpr::Kind::kConstant;
+   }
+ 
+-  static bool IsVar(const DynExpr* e) {
+-    return e && e->kind() == DynExpr::Kind::kVariable;
++  static bool IsVar(const DimExpr* e) {
++    return e && e->kind() == DimExpr::Kind::kVariable;
+   }
+ 
+-  static bool IsPlaceHolder(const DynExpr* e) {
++  static bool IsPlaceHolder(const DimExpr* e) {
+     if (!e) return false;
+-    if (e->kind() != DynExpr::Kind::kVariable) return false;
++    if (e->kind() != DimExpr::Kind::kVariable) return false;
+     return static_cast<const Variable*>(e)->id() < 0;
+   }
+ 
+-  static bool IsCompound(const DynExpr* e) {
++  static bool IsCompound(const DimExpr* e) {
+     if (!e) return false;
+     switch (e->kind()) {
+-      case DynExpr::Kind::kAdd:
+-      case DynExpr::Kind::kSub:
+-      case DynExpr::Kind::kMul:
+-      case DynExpr::Kind::kDiv:
++      case DimExpr::Kind::kAdd:
++      case DimExpr::Kind::kSub:
++      case DimExpr::Kind::kMul:
++      case DimExpr::Kind::kDiv:
+         return true;
+       default:
+         return false;
+@@ -2324,7 +2324,7 @@ class SymbolicShapeManager {
+   }
+ 
+   // Ranking: Const > Arg_ > Compound > Var > null
+-  static int InfoScore(const DynExpr* e) {
++  static int InfoScore(const DimExpr* e) {
+     if (!e) return 0;
+     if (IsConst(e)) return 4;
+     if (IsPlaceHolder(e)) return 3;
+@@ -2334,7 +2334,7 @@ class SymbolicShapeManager {
+   }
+ 
+   // Prefer "more informative" but keep deterministic tie-break.
+-  static DynExpr* PreferMoreInformative(DynExpr* a, DynExpr* b) {
++  static DimExpr* PreferMoreInformative(DimExpr* a, DimExpr* b) {
+     if (a == b) return a;
+     const int sa = InfoScore(a);
+     const int sb = InfoScore(b);
+@@ -2345,7 +2345,7 @@ class SymbolicShapeManager {
+   }
+ 
+   // Get the expr pointer from a dimension handle (accesses private member).
+-  static DynExpr* GetExprFromDimHandle(const DimensionHandle& d) {
++  static DimExpr* GetExprFromDimHandle(const DimensionHandle& d) {
+     if (!d.IsSet()) return nullptr;
+     return d->expr_;
+   }
+@@ -2357,22 +2357,22 @@ class SymbolicShapeManager {
+     void* r2 = dims_.RootId(d2);
+ 
+     // Fetch best-known expr for each set.
+-    auto get_best = [&](void* r, DimensionHandle d) -> DynExpr* {
++    auto get_best = [&](void* r, DimensionHandle d) -> DimExpr* {
+       auto it = dim_root_expr_.find(r);
+       if (it != dim_root_expr_.end()) return it->second;
+       return GetExprFromDimHandle(d);  // may be null
+     };
+ 
+-    DynExpr* e1 = get_best(r1, d1);
+-    DynExpr* e2 = get_best(r2, d2);
++    DimExpr* e1 = get_best(r1, d1);
++    DimExpr* e2 = get_best(r2, d2);
+ 
+     // If already in same UF set, just keep the most informative expr.
+     if (r1 == r2) {
+-      DynExpr* existing = nullptr;
++      DimExpr* existing = nullptr;
+       if (auto it = dim_root_expr_.find(r1); it != dim_root_expr_.end()) {
+         existing = it->second;
+       }
+-      DynExpr* chosen = PreferMoreInformative(existing,
++      DimExpr* chosen = PreferMoreInformative(existing,
+                                             PreferMoreInformative(e1, e2));
+       if (chosen) dim_root_expr_[r1] = chosen;  // keep or upgrade
+       return absl::OkStatus();
+@@ -2385,7 +2385,7 @@ class SymbolicShapeManager {
+     void* new_root = dims_.RootId(d1);
+ 
+     // Choose best expr across both sets.
+-    DynExpr* chosen = PreferMoreInformative(e1, e2);
++    DimExpr* chosen = PreferMoreInformative(e1, e2);
+ 
+     // Remove stale root keys (only the old roots).
+     dim_root_expr_.erase(r1);
+@@ -2402,7 +2402,7 @@ class SymbolicShapeManager {
+   }
+   DisjointSet<shape_inference::ShapeHandle> shapes_;
+   // Map from union-find root pointer to the best expression for that set.
+-  absl::flat_hash_map<void*, DynExpr*> dim_root_expr_;
++  absl::flat_hash_map<void*, DimExpr*> dim_root_expr_;
+   DisjointSet<shape_inference::DimensionHandle> dims_;
+ };
+ 
+diff --git a/tensorflow/core/ops/array_ops.cc b/tensorflow/core/ops/array_ops.cc
+index a9e19b6d7f5..60acc6c9d0b 100644
+--- a/tensorflow/core/ops/array_ops.cc
++++ b/tensorflow/core/ops/array_ops.cc
+@@ -210,7 +210,7 @@ absl::Status SetOutputShapeForReshape(InferenceContext* c) {
+       for (int32_t i = 0; i < c->Rank(out); ++i) {
+         DimensionHandle dim = c->Dim(out, i);
+         if (!c->ValueKnown(dim)) {
+-          if (c->DimExpr(dim) != nullptr) {
++          if (c->GetDimExpr(dim) != nullptr) {
+             TF_RETURN_IF_ERROR(
+                 c->Multiply(known_out_elems, dim, &known_out_elems));
+             continue;
+@@ -233,7 +233,7 @@ absl::Status SetOutputShapeForReshape(InferenceContext* c) {
+       for (int32_t i = 0; i < c->Rank(in); ++i) {
+         DimensionHandle dim = c->Dim(in, i);
+         if (!c->ValueKnown(dim)) {
+-          if (c->DimExpr(dim) != nullptr) {
++          if (c->GetDimExpr(dim) != nullptr) {
+             TF_RETURN_IF_ERROR(
+                 c->Multiply(known_in_elems, dim, &known_in_elems));
+             continue;
+diff --git a/third_party/xla/xla/shape.h b/third_party/xla/xla/shape.h
+index 7c535c2e1e7..5d9c5827a95 100644
+--- a/third_party/xla/xla/shape.h
++++ b/third_party/xla/xla/shape.h
+@@ -50,6 +50,8 @@ class DynExpr {
+   virtual int64_t get_val() const { return -1; }
+   virtual DynExpr* s() = 0; // simplify
+   virtual DynExpr* substitute(int id, DynExpr* v) = 0;
++  virtual std::set<int> get_all_ids() = 0;
++  virtual int64_t solve(int64_t x) = 0;
+ 
+   bool is_dynamic() { return !is_constant(); }
+ 
+@@ -84,6 +86,8 @@ class Constant : public DynExpr {
+   bool is_constant() const override { return true; }
+   int64_t get_val() const override { return value; }
+   DynExpr* substitute(int id, DynExpr* v) { return this; }
++  std::set<int> get_all_ids() { return {}; }
++  int64_t solve(int64_t x) { return -1; }
+   DynExpr* s() override;
+ };
+ 
+@@ -105,6 +109,8 @@ class Variable : public DynExpr {
+   bool is_constant() const override { return false; }
+   int get_id() const { return id; }
+   DynExpr* substitute(int id, DynExpr* v) { return get_id() == id ? v : this;}
++  std::set<int> get_all_ids() { return {get_id()}; }
++  int64_t solve(int64_t x) { return x; }
+   DynExpr* s() override;
+ };
+ 
+@@ -141,6 +147,28 @@ class Add : public DynExpr {
+   DynExpr* substitute(int id, DynExpr* v) {
+     return new Add(lhs->substitute(id, v), rhs->substitute(id, v));
+   }
++
++  std::set<int> get_all_ids() {
++    auto s = lhs->get_all_ids();
++    s.merge(rhs->get_all_ids());
++    return s;
++  }
++
++  int64_t solve(int64_t x) {
++    // Cannot solve if both lhs and rhs are dynamic...
++    if (lhs->is_dynamic() && rhs->is_dynamic()) return -1;
++    if (lhs->get_all_ids().size() == 1) {
++      // (A + c) = x <=> A = x - c => solve A = y with y = x - c
++      return lhs->solve(x - rhs->get_val());
++    }
++    if (rhs->get_all_ids().size() == 1) {
++      // (c + A) = x <=> A = x - c => solve A = y with y = x - c
++      return rhs->solve(x - lhs->get_val());
++    }
++    // No solution
++    return -1;
++  }
++
+   DynExpr* s() override;
+ 
+   ~Add() {
+@@ -183,6 +211,27 @@ class Sub : public DynExpr {
+     return new Sub(lhs->substitute(id, v), rhs->substitute(id, v));
+   }
+ 
++  std::set<int> get_all_ids() {
++    auto s = lhs->get_all_ids();
++    s.merge(rhs->get_all_ids());
++    return s;
++  }
++
++  int64_t solve(int64_t x) {
++    // Cannot solve if both lhs and rhs are dynamic...
++    if (lhs->is_dynamic() && rhs->is_dynamic()) return -1;
++    if (lhs->get_all_ids().size() == 1) {
++      // (A - c) = x <=> A = x + c => solve A = y with y = x + c
++      return lhs->solve(x + rhs->get_val());
++    }
++    if (rhs->get_all_ids().size() == 1) {
++      // (c + A) = x <=> A = x - c => solve A = y with y = x + c
++      return rhs->solve(x + lhs->get_val());
++    }
++    // No solution
++    return -1;
++  }
++
+   DynExpr* s() override;
+ 
+   ~Sub() {
+@@ -225,6 +274,31 @@ class Mul : public DynExpr {
+     return new Mul(lhs->substitute(id, v), rhs->substitute(id, v));
+   }
+ 
++  std::set<int> get_all_ids() {
++    auto s = lhs->get_all_ids();
++    s.merge(rhs->get_all_ids());
++    return s;
++  }
++
++  int64_t solve(int64_t x) {
++    // Cannot solve if both lhs and rhs are dynamic...
++    if (lhs->is_dynamic() && rhs->is_dynamic()) return -1;
++    if (lhs->get_all_ids().size() == 1) {
++      // (A * c) = x <=> A = x / c => solve A = y with y = x / c
++      int64_t c = rhs->get_val();
++      if (x % c != 0) return -1;
++      return lhs->solve(x / c);
++    }
++    if (rhs->get_all_ids().size() == 1) {
++      // (c * A) = x <=> A = x / c => solve A = y with y = x / c
++      int64_t c = lhs->get_val();
++      if (x % c != 0) return -1;
++      return rhs->solve(x / c);
++    }
++    // No solution
++    return -1;
++  }
++
+   DynExpr* s() override;
+ 
+   ~Mul() {
+@@ -267,8 +341,31 @@ class Div : public DynExpr {
+     return new Div(lhs->substitute(id, v), rhs->substitute(id, v));
+   }
+ 
++  std::set<int> get_all_ids() {
++    auto s = lhs->get_all_ids();
++    s.merge(rhs->get_all_ids());
++    return s;
++  }
++
+   DynExpr* s() override;
+ 
++  int64_t solve(int64_t x) {
++    // Cannot solve if both lhs and rhs are dynamic...
++    if (lhs->is_dynamic() && rhs->is_dynamic()) return -1;
++    if (lhs->get_all_ids().size() == 1) {
++      // (A / c) = x <=> A = x * c => solve A = y with y = x * c
++      return lhs->solve(x * rhs->get_val());
++    }
++    if (rhs->get_all_ids().size() == 1) {
++      // (c / A) = x <=> A = c / x => solve A = y with y = c / x
++      int64_t c = lhs->get_val();
++      if (c % x != 0) return -1;
++      return rhs->solve(c / x);
++    }
++    // No solution
++    return -1;
++  }
++
+   ~Div() {
+     delete lhs;
+     delete rhs;
