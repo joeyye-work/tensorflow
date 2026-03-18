@@ -503,6 +503,7 @@ absl::Status CompileToLocalExecutable(
     std::vector<XlaCompiler::Argument> norm_args(args.begin(), args.end());
     int64_t filled_batch = 0;
     bool saw_dynamic_dim_value = false;
+    // Only supporting one dynamic dimension. 
     bool has_multiple_dynamic_dim_values = false;
     int64_t dynamic_dim_value = 0;
     XlaBatchMatcher* xla_batch_matcher =
@@ -514,7 +515,6 @@ absl::Status CompileToLocalExecutable(
         return;
       }
       if (dynamic_dim_value != dim_size) {
-        //TODO: This cannot be true for all inputs to the function, but we currently only support one dynamic.
         has_multiple_dynamic_dim_values = true;
       }
     };
