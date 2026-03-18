@@ -1,0 +1,3403 @@
+diff --git a/tensorflow/compiler/jit/encapsulate_subgraphs_pass.cc b/tensorflow/compiler/jit/encapsulate_subgraphs_pass.cc
+index 3e8a43ce08e..1bcae2384a8 100644
+--- a/tensorflow/compiler/jit/encapsulate_subgraphs_pass.cc
++++ b/tensorflow/compiler/jit/encapsulate_subgraphs_pass.cc
+@@ -57,6 +57,12 @@ limitations under the License.
+ 
+ namespace tensorflow {
+ 
++static const absl::flat_hash_set<absl::string_view> kFailingOps = {
++    "Pad",
++    "Where",
++    // add more here
++};
++
+ const char* const kXlaCompiledKernelAttr = "_XlaCompiledKernel";
+ const char* const kXlaNumConstantArgsAttr = "_XlaNumConstantArgs";
+ const char* const kXlaNumResourceArgsAttr = "_XlaNumResourceArgs";
+@@ -470,6 +476,24 @@ absl::Status Encapsulator::Subgraph::RecordArg(
+     DataType dtype = edge->dst()->input_type(edge->dst_input());
+     builder.Attr("T", dtype);
+     builder.Attr("index", arg_index);
++    AttrSlice attrs = src_node->attrs();
++    auto shape_attr = attrs.FindByString("_output_shapes");
++    if (shape_attr && shape_attr->has_list()) {
++      const TensorShapeProto& shape = shape_attr->list().shape(src_slot);
++      if (shape.dim_size() >= 1 && shape.dim(0).size() == -1) {
++        VLOG(1) << "Found Dynamic dimension in " << src_node->name() << ":"
++                << src_slot;
++        builder.Attr("_is_batch", true);
++      }
++    } else {
++      // if cluster argument is the real argument.
++      auto build_attr = attrs.FindByString("_is_batch");
++      if (build_attr) {
++        VLOG(1) << "Found Dynamic dimension in " << src_node->name() << ":"
++                << src_slot;
++        builder.Attr("_is_batch", true);
++      }
++    }
+     absl::Status s = builder.Finalize(&arg_def);
+     if (!s.ok()) return s;
+ 
+@@ -1143,6 +1167,14 @@ static absl::Status RenumberArguments(Graph* graph,
+   return absl::OkStatus();
+ }
+ 
++static bool SubgraphHasFailingOps(const Graph& g) {
++  for (Node* n : g.op_nodes()) {
++    if (n->IsRetval()) continue;
++    if (kFailingOps.contains(n->def().op())) return true;
++  }
++  return false;
++}
++
+ absl::Status EncapsulateSubgraphsPass::Run(
+     const GraphOptimizationPassOptions& options) {
+   VLOG(1) << "EncapsulateSubgraphsPass::Run";
+@@ -1289,8 +1321,8 @@ absl::Status EncapsulateSubgraphsPass::Run(
+ 
+         // TODO(phawkins): add a forward is-constant analysis, similarly split
+         // outputs into host-memory constants and device-memory non-constants.
+-
+-        AddNodeAttr(kXlaCompiledKernelAttr, true, node);
++        bool compile_enabled = !SubgraphHasFailingOps(**subgraph);
++        AddNodeAttr(kXlaCompiledKernelAttr, compile_enabled, node);
+         AddNodeAttr(kXlaNumConstantArgsAttr, num_consts, node);
+         AddNodeAttr(kXlaNumResourceArgsAttr, num_resources, node);
+         return absl::OkStatus();
+diff --git a/tensorflow/compiler/jit/flags.cc b/tensorflow/compiler/jit/flags.cc
+index d898298f0d1..b3b383d7530 100644
+--- a/tensorflow/compiler/jit/flags.cc
++++ b/tensorflow/compiler/jit/flags.cc
+@@ -114,6 +114,9 @@ void AppendMarkForCompilationPassFlagsInternal(std::vector<Flag>* flag_list) {
+            "Operators whose name starting with .cluster.{id} will likely"
+            "to be clustered together if the ids are the same number. "
+            ".cluster.none will not be clustered with those having numbered id"),
++      Flag("tf_xla_cluster_parallel",
++           &mark_for_compilation_flags->tf_xla_cluster_parallel,
++           "Split parallel compute subgraph info different clusters"),
+       Flag(
+           "tf_xla_ops_to_cluster",
+           &mark_for_compilation_flags->tf_xla_ops_to_cluster,
+@@ -161,6 +164,9 @@ void AppendMarkForCompilationPassFlagsInternal(std::vector<Flag>* flag_list) {
+            &mark_for_compilation_flags->tf_xla_deterministic_cluster_names,
+            "Causes the function names assigned by auto clustering to be "
+            "deterministic from run to run."),
++      Flag("tf_xla_enable_dynamic_sizes",
++           &mark_for_compilation_flags->tf_xla_enable_dynamic_sizes,
++           "Enable dynamic sizes support."),
+       Flag("tf_xla_persistent_cache_directory",
+            &mark_for_compilation_flags->tf_xla_persistent_cache_directory,
+            "If non-empty, JIT-compiled executables are saved to and loaded "
+@@ -239,6 +245,7 @@ void AllocateAndParseFlags() {
+   mark_for_compilation_flags->tf_xla_max_cluster_size =
+       std::numeric_limits<int32>::max();
+   mark_for_compilation_flags->tf_xla_annotate_cluster_id = false;
++  mark_for_compilation_flags->tf_xla_cluster_parallel = false;
+   mark_for_compilation_flags->tf_xla_clustering_debug = false;
+   mark_for_compilation_flags->tf_xla_cpu_global_jit = false;
+   mark_for_compilation_flags->tf_xla_clustering_fuel =
+@@ -248,6 +255,7 @@ void AllocateAndParseFlags() {
+   mark_for_compilation_flags
+       ->tf_xla_disable_resource_variable_safety_checks_for_debugging = false;
+   mark_for_compilation_flags->tf_xla_deterministic_cluster_names = false;
++  mark_for_compilation_flags->tf_xla_enable_dynamic_sizes = false;
+   mark_for_compilation_flags->tf_xla_persistent_cache_directory = "";
+   mark_for_compilation_flags->tf_xla_persistent_cache_device_types = "";
+   mark_for_compilation_flags->tf_xla_persistent_cache_read_only = false;
+diff --git a/tensorflow/compiler/jit/flags.h b/tensorflow/compiler/jit/flags.h
+index e9e14fbabdd..ebb6b7a5181 100644
+--- a/tensorflow/compiler/jit/flags.h
++++ b/tensorflow/compiler/jit/flags.h
+@@ -65,6 +65,9 @@ struct MarkForCompilationPassFlags {
+   // Enable operator name to influence clustering decision
+   bool tf_xla_annotate_cluster_id;
+ 
++  // Split parallel compute subgraph info different clusters
++  bool tf_xla_cluster_parallel;
++
+   // If non-empty, limit XLA clustering to the following TF operations.
+   string tf_xla_ops_to_cluster;
+ 
+@@ -96,6 +99,9 @@ struct MarkForCompilationPassFlags {
+   // so that they remain stable from run to run of auto clusteing.
+   bool tf_xla_deterministic_cluster_names;
+ 
++  // If true enables support of dynamic sizes.
++  bool tf_xla_enable_dynamic_sizes;
++
+   // If non-empty, JIT-compiled executables are saved to and loaded from the
+   // specified file system directory path.
+   std::string tf_xla_persistent_cache_directory;
+diff --git a/tensorflow/compiler/jit/kernels/xla_ops.cc b/tensorflow/compiler/jit/kernels/xla_ops.cc
+index 468b85280e2..42264a4df28 100644
+--- a/tensorflow/compiler/jit/kernels/xla_ops.cc
++++ b/tensorflow/compiler/jit/kernels/xla_ops.cc
+@@ -427,9 +427,52 @@ absl::Status CompileToLocalExecutable(
+   XlaCompiler::CompileOptions compile_options =
+       GenerateCompileOptions(has_ref_vars, may_alias_resource_update);
+ 
+-  return xla_device_compiler->CompileIfNeeded(
+-      options, function, args, compile_options, compile_mode, profiler,
+-      compilation_result, executable);
++  MarkForCompilationPassFlags* flags = GetMarkForCompilationPassFlags();
++  if (flags->tf_xla_enable_dynamic_sizes) {
++    // Rewriting the argument with the magic number if they have dynamic
++    // dimension, detecting dynamic dimension via _is_batch attr in the
++    // argument.
++    std::vector<XlaCompiler::Argument> norm_args(args.begin(), args.end());
++    constexpr int64_t kMagicBound = 977;
++    if (options.flib_def != nullptr) {
++      const FunctionDef* fdef = options.flib_def->Find(function.name());
++      if (fdef != nullptr) {
++        for (const auto& kv : fdef->arg_attr()) {
++          int arg_index = kv.first;
++          const auto& attr_map = kv.second.attr();
++          auto it = attr_map.find("_is_batch");
++
++          const AttrValue& v = it->second;
++          if (it == attr_map.end()) continue;
++          norm_args[arg_index].dynamic_dim = 0;
++        }
++      }
++    }
++    for (int i = 0; i < norm_args.size(); ++i) {
++      auto& arg = norm_args[i];
++      // argument rewrite.
++      if (arg.dynamic_dim == 0) {
++        TensorShape& shp = std::get<TensorShape>(arg.shape);
++        int64_t old = shp.dim_size(0);
++        shp.set_dim(0, kMagicBound);
++      }
++      // constant argument rewrite otherwise it still store the incoming batch
++      // request.
++      if (arg.kind == XlaCompiler::Argument::kConstant) {
++        auto flat = arg.constant_value.flat<int32>();
++        int32 old_batch = flat(0);
++        flat(0) = static_cast<int32>(kMagicBound);
++      }
++    }
++
++    return xla_device_compiler->CompileIfNeeded(
++        options, function, norm_args, compile_options, compile_mode, profiler,
++        compilation_result, executable);
++  } else {
++    return xla_device_compiler->CompileIfNeeded(
++        options, function, args, compile_options, compile_mode, profiler,
++        compilation_result, executable);
++  }
+ }
+ 
+ absl::Status GetUpdatedVariables(
+@@ -802,14 +845,24 @@ void XlaCompileOp::Compute(OpKernelContext* ctx) {
+           ctx, function_, has_ref_vars_, platform_info_, args, compile_mode,
+           /*may_alias_resource_update=*/false, &client, &kernel, &executable);
+     }
++
+     if (compile_mode != DeviceCompileMode::kLazy ||
+         status.code() != error::UNIMPLEMENTED) {
+-      OP_REQUIRES_OK(ctx, status);
++      if ((status != OkStatus()) &&
++          (status.code() != error::UNIMPLEMENTED) &&
++        (compile_mode == DeviceCompileMode::kLazy)) {
++        // We set the error to error::UNIMPLEMENTED so it falls in the
++        // conditions of the if to fall back to TensorFlow function call
++        status = tensorflow::errors::Unimplemented(status.ToString());
++      } else {
++        OP_REQUIRES_OK(ctx, status);
++      }
+     }
+ 
+     if (status.code() == error::UNIMPLEMENTED) {
+-      LOG(WARNING) << "Compilation failed:" << status
+-                   << ".  Falling back to TF function call.";
++      LOG(WARNING) << "[HUAWEI] Compilation of the cluster failed with:";
++      LOG(WARNING) << "[HUAWEI] " << status;
++      LOG(WARNING) << "[HUAWEI] Falling back to TF function call.\n";
+ 
+       BroadcastOptimizationRemark(
+           XlaOptimizationRemark::UNIMPLEMENTED_OPERATION, status.ToString())
+@@ -817,6 +870,8 @@ void XlaCompileOp::Compute(OpKernelContext* ctx) {
+       executable = nullptr;
+       pjrt_executable = nullptr;
+       mutex_lock guard(cannot_compile_cluster_mu_);
++      // TODO: decide if we want to set this flag to true, as we may want to
++      // allow the cluster to try to compile again later in time.
+       cannot_compile_cluster_ = true;
+     }
+   }
+@@ -953,6 +1008,15 @@ void XlaRunOp::Compute(OpKernelContext* ctx) {
+ 
+   xla::ExecutableRunOptions run_options;
+ 
++  MarkForCompilationPassFlags* flags = GetMarkForCompilationPassFlags();
++  if (flags->tf_xla_enable_dynamic_sizes) {
++    if (auto s = ctx->session_state()) {
++      run_options.set_batch_size(s->GetBatchSize());
++      VLOG(1) << "run_options.batch_size is set to: "
++              << run_options.batch_size();
++    }
++  }
++
+   // Host callbacks used for HLO send/recv.
+   xla::SendDeviceMemoryFunction send_function =
+       GetSendDeviceMemoryFunction(ctx, key);
+diff --git a/tensorflow/compiler/jit/mark_for_compilation_pass.cc b/tensorflow/compiler/jit/mark_for_compilation_pass.cc
+index 584be983432..7ed57392c0c 100644
+--- a/tensorflow/compiler/jit/mark_for_compilation_pass.cc
++++ b/tensorflow/compiler/jit/mark_for_compilation_pass.cc
+@@ -30,6 +30,7 @@ limitations under the License.
+ #include <unordered_set>
+ #include <utility>
+ #include <vector>
++#include <queue>
+ 
+ #include "absl/base/call_once.h"
+ #include "absl/container/flat_hash_map.h"
+@@ -110,6 +111,8 @@ class MarkForCompilationPassImpl {
+     // stable from run to rum.
+     bool deterministic_cluster_names;
+ 
++    bool enable_dynamic_sizes;
++
+     int max_cluster_size;
+     int min_cluster_size;
+ 
+@@ -127,6 +130,8 @@ class MarkForCompilationPassImpl {
+ 
+     // Enable models to influcence clustering with operator names
+     int annotate_cluster_id;
++
++    bool enable_cluster_parallel;
+   };
+ 
+   MarkForCompilationPassImpl(DebugOptions debug_options, Graph* graph,
+@@ -251,9 +256,12 @@ class MarkForCompilationPassImpl {
+ 
+     int annotated_id() const { return annotated_id_; }
+     void set_annotated_id(int id) { annotated_id_ = id; }
++    int chain_id() const {return chain_id_;}
++    void set_chain_id(int id) {chain_id_ = id;}
+ 
+    private:
+     int annotated_id_ = -1;
++    int chain_id_ = -1;
+     int cluster_size_ = 1;
+     int cycles_graph_node_id_;
+     int effective_cluster_size_;
+@@ -326,6 +334,14 @@ class MarkForCompilationPassImpl {
+   }
+ 
+   absl::Status AssignAnnotatedClusterIDs();
++  void collectInputNodes(std::set<Node*> &path_nodes);
++  void collectMergeNodes(const std::vector<Node*>& nodeSet,
++                         std::set<Node*> &merger_nodes);
++  void collectPathNodes(Node* start, std::set<Node*> &path_nodes,
++                        std::set<Node*>& merger_nodes);
++  std::map<Node*, std::vector<Node*>> collectParallelNode(
++      const std::vector<Node*>& nodeSet);
++  absl::Status AssignParallelChains();
+ 
+   // Tries to contract the edge from cluster `from` to cluster `to`.  Returns
+   // true if successful.
+@@ -702,6 +718,9 @@ absl::StatusOr<bool> MarkForCompilationPassImpl::Initialize() {
+   if (debug_options_.annotate_cluster_id) {
+     TF_RETURN_IF_ERROR(AssignAnnotatedClusterIDs());
+   }
++  if (debug_options_.enable_cluster_parallel) {
++    TF_RETURN_IF_ERROR(AssignParallelChains());
++  }
+   return true;
+ }
+ 
+@@ -1044,6 +1063,7 @@ absl::Status MarkForCompilationPassImpl::CreateClusters() {
+     // trouble.
+ 
+     if (cluster->effective_cluster_size() >= debug_options_.min_cluster_size ||
++        cluster->chain_id() != -1 ||
+         cluster->has_functional_control_flow() ||
+         cluster->is_xla_compile_attr_true()) {
+       string& name = cluster_names[cluster->cycles_graph_node_id()];
+@@ -1609,8 +1629,208 @@ bool MarkForCompilationPassImpl::LogNotContractableAndReturnFalse(
+   return false;
+ }
+ 
++void MarkForCompilationPassImpl::collectInputNodes(std::set<Node*> &path_nodes) {
++  std::unordered_map<Node*, int> out_degree_count;
++
++  // 4. Initialize the queue and add nodes from path_nodes
++  std::queue<Node*> queue;
++  for (auto node : path_nodes) {
++    queue.push(node);
++  }
++
++  // 5. BFS search
++  while (!queue.empty()) {
++    auto u = queue.front();
++    queue.pop();
++
++    // Traverse all predecessor nodes
++    for (const Edge* e : u->in_edges()) {
++      Node* p = e->src();
++      if (path_nodes.find(p) != path_nodes.end() ||
++          !IsCompilationCandidate(p)) {
++        continue;
++      }
++      if (out_degree_count.count(p) == 0) {
++        // Initialize the out-degree count for the node
++        out_degree_count[p] = p->out_edges().size();
++      }
++      // Decrease the out-degree count for the predecessor node
++      out_degree_count[p] -= 1;
++
++      // If the predecessor node's out-degree count is 0 and not in path_nodes,
++      // add it to path_nodes and queue
++      if (out_degree_count[p] == 0) {
++        path_nodes.insert(p);
++        queue.push(p);
++        VLOG(3) << p->DebugString();
++      }
++    }
++  }
++}
++
++void MarkForCompilationPassImpl::collectMergeNodes(
++    const std::vector<Node*>& nodeSet, std::set<Node*> &merger_nodes) {
++  // 1. Collect the number of nodeSet that can reach each node
++  std::map<Node*, std::set<Node*>> reach_map;
++  for (Node* start : nodeSet) {
++    std::set<Node*> visited;
++    std::vector<Node*> stack = {start};
++    while (!stack.empty()) {
++      Node* cur = stack.back();
++      stack.pop_back();
++      if (visited.count(cur)) continue;
++      visited.insert(cur);
++      for (const Edge* e : cur->out_edges()) {
++        Node* next = e->dst();
++        if (!visited.count(next))
++          stack.push_back(next);
++      }
++    }
++    reach_map[start] = std::move(visited);
++  }
++
++  // 2. Determine the merger node
++  std::map<Node*, int> node_reach_count;
++  std::set<Node*> all_nodes;
++  for (const auto& kv : reach_map) {
++    for (Node* n : kv.second) {
++      node_reach_count[n]++;
++      all_nodes.insert(n);
++    }
++  }
++  for (Node* n : all_nodes) {
++    // Condition 1: Reached by multiple sources
++    if (node_reach_count[n] >= 2) merger_nodes.insert(n);
++    // Condition 2: No output edges
++    if (n->out_edges().empty()) merger_nodes.insert(n);
++  }
++}
++
++void MarkForCompilationPassImpl::collectPathNodes(
++    Node* start, std::set<Node*> &path_nodes, std::set<Node*>& merger_nodes) {
++  std::vector<Node*> stack = {start};
++  std::set<Node*> visited;
++
++  while (!stack.empty()) {
++    Node* cur = stack.back();
++    stack.pop_back();
++    if (visited.count(cur) || !IsCompilationCandidate(cur)) {
++      continue;
++    }
++    visited.insert(cur);
++
++    // Stop search met the merger node
++    if (merger_nodes.count(cur)) {
++      if (cur->out_edges().empty()) path_nodes.insert(cur);
++      continue;
++    }
++    path_nodes.insert(cur);
++
++    for (const Edge* e : cur->out_edges()) {
++      Node* next = e->dst();
++      if (!visited.count(next)) {
++        stack.push_back(next);
++      }
++    }
++  }
++}
++
++// collectParallelNode
++// Search the serial merger nodes based on the parallel matmul starting points
++// Search along the output edge to get the boundary from start to all merger points
++// Search along the input edge to get the entire parallel computation graph
++std::map<Node*, std::vector<Node*>>
++MarkForCompilationPassImpl::collectParallelNode(
++    const std::vector<Node*>& nodeSet) {
++  std::set<Node*> merger_nodes;
++  collectMergeNodes(nodeSet, merger_nodes);
++
++  // Collect path nodes
++  std::map<Node*, std::vector<Node*>> result;
++  for (Node* start : nodeSet) {
++    VLOG(4) << "Search parallel graph form node: " << start->DebugString();
++    std::set<Node*> path_nodes;
++
++    // Search along output edge form start to merger nodes
++    collectPathNodes(start, path_nodes, merger_nodes);
++
++    VLOG(4) << "Collect path nodes:";
++    for (auto node : path_nodes) {
++      VLOG(4) << node->type_string();
++    }
++
++    VLOG(4) << "Collect input nodes:";
++    // search along input edge
++    collectInputNodes(path_nodes);
++
++    result[start] = std::vector<Node*>(path_nodes.begin(), path_nodes.end());
++  }
++  return result;
++}
++
++// Collect parallel matmuls as input nodes into nodeSet
++// Use collectParallelNode to get the parallel subgraph
++// Mark parallel nodes change ID
++absl::Status MarkForCompilationPassImpl::AssignParallelChains() {
++  VLOG(4) << "Run AssignParallelChains";
++  // Record the matmuls that can be paralleled
++  std::vector<std::vector<Node*>> parallel_matmuls;
++  int minParallelMatmulNum = 2;
++  int next_chain_id = 0;
++  // Collect matmul nodes with shared input to parallel_matmuls
++  for (Node* node : graph_->nodes()) {
++    if (node->out_edges().size() < 2) continue;
++    std::vector<Node*> matmul_nodes;
++    for (const Edge* e : node->out_edges()) {
++      if (e->IsControlEdge()) continue;
++      Node* succ = e->dst();
++      VLOG(4) << "Find matmul node: " << succ->type_string() << " : " << succ->DebugString();
++      if (succ->type_string() == "MatMul")
++        matmul_nodes.push_back(succ);
++    }
++    if (matmul_nodes.size() >= minParallelMatmulNum)
++      parallel_matmuls.push_back(matmul_nodes);
++  }
++
++  for (auto matmul_nodes : parallel_matmuls) {
++    VLOG(4) << "Process matmul nodes: Total " << matmul_nodes.size()
++            << " sub matmuls";
++    bool visited = false;
++    for (auto matmul : matmul_nodes) {
++      VLOG(4) << matmul->name();
++      Cluster* cluster = GetClusterForNode(matmul);
++      if (!cluster || cluster->chain_id() != -1) {
++        visited = true;
++        break;
++      }
++    }
++    if (visited) {
++      VLOG(4) << "stop collect: has visited matmul";
++      continue;
++    }
++
++    std::map<Node*, std::vector<Node*>> subgraphMap =
++        collectParallelNode(matmul_nodes);
++    for (auto it : subgraphMap) {
++      auto nodeSet = it.second;
++      VLOG(4) << "One of Parallel sub-graph is: ";
++      for (auto node : nodeSet) {
++        VLOG(4) << node->DebugString();
++        Cluster* cluster = GetClusterForNode(node);
++        cluster->set_chain_id(next_chain_id);
++      }
++      next_chain_id++;
++    }
++  }
++  return absl::OkStatus();
++}
++
+ absl::StatusOr<bool> MarkForCompilationPassImpl::TryToContractEdge(
+     Cluster* from, Cluster* to) {
++  if (from->chain_id() != to->chain_id()) {
++    return LogNotContractableAndReturnFalse(
++        from, to, "nodes are in different parallel chains");
++  }
+   DCHECK(from->deadness_predicate().has_value() ==
+          to->deadness_predicate().has_value());
+   if (from->deadness_predicate() != to->deadness_predicate()) {
+@@ -2018,11 +2238,14 @@ absl::Status MarkForCompilationPass::Run(
+   debug_options.ignore_xla_compile_attr = false;
+   debug_options.deterministic_cluster_names =
+       flags->tf_xla_deterministic_cluster_names;
++  debug_options.enable_dynamic_sizes =
++      flags->tf_xla_enable_dynamic_sizes;
+   debug_options.max_cluster_size = flags->tf_xla_max_cluster_size;
+   debug_options.min_cluster_size = flags->tf_xla_min_cluster_size;
+   debug_options.fuel = GetPointerToFuel(flags->tf_xla_clustering_fuel);
+   debug_options.dump_graphs = flags->tf_xla_clustering_debug;
+   debug_options.annotate_cluster_id = flags->tf_xla_annotate_cluster_id;
++  debug_options.enable_cluster_parallel = flags->tf_xla_cluster_parallel;
+ 
+   return MarkForCompilation(options, debug_options);
+ }
+@@ -2038,6 +2261,7 @@ absl::Status MarkForCompilationPass::RunForTest(
+       flags->tf_xla_disable_resource_variable_safety_checks_for_debugging;
+   debug_options.ignore_xla_compile_attr = true;
+   debug_options.deterministic_cluster_names = deterministic_cluster_names;
++  debug_options.enable_dynamic_sizes = false;
+   debug_options.max_cluster_size = flags->tf_xla_max_cluster_size;
+   debug_options.min_cluster_size = flags->tf_xla_min_cluster_size;
+   debug_options.fuel = GetPointerToFuel(flags->tf_xla_clustering_fuel);
+diff --git a/tensorflow/compiler/tf2xla/kernels/reduction_ops.cc b/tensorflow/compiler/tf2xla/kernels/reduction_ops.cc
+index 5f911018c24..be6b6e07765 100644
+--- a/tensorflow/compiler/tf2xla/kernels/reduction_ops.cc
++++ b/tensorflow/compiler/tf2xla/kernels/reduction_ops.cc
+@@ -22,6 +22,7 @@ limitations under the License.
+ #include <vector>
+ 
+ #include "absl/status/status.h"
++#include "tensorflow/compiler/jit/flags.h"
+ #include "tensorflow/compiler/tf2xla/xla_helpers.h"
+ #include "tensorflow/compiler/tf2xla/xla_op_registry.h"
+ #include "xla/hlo/builder/lib/constants.h"
+@@ -147,10 +148,21 @@ class MeanOp : public XlaReductionOp {
+     xla::XlaOp result = reduce_output;
+     xla::Shape bounded_shape = builder->GetShape(input).value();
+     int64_t divisor_value = bounded_shape.dimensions(dimensions_to_reduce[0]);
+-    auto divisor = xla::GetDimensionSize(input, dimensions_to_reduce[0]);
++    xla::XlaOp divisor;
++    MarkForCompilationPassFlags* flags = GetMarkForCompilationPassFlags();
++    if (flags->tf_xla_enable_dynamic_sizes && dimensions_to_reduce[0] == 0) {
++      divisor = xla::GetOuterBatchValue(input);
++    } else {
++      divisor = xla::GetDimensionSize(input, dimensions_to_reduce[0]);
++    }
+     for (int i = 1; i < dimensions_to_reduce.size(); i++) {
+       int64_t size_value = bounded_shape.dimensions(dimensions_to_reduce[i]);
+-      auto size = xla::GetDimensionSize(input, dimensions_to_reduce[i]);
++      xla::XlaOp size;
++      if (flags->tf_xla_enable_dynamic_sizes && dimensions_to_reduce[i] == 0) {
++        size = xla::GetOuterBatchValue(input);
++      } else {
++        size = xla::GetDimensionSize(input, dimensions_to_reduce[i]);
++      }
+       if (size_value * divisor_value > std::numeric_limits<int32_t>::max()) {
+         result = result / xla::ConvertElementType(divisor, xla_reduction_type_);
+         divisor_value = size_value;
+diff --git a/tensorflow/compiler/tf2xla/xla_argument.h b/tensorflow/compiler/tf2xla/xla_argument.h
+index 9e2eccd29b1..86811d3416e 100644
+--- a/tensorflow/compiler/tf2xla/xla_argument.h
++++ b/tensorflow/compiler/tf2xla/xla_argument.h
+@@ -53,6 +53,9 @@ struct XlaArgument {
+     kTensorList,
+   };
+ 
++  //To keep dynamic dim as an attribute of the argument.
++  int64_t dynamic_dim = -1;
++
+   Kind kind = kInvalid;
+ 
+   // The type of the argument. If the argument is a resource, this
+diff --git a/tensorflow/compiler/tf2xla/xla_compiler.cc b/tensorflow/compiler/tf2xla/xla_compiler.cc
+index b7cff00c8a0..65df8e1fc15 100644
+--- a/tensorflow/compiler/tf2xla/xla_compiler.cc
++++ b/tensorflow/compiler/tf2xla/xla_compiler.cc
+@@ -840,6 +840,8 @@ absl::Status XlaCompiler::CompileFunction(
+       }
+     } else {
+       TensorShape tensor_shape = std::get<TensorShape>(args[i].shape);
++      AttrSlice n_attrs = fbody->arg_nodes[i]->attrs();
++      std::vector<const TensorShapeProto*> output_shapes;
+       fbody->arg_nodes[i]->ClearAttr("_output_shapes");
+       fbody->arg_nodes[i]->AddAttr("_output_shapes",
+                                    std::vector<TensorShape>{tensor_shape});
+@@ -1194,6 +1196,13 @@ absl::Status XlaCompiler::BuildArguments(
+ 
+       xla::OpMetadata arg_metadata;
+       arg_metadata.set_op_name(arg.node_name);
++
++      if (arg.dynamic_dim==0) {
++        // Encode dynamic dims as a string in op_type, so it appears in HLO metadata.
++        arg_metadata.set_op_type(
++            absl::StrCat("XLA_Arg_dyn[",arg.dynamic_dim, "]"));
++      }
++
+       builder->SetOneShotOpMetadata(arg_metadata);
+       arg_handles[i] = xla::GetTupleElement(tuple, i);
+     }
+@@ -1203,6 +1212,15 @@ absl::Status XlaCompiler::BuildArguments(
+       xla::XlaScopedShardingAssignment assign_sharding(
+           builder, it == arg_shardings.end() ? std::optional<xla::OpSharding>()
+                                              : it->second);
++      auto& arg = args[input_to_args->at(i)];
++      xla::OpMetadata arg_metadata;
++      arg_metadata.set_op_name(arg.node_name);
++      if (arg.dynamic_dim==0) {
++        arg_metadata.set_op_type(
++            absl::StrCat("XLA_Arg_dyn[",arg.dynamic_dim, "]"));
++      }
++      builder->SetOneShotOpMetadata(arg_metadata);
++      
+       if (is_entry_computation) {
+         // Add an entry to is_same_across_replicas for every leaf buffer.
+         std::vector<bool> is_same_across_replicas(
+diff --git a/tensorflow/core/framework/op_kernel.h b/tensorflow/core/framework/op_kernel.h
+index 66864b4f97b..a36d1cacc53 100644
+--- a/tensorflow/core/framework/op_kernel.h
++++ b/tensorflow/core/framework/op_kernel.h
+@@ -580,6 +580,9 @@ class OpKernelContext {
+   struct Params {
+     ~Params() { delete eigen_gpu_device; }
+ 
++    // batch size
++    int64_t batch_size = 0;
++
+     // The step being executed.
+     int64_t step_id = 0;
+ 
+@@ -706,6 +709,9 @@ class OpKernelContext {
+   };
+ 
+   // params must outlive the OpKernelContext.
++  void set_batch_size (int64_t bs) { params_->batch_size = bs; }
++  int64_t batch_size () const { return params_->batch_size; }
++
+   explicit OpKernelContext(Params* params);
+   OpKernelContext(Params* params, int num_outputs);
+   virtual ~OpKernelContext();
+diff --git a/tensorflow/core/framework/session_state.h b/tensorflow/core/framework/session_state.h
+index d102e153c00..01029063848 100644
+--- a/tensorflow/core/framework/session_state.h
++++ b/tensorflow/core/framework/session_state.h
+@@ -43,12 +43,17 @@ class SessionState {
+ 
+   static const char* kTensorHandleResourceTypeName;
+ 
++  int64_t GetBatchSize(void) { return batch_size_; }
++  void SetBatchSize(int64_t bs) { batch_size_ = bs; }
++
+  private:
+   mutex state_lock_;
+ 
+   // For generating unique ids for tensors stored in the session.
+   int64_t tensor_id_ = 0;
+ 
++  int64_t batch_size_ = 0;
++
+   // The live tensors in the session. A map from tensor handle to tensor.
+   std::unordered_map<string, Tensor> tensors_;
+ };
+diff --git a/tensorflow/core/graph/subgraph.cc b/tensorflow/core/graph/subgraph.cc
+index bb47f37ef7f..0d66e1f868c 100644
+--- a/tensorflow/core/graph/subgraph.cc
++++ b/tensorflow/core/graph/subgraph.cc
+@@ -79,6 +79,15 @@ absl::Status FeedInputs(
+     TF_RETURN_IF_ERROR(
+         feed_rewrites[i]->AddNode(g, {n, id.second}, &feed_node));
+ 
++    // Set an attribute in _Arg node to indicate it has a batch dimension
++    auto node_attrs = n->attrs();
++    const AttrValue* shape_attr = node_attrs.FindByString("_output_shapes");
++    if (shape_attr && shape_attr->has_list()) {
++      const TensorShapeProto& shape = shape_attr->list().shape(0);
++      if (shape.dim_size() >= 1 && shape.dim(0).size() == -1) {
++        feed_node->AddAttr("_is_batch", true);
++      }
++    }
+     // Update name_index
+     (*name_index)[feed_node->name()] = feed_node;
+     // Duplicate control edges aren't allowed, but feed_node was *just* created
+diff --git a/tensorflow/core/kernels/function_ops.cc b/tensorflow/core/kernels/function_ops.cc
+index 864855de1d6..2124ac9ff96 100644
+--- a/tensorflow/core/kernels/function_ops.cc
++++ b/tensorflow/core/kernels/function_ops.cc
+@@ -59,16 +59,53 @@ void ArgOp::Compute(OpKernelContext* ctx) {
+     }
+   };
+ 
++  Tensor t;
+   if (frame->CanConsumeArg(index_)) {
+-    Tensor val;
+-    frame->ConsumeArg(index_, &val);
+-    OP_REQUIRES_OK(ctx, validate_type(val));
+-    ctx->set_output(0, std::move(val));
++    frame->ConsumeArg(index_, &t);
++    OP_REQUIRES_OK(ctx, validate_type(t));
++    ctx->set_output(0, std::move(t));
++    val = &t;
+   } else {
+     OP_REQUIRES_OK(ctx, frame->GetArg(index_, &val));
+     OP_REQUIRES_OK(ctx, validate_type(*val));
+     ctx->set_output(0, *val);
+   }
++  if (is_batch_) {
++    SessionState * ss = ctx->session_state();
++    if (ss) {
++      int64_t cur_val = ss->GetBatchSize();
++      // Current batch size in the Session state can have 3 conditions:
++      // == 0: initial value. Can be set to the newly found batch size
++      // >0: previously set batch size exist.
++      // < 0: conflict detected already. Do nothing
++      // Batch size conflict is detected if in the same session but different
++      // Arg operators get different batch sizes. To be conservtive once
++      // conflict is detected the session batch size will always be -1
++      if (cur_val == 0) {
++        int64_t batch_size = val->dim_size(0);
++        ss->SetBatchSize(batch_size);
++        ctx->set_batch_size(batch_size);
++        VLOG(4) << "Setting batch size of SessionState to " << batch_size;
++      }
++      else if (cur_val > 0) {
++        int64_t batch_size = val->dim_size(0);
++        int64_t ctx_batch_size = ctx->batch_size();
++        VLOG(4) << "Context batch_size: " << ctx_batch_size << " new batch size: " << batch_size;
++        if (ctx_batch_size == 0 || batch_size == ctx_batch_size) {
++          ss->SetBatchSize(batch_size);
++          ctx->set_batch_size(batch_size);
++          VLOG(4) << "Setting batch size of SessionState to " << batch_size;
++        }
++        else {
++          // In this case batch size of the same context don't agree. We cannot
++          // Assume any batch size
++          ss->SetBatchSize(-1);
++          VLOG(4) << "Conflict detected. Setting batch size of SessionState to " << -1;
++        }
++      }
++      // else if cur_val < 0: do nothing
++    }
++  }
+ }
+ 
+ RetvalOp::RetvalOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
+diff --git a/tensorflow/core/kernels/function_ops.h b/tensorflow/core/kernels/function_ops.h
+index 552e1e6c515..c9e8fdcd894 100644
+--- a/tensorflow/core/kernels/function_ops.h
++++ b/tensorflow/core/kernels/function_ops.h
+@@ -38,6 +38,7 @@ class ArgOp : public OpKernel {
+  private:
+   int index_;
+   DataType dtype_;
++  bool is_batch_;
+ 
+   ArgOp(const ArgOp&) = delete;
+   void operator=(const ArgOp&) = delete;
+@@ -54,6 +55,7 @@ class RetvalOp : public OpKernel {
+  private:
+   int index_;
+   DataType dtype_;
++  bool is_batch_;
+ 
+   RetvalOp(const RetvalOp&) = delete;
+   void operator=(const RetvalOp&) = delete;
+diff --git a/third_party/xla/xla/backends/cpu/codegen/kernel_api_ir_builder.cc b/third_party/xla/xla/backends/cpu/codegen/kernel_api_ir_builder.cc
+index 2ce99c4b93a..30f64818209 100644
+--- a/third_party/xla/xla/backends/cpu/codegen/kernel_api_ir_builder.cc
++++ b/third_party/xla/xla/backends/cpu/codegen/kernel_api_ir_builder.cc
+@@ -147,7 +147,7 @@ llvm::StructType* KernelCallFrameTy(llvm::LLVMContext& ctx) {
+   llvm::PointerType* ptr = llvm::PointerType::getUnqual(ctx);
+   llvm::IntegerType* i64 = llvm::IntegerType::getInt64Ty(ctx);
+   return llvm::StructType::create("XLA_CPU_KernelCallFrame", ptr, ptr, i64,
+-                                  ptr);
++                                  ptr, i64);
+ }
+ 
+ llvm::FunctionType* KernelFunctionTy(llvm::LLVMContext& ctx) {
+@@ -316,6 +316,34 @@ auto KernelApiIrBuilder::EmitKernelPrototype(
+   return EmitKernelPrototype(module, name, arguments, results);
+ }
+ 
++llvm::Value* KernelApiIrBuilder::EmitGetBatchDim(llvm::IRBuilderBase& builder,
++                                                 llvm::Value* call_frame) {
++  llvm::LLVMContext& ctx = builder.getContext();
++  llvm::Type* ptr = llvm::PointerType::get(ctx, 0);
++  llvm::IntegerType* i64 = llvm::IntegerType::getInt64Ty(ctx);
++  llvm::Value* bdim_gep =
++      builder.CreateStructGEP(call_frame_ty_, call_frame, 4, "bdim_gep");
++  llvm::Value* bdim_value = builder.CreateLoad(i64, bdim_gep, "bdim_value");
++
++#if defined(PRINT_BATCHSIZE)
++  // Print batch size
++  llvm::Function* function = builder.GetInsertBlock()->getParent();
++  llvm::Module* module = function->getParent();
++  llvm::FunctionType* printfType = llvm::FunctionType::get(
++      builder.getInt32Ty(), llvm::PointerType::get(builder.getInt8Ty(), 0),
++      true);
++  llvm::Value* funcNameStr =
++      builder.CreateGlobalStringPtr(function->getName());
++  llvm::FunctionCallee printfFunc =
++      module->getOrInsertFunction("printf", printfType);
++  llvm::Value* formatStr =
++      builder.CreateGlobalStringPtr("Function: %s, Batch size is : %d!\n");
++  builder.CreateCall(printfFunc, {formatStr, funcNameStr, bdim_value});
++#endif
++
++  return bdim_value;
++}
++
+ auto KernelApiIrBuilder::EmitKernelPrototype(
+     llvm::Module& module, absl::string_view name,
+     absl::Span<const KernelParameter> arguments,
+@@ -394,6 +422,8 @@ auto KernelApiIrBuilder::EmitKernelPrototype(
+     ir_results.push_back(std::move(ir_result));
+   }
+ 
++  EmitGetBatchDim(b, call_frame);
++
+   // Return null pointer to signal success as we do not support error handling
+   // in the compiled host kernel.
+   llvm::BasicBlock* return_block =
+@@ -503,7 +533,8 @@ llvm_ir::IrArray KernelApiIrBuilder::EmitKernelArgument(
+   const llvm::DataLayout& data_layout = llvm_module->getDataLayout();
+   int64_t pointer_size = data_layout.getTypeStoreSize(builder.getPtrTy());
+   int64_t byte_size = ShapeUtil::ByteSizeOf(shape, pointer_size);
+-  llvm_ir::SetDereferenceableMetadataForLoad(data, byte_size);
++  if (shape.outer_multiplier() < 0)
++    llvm_ir::SetDereferenceableMetadataForLoad(data,byte_size);
+ 
+   // All buffers pointers passed to host kernels are expected to be invariant
+   // over the whole program. Note the metadata is attached only to loading
+diff --git a/third_party/xla/xla/backends/cpu/codegen/kernel_api_ir_builder.h b/third_party/xla/xla/backends/cpu/codegen/kernel_api_ir_builder.h
+index 58ffc5bc859..08af675fcb6 100644
+--- a/third_party/xla/xla/backends/cpu/codegen/kernel_api_ir_builder.h
++++ b/third_party/xla/xla/backends/cpu/codegen/kernel_api_ir_builder.h
+@@ -147,9 +147,13 @@ class KernelApiIrBuilder {
+   llvm_ir::IrArray EmitKernelArgument(llvm::IRBuilderBase& builder,
+                                       llvm::Value* call_frame, int64_t index,
+                                       const Shape& shape);
++
+   llvm::Function* EmitKernelFunction(llvm::Module& module,
+                                      absl::string_view name);
+ 
++  llvm::Value* EmitGetBatchDim(llvm::IRBuilderBase& builder,
++                               llvm::Value* call_frame);
++
+  private:
+   llvm::LLVMContext& context_;
+ 
+diff --git a/third_party/xla/xla/backends/cpu/runtime/kernel.cc b/third_party/xla/xla/backends/cpu/runtime/kernel.cc
+index ac1a5d7181e..668e10f0a0d 100644
+--- a/third_party/xla/xla/backends/cpu/runtime/kernel.cc
++++ b/third_party/xla/xla/backends/cpu/runtime/kernel.cc
+@@ -64,7 +64,7 @@ template <bool thread_dim_x_only>
+ class Kernel::ParallelTask {
+  public:
+   ParallelTask(XLA_CPU_Kernel* kernel, Kernel::ThreadDim thread_dims,
+-               absl::Span<const XLA_CPU_KernelArg> args);
++               size_t batch_size, absl::Span<const XLA_CPU_KernelArg> args);
+ 
+   // Invokes a host kernel for a given task index.
+   absl::Status operator()(size_t task_index) const;
+@@ -76,6 +76,7 @@ class Kernel::ParallelTask {
+ 
+   XLA_CPU_Kernel* kernel_;
+   XLA_CPU_KernelThreadDim thread_dims_;
++  size_t batch_size_;
+   absl::InlinedVector<XLA_CPU_KernelArg, 8> args_;
+ 
+   size_t num_tasks_;
+@@ -88,11 +89,13 @@ class Kernel::ParallelTask {
+ template <bool thread_dim_x_only>
+ Kernel::ParallelTask<thread_dim_x_only>::ParallelTask(
+     XLA_CPU_Kernel* kernel, Kernel::ThreadDim thread_dims,
++    size_t batch_size,
+     absl::Span<const XLA_CPU_KernelArg> args)
+     : kernel_(kernel),
+       thread_dims_({thread_dims.x, thread_dims.y, thread_dims.z}),
+       args_(args.begin(), args.end()),
+       num_tasks_(thread_dims_.x * thread_dims_.y * thread_dims_.z),
++      batch_size_(batch_size),
+       stride_z_(thread_dims_.y * thread_dims_.x),
+       stride_y_(thread_dims_.x) {}
+ 
+@@ -103,7 +106,7 @@ absl::Status Kernel::ParallelTask<thread_dim_x_only>::operator()(
+ 
+   XLA_CPU_KernelThread kernel_thread = Delinearize(task_index);
+   XLA_CPU_KernelCallFrame call_frame = {&thread_dims_, &kernel_thread,
+-                                        args_.size(), args_.data()};
++                                        args_.size(), args_.data(), batch_size_};
+ 
+   XLA_CPU_KernelError* error = (*kernel_)(&call_frame);
+ 
+@@ -138,12 +141,12 @@ Kernel::Kernel(unsigned arity, XLA_CPU_Kernel* kernel)
+       kernel_(function_->kernel()),
+       arity_(arity) {}
+ 
+-absl::Status Kernel::Launch(const ThreadDim& thread_dims,
++absl::Status Kernel::Launch(const ThreadDim& thread_dims, size_t batch_size,
+                             absl::Span<const DeviceMemoryBase> buffers) const {
+-  return Launch(thread_dims, ConvertBuffersToKernelArgs(buffers));
++  return Launch(thread_dims, batch_size, ConvertBuffersToKernelArgs(buffers));
+ }
+ 
+-absl::Status Kernel::Launch(const ThreadDim& thread_dims,
++absl::Status Kernel::Launch(const ThreadDim& thread_dims, size_t batch_size,
+                             absl::Span<const XLA_CPU_KernelArg> args) const {
+   XLA_CPU_KernelThreadDim kernel_thread_dims = {
+       thread_dims.x,
+@@ -156,8 +159,9 @@ absl::Status Kernel::Launch(const ThreadDim& thread_dims,
+       for (uint64_t x = 0; x < thread_dims.x; ++x) {
+         XLA_CPU_KernelThread kernel_thread = {x, y, z};
+ 
+-        XLA_CPU_KernelCallFrame call_frame = {
+-            &kernel_thread_dims, &kernel_thread, args.size(), args.data()};
++        XLA_CPU_KernelCallFrame call_frame = {&kernel_thread_dims,
++                                              &kernel_thread, args.size(),
++                                              args.data(), batch_size};
+ 
+         XLA_CPU_KernelError* error = (*kernel_)(&call_frame);
+ 
+@@ -172,20 +176,23 @@ absl::Status Kernel::Launch(const ThreadDim& thread_dims,
+ }
+ 
+ tsl::AsyncValueRef<LaunchEvent> Kernel::Launch(
+-    const ThreadDim& thread_dims, absl::Span<const DeviceMemoryBase> buffers,
++    const ThreadDim& thread_dims, size_t batch_size,
++    absl::Span<const DeviceMemoryBase> buffers,
+     const Eigen::ThreadPoolDevice* device) const {
+-  return Launch(thread_dims, ConvertBuffersToKernelArgs(buffers), device);
++  return Launch(thread_dims, batch_size, ConvertBuffersToKernelArgs(buffers),
++                device);
+ }
+ 
+ tsl::AsyncValueRef<LaunchEvent> Kernel::Launch(
+-    const ThreadDim& thread_dims, absl::Span<const XLA_CPU_KernelArg> args,
++    const ThreadDim& thread_dims, size_t batch_size,
++    absl::Span<const XLA_CPU_KernelArg> args,
+     const Eigen::ThreadPoolDevice* device) const {
+   size_t num_tasks = thread_dims.x * thread_dims.y * thread_dims.z;
+   CHECK_GT(num_tasks, 0) << "Number of tasks must be positive";  // Crash Ok
+ 
+   // Short-circuit launch with a single task and run it in the caller thread.
+   if (ABSL_PREDICT_TRUE(num_tasks == 1)) {
+-    absl::Status launched = Launch(thread_dims, args);
++    absl::Status launched = Launch(thread_dims, batch_size, args);
+     return ABSL_PREDICT_TRUE(launched.ok())
+                ? OkLaunchEvent()
+                : tsl::MakeErrorAsyncValueRef(std::move(launched));
+@@ -197,11 +204,13 @@ tsl::AsyncValueRef<LaunchEvent> Kernel::Launch(
+                        std::numeric_limits<uint16_t>::max());
+ 
+   if (ABSL_PREDICT_TRUE(thread_dims.y == 1 && thread_dims.z == 1)) {
+-    return Worker::Parallelize(device, num_workers, num_tasks,
+-                               ParallelTask<true>(kernel_, thread_dims, args));
++    return Worker::Parallelize(
++        device, num_workers, num_tasks,
++        ParallelTask<true>(kernel_, thread_dims, batch_size, args));
+   } else {
+-    return Worker::Parallelize(device, num_workers, num_tasks,
+-                               ParallelTask<false>(kernel_, thread_dims, args));
++    return Worker::Parallelize(
++        device, num_workers, num_tasks,
++        ParallelTask<false>(kernel_, thread_dims, batch_size, args));
+   }
+ }
+ 
+diff --git a/third_party/xla/xla/backends/cpu/runtime/kernel.h b/third_party/xla/xla/backends/cpu/runtime/kernel.h
+index 98010905322..0d0465af154 100644
+--- a/third_party/xla/xla/backends/cpu/runtime/kernel.h
++++ b/third_party/xla/xla/backends/cpu/runtime/kernel.h
+@@ -73,13 +73,13 @@ class Kernel {
+ 
+   // Calls the kernel once in the caller thread for a thread dim (0,0,0).
+   // This is a fast path for small host kernels that have just one thread.
+-  absl::Status CallOnce(absl::Span<const XLA_CPU_KernelArg> args) const;
++  absl::Status CallOnce(absl::Span<const XLA_CPU_KernelArg> args, size_t batch_size) const;
+ 
+   // Launches the kernel on the current thread by iterating over all threads in
+   // `thread_dims` and calling the kernel function.
+-  absl::Status Launch(const ThreadDim& thread_dims,
++  absl::Status Launch(const ThreadDim& thread_dims, size_t batch_size,
+                       absl::Span<const DeviceMemoryBase> buffers) const;
+-  absl::Status Launch(const ThreadDim& thread_dims,
++  absl::Status Launch(const ThreadDim& thread_dims, size_t batch_size,
+                       absl::Span<const XLA_CPU_KernelArg> args) const;
+ 
+   // Launches the kernel by iterating over all threads in `thread_dims` and
+@@ -89,10 +89,12 @@ class Kernel {
+   // Async value returned in constructed state and the caller can access it to
+   // get the number of tasks that are expected to be completed.
+   tsl::AsyncValueRef<LaunchEvent> Launch(
+-      const ThreadDim& thread_dims, absl::Span<const DeviceMemoryBase> buffers,
++      const ThreadDim& thread_dims, size_t batch_size,
++      absl::Span<const DeviceMemoryBase> buffers,
+       const Eigen::ThreadPoolDevice* device) const;
+   tsl::AsyncValueRef<LaunchEvent> Launch(
+-      const ThreadDim& thread_dims, absl::Span<const XLA_CPU_KernelArg> args,
++      const ThreadDim& thread_dims, size_t batch_size,
++      absl::Span<const XLA_CPU_KernelArg> args,
+       const Eigen::ThreadPoolDevice* device) const;
+ 
+   // For host platform, we assume that a core is a thread, and we can run at
+@@ -123,12 +125,13 @@ class Kernel {
+ };
+ 
+ inline ABSL_ATTRIBUTE_ALWAYS_INLINE absl::Status Kernel::CallOnce(
+-    absl::Span<const XLA_CPU_KernelArg> args) const {
++    absl::Span<const XLA_CPU_KernelArg> args,
++    size_t batch_size) const {
+   constexpr XLA_CPU_KernelThreadDim kernel_thread_dims = {1, 1, 1};
+   constexpr XLA_CPU_KernelThread kernel_thread = {1, 1, 1};
+ 
+   XLA_CPU_KernelCallFrame call_frame = {&kernel_thread_dims, &kernel_thread,
+-                                        args.size(), args.data()};
++                                        args.size(), args.data(), batch_size};
+ 
+   XLA_CPU_KernelError* error = (*kernel_)(&call_frame);
+ 
+diff --git a/third_party/xla/xla/backends/cpu/runtime/kernel_c_api.h b/third_party/xla/xla/backends/cpu/runtime/kernel_c_api.h
+index cbe05685063..cf8016759ed 100644
+--- a/third_party/xla/xla/backends/cpu/runtime/kernel_c_api.h
++++ b/third_party/xla/xla/backends/cpu/runtime/kernel_c_api.h
+@@ -72,6 +72,7 @@ typedef struct XLA_CPU_KernelCallFrame {
+ 
+   size_t num_args;
+   const XLA_CPU_KernelArg* args;
++  size_t batch_size;
+ } XLA_CPU_KernelCallFrame;
+ 
+ // Error reporting for host kernels. NULL means success.
+diff --git a/third_party/xla/xla/backends/cpu/runtime/kernel_thunk.cc b/third_party/xla/xla/backends/cpu/runtime/kernel_thunk.cc
+index 90c15a09bd6..7a1c0ec70c4 100644
+--- a/third_party/xla/xla/backends/cpu/runtime/kernel_thunk.cc
++++ b/third_party/xla/xla/backends/cpu/runtime/kernel_thunk.cc
+@@ -223,7 +223,7 @@ KernelThunk<num_arguments, num_results>::ExecuteInternal(
+ 
+   // Use a fast path if kernel called just once.
+   if (ABSL_PREDICT_TRUE(call_once_)) {
+-    TF_RETURN_IF_ERROR(kernel->CallOnce(kernel_args));
++    TF_RETURN_IF_ERROR(kernel->CallOnce(kernel_args, params.batch_size));
+     return OkExecuteEvent();
+   }
+ 
+@@ -231,10 +231,12 @@ KernelThunk<num_arguments, num_results>::ExecuteInternal(
+   // by scheduling tasks into it. HostKernel launch completion will
+   // automatically signal KernelThunk execute completion.
+   if (ABSL_PREDICT_TRUE(params.intra_op_threadpool)) {
+-    return kernel->Launch(thread_dim_, kernel_args, params.intra_op_threadpool);
++    return kernel->Launch(thread_dim_, params.batch_size, kernel_args,
++                          params.intra_op_threadpool);
+   }
+ 
+-  TF_RETURN_IF_ERROR(kernel->Launch(thread_dim_, kernel_args));
++  TF_RETURN_IF_ERROR(
++      kernel->Launch(thread_dim_, params.batch_size, kernel_args));
+   return OkExecuteEvent();
+ }
+ 
+diff --git a/third_party/xla/xla/backends/cpu/runtime/thunk.h b/third_party/xla/xla/backends/cpu/runtime/thunk.h
+index d4a56ae88fa..5b7042ccb28 100644
+--- a/third_party/xla/xla/backends/cpu/runtime/thunk.h
++++ b/third_party/xla/xla/backends/cpu/runtime/thunk.h
+@@ -259,6 +259,7 @@ class Thunk {
+     TaskRunner* task_runner = nullptr;
+     CollectiveExecuteParams* collective_params = nullptr;
+     CustomCallExecuteParams* custom_call_params = nullptr;
++    int64_t batch_size = 0;
+     ExecuteSession session = ExecuteSession(ExecuteSession::kMaxWorkers,
+                                             ExecuteSession::kSplitThreshold);
+   };
+diff --git a/third_party/xla/xla/executable_run_options.h b/third_party/xla/xla/executable_run_options.h
+index b377e91670e..211932ffcbb 100644
+--- a/third_party/xla/xla/executable_run_options.h
++++ b/third_party/xla/xla/executable_run_options.h
+@@ -195,6 +195,13 @@ class ExecutableRunOptions {
+     return *this;
+   }
+ 
++  ExecutableRunOptions& set_batch_size(int64_t batch_size) {
++    batch_size_ = batch_size;
++    return *this;
++  }
++
++  int64_t batch_size() const { return batch_size_; }
++
+   int32_t launch_id() const { return launch_id_; }
+ 
+   ExecutableRunOptions& set_run_id(RunId id);
+@@ -265,6 +272,7 @@ class ExecutableRunOptions {
+   ExecutionProfile* execution_profile_ = nullptr;
+   int rng_seed_ = 0;
+   int32_t launch_id_ = 0;
++  int64_t batch_size_ = 0;
+   stream_executor::Stream* device_to_host_stream_ = nullptr;
+   stream_executor::Stream* host_to_device_stream_ = nullptr;
+   ThenExecuteFunction* then_execute_function_ = nullptr;
+diff --git a/third_party/xla/xla/hlo/builder/xla_builder.cc b/third_party/xla/xla/hlo/builder/xla_builder.cc
+index 93d7782de50..96000563190 100644
+--- a/third_party/xla/xla/hlo/builder/xla_builder.cc
++++ b/third_party/xla/xla/hlo/builder/xla_builder.cc
+@@ -6085,6 +6085,14 @@ XlaOp GetDimensionSize(const XlaOp operand, int64_t dimension) {
+   return operand.builder()->GetDimensionSize(operand, dimension);
+ }
+ 
++XlaOp GetOuterBatchValue(XlaOp operand) {
++  XlaBuilder* builder = operand.builder();
++  return CustomCall(builder, "GetOuterBatchValue", {operand},
++                             ShapeUtil::MakeShape(S32, {}), "", false, {},
++                             nullptr, CustomCallSchedule::SCHEDULE_NONE,
++                             CustomCallApiVersion::API_VERSION_ORIGINAL);
++}
++
+ XlaOp SetDimensionSize(const XlaOp operand, const XlaOp val,
+                        int64_t dimension) {
+   return operand.builder()->SetDimensionSize(operand, val, dimension);
+diff --git a/third_party/xla/xla/hlo/builder/xla_builder.h b/third_party/xla/xla/hlo/builder/xla_builder.h
+index 8f479090d86..b5ede47dd41 100644
+--- a/third_party/xla/xla/hlo/builder/xla_builder.h
++++ b/third_party/xla/xla/hlo/builder/xla_builder.h
+@@ -3055,6 +3055,8 @@ XlaOp BatchNormGrad(XlaOp operand, XlaOp scale, XlaOp batch_mean,
+ // array shaped.
+ XlaOp GetDimensionSize(XlaOp operand, int64_t dimension);
+ 
++XlaOp GetOuterBatchValue(XlaOp operand);
++
+ // Sets the size of the given dimension of the operand. The operand must be
+ // array shaped.  The result will have the same shape as the operand, but the
+ // given dimension will be dynamic (if not already).
+diff --git a/third_party/xla/xla/service/BUILD b/third_party/xla/xla/service/BUILD
+index 7cd03e529ae..2e68abe767d 100644
+--- a/third_party/xla/xla/service/BUILD
++++ b/third_party/xla/xla/service/BUILD
+@@ -121,6 +121,38 @@ cc_library(
+     ],
+ )
+ 
++cc_library(
++    name = "outer_dimension_propagation",
++    srcs = ["outer_dimension_propagation.cc"],
++    hdrs = ["outer_dimension_propagation.h"],
++    deps = [
++        "hlo_proto_util",
++        "//xla/hlo/ir:hlo",
++        "//xla/hlo/pass:hlo_pass",
++        "@com_google_absl//absl/container:flat_hash_set",
++        "@com_google_absl//absl/status",
++        "@com_google_absl//absl/status:statusor",
++        "@com_google_absl//absl/strings",
++        "@local_tsl//tsl/platform:statusor",
++    ],
++)
++
++cc_library(
++    name = "get_outer_batch_value_simplifier",
++    srcs = ["get_outer_batch_value_simplifier.cc"],
++    hdrs = ["get_outer_batch_value_simplifier.h"],
++    deps = [
++        "hlo_proto_util",
++        "//xla/hlo/ir:hlo",
++        "//xla/hlo/pass:hlo_pass",
++        "@com_google_absl//absl/container:flat_hash_set",
++        "@com_google_absl//absl/status",
++        "@com_google_absl//absl/status:statusor",
++        "@com_google_absl//absl/strings",
++        "@local_tsl//tsl/platform:statusor",
++    ],
++)
++
+ cc_library(
+     name = "all_reduce_promotion",
+     srcs = ["all_reduce_promotion.cc"],
+diff --git a/third_party/xla/xla/service/cpu/BUILD b/third_party/xla/xla/service/cpu/BUILD
+index 24247e60993..5e35837e4db 100644
+--- a/third_party/xla/xla/service/cpu/BUILD
++++ b/third_party/xla/xla/service/cpu/BUILD
+@@ -295,6 +295,8 @@ cc_library(
+         "//xla/mlir_hlo:all_passes",
+         "//xla/mlir_hlo:transforms_passes",
+         "//xla/service:all_reduce_promotion",
++        "//xla/service:outer_dimension_propagation",
++        "//xla/service:get_outer_batch_value_simplifier",
+         "//xla/service:all_to_all_decomposer",
+         "//xla/service:batched_gather_scatter_normalizer",
+         "//xla/service:batchnorm_expander",
+@@ -1156,6 +1158,16 @@ cc_library(
+     ],
+ )
+ 
++cc_library(
++    name = "executable_run_options_offset",
++    srcs = ["executable_run_options_offset.cc"],
++    hdrs = ["executable_run_options_offset.h"],
++    copts = tsl_copts(),
++    deps = [
++        "//xla:executable_run_options",
++    ],
++)
++
+ cc_library(
+     name = "runtime_conv3d",
+     srcs = ["runtime_conv3d.cc"],
+diff --git a/third_party/xla/xla/service/cpu/cpu_compiler.cc b/third_party/xla/xla/service/cpu/cpu_compiler.cc
+index fcffdafcf5e..9ba0085b24d 100644
+--- a/third_party/xla/xla/service/cpu/cpu_compiler.cc
++++ b/third_party/xla/xla/service/cpu/cpu_compiler.cc
+@@ -152,6 +152,8 @@ limitations under the License.
+ #include "xla/map_util.h"
+ #include "xla/mlir_hlo/transforms/passes.h"
+ #include "xla/service/all_reduce_promotion.h"
++#include "xla/service/outer_dimension_propagation.h"
++#include "xla/service/get_outer_batch_value_simplifier.h"
+ #include "xla/service/all_to_all_decomposer.h"
+ #include "xla/service/batched_gather_scatter_normalizer.h"
+ #include "xla/service/batchnorm_expander.h"
+@@ -475,7 +477,7 @@ std::unique_ptr<HloPassFix<HloPassPipeline>> CreateSimplificationPipeline(
+   }
+ 
+   // Needs to happen after algebraic simplifier.
+-  pipeline->AddPass<TreeReductionRewriter>();
++  // pipeline->AddPass<TreeReductionRewriter>();
+ 
+   // BatchNormExpander can create zero-sized ops, so zero-sized HLO
+   // elimination has to come after that pass.
+@@ -927,6 +929,8 @@ absl::Status CpuCompiler::RunHloPassesAfterLayoutAssn(
+     pipeline.AddPass<SmallWhileLoopHoistingPass>(byte_threshold);
+   }
+ 
++  pipeline.AddPass<OuterDimensionPropagationPass>();
++  pipeline.AddPass<GetOuterBatchValueSimplifier>();
+   pipeline.AddPass<HloDCE>();
+   return pipeline.Run(module).status();
+ }
+diff --git a/third_party/xla/xla/service/cpu/cpu_executable.cc b/third_party/xla/xla/service/cpu/cpu_executable.cc
+index 158a4000d27..e161f760a5d 100644
+--- a/third_party/xla/xla/service/cpu/cpu_executable.cc
++++ b/third_party/xla/xla/service/cpu/cpu_executable.cc
+@@ -163,14 +163,34 @@ static absl::StatusOr<MaybeOwningDeviceMemory> MemoryForAllocation(
+     se::DeviceMemoryAllocator* memory_allocator, int device_ordinal) {
+   VLOG(3) << allocation.ToString();
+   if (allocation.is_entry_computation_parameter()) {
+-    se::DeviceMemoryBase out = arguments[allocation.parameter_number()]
++    se::DeviceMemoryBase param_mem = arguments[allocation.parameter_number()]
+                                    .Buffer(allocation.param_shape_index())
+                                    .AsDeviceMemoryBase();
+-    CHECK_LE(allocation.size(), out.size())
+-        << "Size mismatch on param " << allocation.parameter_number()
+-        << " at shape index " << allocation.param_shape_index().ToString();
+-    VLOG(3) << "allocation is a parameter";
+-    return MaybeOwningDeviceMemory{out};
++
++    const int64_t compiled_bytes = allocation.size();
++    const int64_t runtime_bytes = param_mem.size();
++
++    if(runtime_bytes == 0){
++      return MaybeOwningDeviceMemory{param_mem};
++    }
++
++    if (compiled_bytes <= runtime_bytes) {
++      return MaybeOwningDeviceMemory{param_mem};
++    }
++
++    //padded owns that device memory
++    TF_ASSIGN_OR_RETURN(
++        se::OwningDeviceMemory padded,
++        memory_allocator->Allocate(device_ordinal, compiled_bytes));
++    
++    void* dst = padded-> opaque();
++    void* src = param_mem.opaque();
++
++    std::memcpy(dst, src, runtime_bytes);
++    //Fill rest of them with zeros.
++    std::memset(static_cast<char*>(dst) + runtime_bytes, 0, compiled_bytes - runtime_bytes);
++    return MaybeOwningDeviceMemory{std::move(padded)};
++
+   } else if (allocation.is_constant()) {
+     VLOG(3) << "allocation is a constant";
+     if (allocation.index() < constants.size()) {
+@@ -275,11 +295,28 @@ absl::Status CpuExecutable::ExecuteComputeFunction(
+   return absl::OkStatus();
+ }
+ 
++void PrintScalars(absl::Span<MaybeOwningDeviceMemory const> buffers) {
++  for (int i = 0; i < buffers.size(); ++i) {
++    const se::DeviceMemoryBase& dmem = buffers[i].AsDeviceMemoryBase();
++    if (dmem.opaque() && dmem.size() >= sizeof(int64_t)) {
++      int64_t val = 0;
++      std::memcpy(&val, dmem.opaque(), sizeof(val));
++      std::cerr << "Buffer " << i << " scalar: " << val << std::endl;
++    } else {
++      std::cerr << "Buffer " << i << " empty or too small" << std::endl;
++    }
++  }
++}
++
+ absl::Status CpuExecutable::ExecuteThunks(
+     const ExecutableRunOptions* run_options,
+     absl::Span<MaybeOwningDeviceMemory const> buffers) {
+   uint64_t start_ns = tsl::Env::Default()->NowNanos();
+ 
++  #if defined(PRINT_BATCHSIZE)
++  PrintScalars(buffers);
++  #endif
++
+   size_t profile_counters_size = 0;
+   int64_t* profile_counters = nullptr;
+ 
+@@ -318,7 +355,8 @@ absl::Status CpuExecutable::ExecuteThunks(
+       intra_op_thread_pool,
+       &task_runner,
+       &collective_execute_params,
+-      &custom_call_execute_params};
++      &custom_call_execute_params,
++      run_options->batch_size()};
+ 
+   auto executed_event = thunks_->Execute(execute_params);
+   tsl::BlockUntilReady(executed_event);
+diff --git a/third_party/xla/xla/service/cpu/dot_op_emitter.cc b/third_party/xla/xla/service/cpu/dot_op_emitter.cc
+index e2e4f914579..c3f43289756 100644
+--- a/third_party/xla/xla/service/cpu/dot_op_emitter.cc
++++ b/third_party/xla/xla/service/cpu/dot_op_emitter.cc
+@@ -862,12 +862,17 @@ absl::Status DotOpEmitter::EmitCallToRuntime() {
+     std::swap(transpose_lhs, transpose_rhs);
+   }
+ 
++  // We work under the assumption that only M can be dynamic.
++  int batch_multiplier = target_array_.GetShape().outer_multiplier();
++  llvm::Value* m_val = (batch_multiplier > 0)
++                           ? xla::llvm_ir::GetBatchDimByName(b_, batch_multiplier)
++                           : b_->getInt64(mat_mult_dims.m);
++
+   b_->CreateCall(matmul_func,
+                  {executable_run_options_value_, target_array_.GetBasePointer(),
+-                  lhs->GetBasePointer(), rhs->GetBasePointer(),
+-                  b_->getInt64(mat_mult_dims.m), b_->getInt64(mat_mult_dims.n),
+-                  b_->getInt64(mat_mult_dims.k), b_->getInt32(transpose_lhs),
+-                  b_->getInt32(transpose_rhs)});
++                  lhs->GetBasePointer(), rhs->GetBasePointer(), m_val,
++                  b_->getInt64(mat_mult_dims.n), b_->getInt64(mat_mult_dims.k),
++                  b_->getInt32(transpose_lhs), b_->getInt32(transpose_rhs)});
+   return absl::OkStatus();
+ }
+ 
+diff --git a/third_party/xla/xla/service/cpu/executable_run_options_offset.cc b/third_party/xla/xla/service/cpu/executable_run_options_offset.cc
+new file mode 100644
+index 00000000000..2d84ddfa2ea
+--- /dev/null
++++ b/third_party/xla/xla/service/cpu/executable_run_options_offset.cc
+@@ -0,0 +1,28 @@
++#include "executable_run_options_offset.h"
++#include "xla/executable_run_options.h"
++
++namespace xla::cpu {
++
++// Friend-injection trick to get a pointer-to-private-member for the *real*
++// xla::ExecutableRunOptions::batch_size_.
++template <typename Tag, typename Tag::type Ptr>
++struct Linker {
++  friend constexpr typename Tag::type get_offset(Tag) { return Ptr; }
++};
++
++struct BatchSizeTag {
++  using type = int64_t xla::ExecutableRunOptions::*;
++  friend constexpr type get_offset(BatchSizeTag);
++};
++
++// Instantiate template to expose &ExecutableRunOptions::batch_size_.
++template struct Linker<BatchSizeTag, &xla::ExecutableRunOptions::batch_size_>;
++
++size_t ExecutableRunOptionsBatchSizeOffset() {
++  auto ptr = get_offset(BatchSizeTag{});
++  // Compute offset in bytes from null pointer.
++  return reinterpret_cast<size_t>(
++      &(reinterpret_cast<xla::ExecutableRunOptions*>(0)->*ptr));
++}
++
++}  // namespace xla::cpu
+diff --git a/third_party/xla/xla/service/cpu/executable_run_options_offset.h b/third_party/xla/xla/service/cpu/executable_run_options_offset.h
+new file mode 100644
+index 00000000000..3e702454e76
+--- /dev/null
++++ b/third_party/xla/xla/service/cpu/executable_run_options_offset.h
+@@ -0,0 +1,8 @@
++#pragma once
++#include <cstddef>
++
++namespace xla::cpu{
++
++    size_t ExecutableRunOptionsBatchSizeOffset();
++
++}
+diff --git a/third_party/xla/xla/service/cpu/ir_emitter.cc b/third_party/xla/xla/service/cpu/ir_emitter.cc
+index feca6552d24..cbcea0cb2d1 100644
+--- a/third_party/xla/xla/service/cpu/ir_emitter.cc
++++ b/third_party/xla/xla/service/cpu/ir_emitter.cc
+@@ -2358,6 +2358,29 @@ absl::Status IrEmitter::HandleSliceToDynamic(HloInstruction* hlo) {
+   return EmitSliceToDynamic(hlo, source_arrays, target_array);
+ }
+ 
++absl::Status IrEmitter::HandleOuterBatchValue(HloInstruction* hlo) {
++  TF_RETURN_IF_ERROR(EmitTargetAddressForOp(hlo));
++
++  llvm_ir::IrArray out_array = GetIrArrayFor(hlo);
++  int64_t multiplier = hlo->operand(0)->shape().outer_multiplier();
++
++  if (multiplier <= 0) {
++    LOG(ERROR) << "Invalid outer multiplier for GetOuterBatchValue: "
++               << multiplier;
++    return absl::InvalidArgumentError(
++        "Invalid outer multiplier for GetOuterBatchValue");
++  }
++  llvm::Value* bdim_value = llvm_ir::GetBatchDimByName(b(), multiplier);
++
++  llvm_ir::IrArray::Index out_index(/*multidimensional_index=*/{}, hlo->shape(),
++                                    b()->getInt32Ty());
++
++  llvm::Value* out_ptr = out_array.EmitArrayElementAddress(out_index, b());
++  b()->CreateStore(bdim_value, out_ptr);
++
++  return absl::OkStatus();
++}
++
+ absl::Status IrEmitter::HandlePadToStatic(HloInstruction* hlo) {
+   TF_RETURN_IF_ERROR(EmitTargetAddressForOp(hlo));
+ 
+@@ -2806,6 +2829,10 @@ absl::Status IrEmitter::HandleOneDnnSoftmax(HloInstruction* custom_call) {
+ #endif  // INTEL_MKL
+ 
+ absl::Status IrEmitter::HandleCustomCall(HloInstruction* custom_call) {
++  if (custom_call->custom_call_target() == "GetOuterBatchValue") {
++    return HandleOuterBatchValue(custom_call);
++  }
++
+   if (custom_call->custom_call_target() == "PadToStatic") {
+     return HandlePadToStatic(custom_call);
+   }
+diff --git a/third_party/xla/xla/service/cpu/ir_emitter.h b/third_party/xla/xla/service/cpu/ir_emitter.h
+index 40f54d2f4bf..0bd7fcc6b37 100644
+--- a/third_party/xla/xla/service/cpu/ir_emitter.h
++++ b/third_party/xla/xla/service/cpu/ir_emitter.h
+@@ -332,6 +332,7 @@ class IrEmitter : public DfsHloVisitorWithDefault,
+ 
+  private:
+   absl::Status HandleSliceToDynamic(HloInstruction* hlo);
++  absl::Status HandleOuterBatchValue(HloInstruction* hlo);
+   absl::Status HandlePadToStatic(HloInstruction* hlo);
+   absl::Status HandleTopK(HloInstruction* hlo) override;
+   absl::Status HandleAllReduceSingleReplica(HloInstruction* crs);
+diff --git a/third_party/xla/xla/service/cpu/ir_emitter2.cc b/third_party/xla/xla/service/cpu/ir_emitter2.cc
+index bce2108bb87..927d43f9d42 100644
+--- a/third_party/xla/xla/service/cpu/ir_emitter2.cc
++++ b/third_party/xla/xla/service/cpu/ir_emitter2.cc
+@@ -195,6 +195,33 @@ absl::StatusOr<IrEmitter2::KernelInfo> IrEmitter2::EmitPadHostKernel(
+       KernelInfo(std::move(kernel_prototype), se::BlockDim(), se::ThreadDim()));
+ }
+ 
++absl::StatusOr<IrEmitter2::KernelInfo>
++IrEmitter2::EmitGetOuterBatchValueHostKernel(const HloInstruction* getBatch) {
++  VLOG(2) << "Emit GetOuterBatchValue host kernel: " << getBatch->name();
++
++  TF_ASSIGN_OR_RETURN(KernelPrototype kernel_prototype,
++                      EmitKernelPrototype(getBatch));
++  llvm_ir::IrArray operand_array = kernel_prototype.arguments[0];
++  llvm_ir::IrArray output_array = kernel_prototype.results[0];
++  int64_t multiplier = getBatch->operand(0)->shape().outer_multiplier();
++  if (multiplier <= 0) {
++    LOG(ERROR) << "Invalid outer multiplier for GetOuterBatchValue: "
++               << multiplier;
++    return absl::InvalidArgumentError(
++        "Invalid outer multiplier for GetOuterBatchValue");
++  }
++  llvm::IRBuilder<> b(module_->getContext());
++  b.SetInsertPoint(kernel_prototype.function->getEntryBlock().getTerminator());
++  llvm::Value* bdim_value = llvm_ir::GetBatchDimByName(&b, multiplier);
++  llvm_ir::IrArray::Index output_index(/*multidimensional_index=*/{},
++                                       getBatch->shape(), b.getInt32Ty());
++  llvm::Value* output_ptr =
++      output_array.EmitArrayElementAddress(output_index, &b);
++  b.CreateStore(bdim_value, output_ptr);
++  return kernels_.emplace_back(
++      KernelInfo(std::move(kernel_prototype), se::BlockDim(), se::ThreadDim()));
++}
++
+ absl::StatusOr<IrEmitter2::KernelInfo> IrEmitter2::EmitFusionHostKernel(
+     const HloFusionInstruction* fusion) {
+   VLOG(2) << "Emit fusion host kernel: " << fusion->name();
+diff --git a/third_party/xla/xla/service/cpu/ir_emitter2.h b/third_party/xla/xla/service/cpu/ir_emitter2.h
+index e720e06f376..2a0b98d5856 100644
+--- a/third_party/xla/xla/service/cpu/ir_emitter2.h
++++ b/third_party/xla/xla/service/cpu/ir_emitter2.h
+@@ -113,6 +113,9 @@ class IrEmitter2 {
+   // Emits a host kernel for the pad instruction.
+   absl::StatusOr<KernelInfo> EmitPadHostKernel(const HloInstruction* pad);
+ 
++  absl::StatusOr<KernelInfo> EmitGetOuterBatchValueHostKernel(
++      const HloInstruction* getBatch);
++
+   // Emits a host kernel for the given fusion instruction.
+   absl::StatusOr<KernelInfo> EmitFusionHostKernel(
+       const HloFusionInstruction* fusion);
+diff --git a/third_party/xla/xla/service/cpu/parallel_loop_emitter.cc b/third_party/xla/xla/service/cpu/parallel_loop_emitter.cc
+index 2bfffd88df9..adabc35f90c 100644
+--- a/third_party/xla/xla/service/cpu/parallel_loop_emitter.cc
++++ b/third_party/xla/xla/service/cpu/parallel_loop_emitter.cc
+@@ -61,6 +61,8 @@ ParallelLoopEmitter::EmitIndexAndSetExitBasicBlock(absl::string_view loop_name,
+     // performance with a large improvement in compile time.
+     auto unroll_mode = (i == 0) ? llvm_ir::UnrollMode::kDefaultUnroll
+                                 : llvm_ir::UnrollMode::kNoUnroll;
++    bool is_batch_dim = (dimension == 0) && shape_.outer_multiplier() > 0;
++
+     if (bounds_index < dynamic_loop_bounds_->size()) {
+       // Emit dynamic loop bounds for this dimension. Dynamic loop bounds
+       // are read from ir function dynamic loop bounds argument.
+@@ -69,14 +71,16 @@ ParallelLoopEmitter::EmitIndexAndSetExitBasicBlock(absl::string_view loop_name,
+ 
+       std::unique_ptr<llvm_ir::ForLoop> loop = loop_nest.AddLoop(
+           /*suffix=*/absl::StrFormat("dim.%d", dimension), start_index,
+-          end_index, unroll_mode);
++          end_index, unroll_mode, /*prevent_vectorization*/ false,
++          is_batch_dim);
+       array_multi_index[dimension] = loop->GetIndVarValue();
+     } else {
+       // Emit static loop bounds for this dimension.
+       std::unique_ptr<llvm_ir::ForLoop> loop = loop_nest.AddLoop(
+           /*start_index=*/0,
+           /*end_index=*/shape_.dimensions(dimension),
+-          /*suffix=*/absl::StrFormat("dim.%d", dimension), unroll_mode);
++          /*suffix=*/absl::StrFormat("dim.%d", dimension), unroll_mode,
++          /*prevent_vectorization*/ false, is_batch_dim);
+       array_multi_index[dimension] = loop->GetIndVarValue();
+     }
+   }
+diff --git a/third_party/xla/xla/service/cpu/thunk_emitter.cc b/third_party/xla/xla/service/cpu/thunk_emitter.cc
+index 9079ed8a16d..b6c32ecf8d4 100644
+--- a/third_party/xla/xla/service/cpu/thunk_emitter.cc
++++ b/third_party/xla/xla/service/cpu/thunk_emitter.cc
+@@ -1086,6 +1086,8 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCustomCallThunk(
+     return EmitTopKThunk(custom_call);
+   } else if (custom_call_target == "SliceToDynamic") {
+     return EmitSliceToDynamicThunk(instruction);
++  } else if (custom_call_target == "GetOuterBatchValue") {
++    return EmitGetOuterBatchValueThunk(instruction);
+   }
+ 
+   // Check the API version.
+@@ -1128,6 +1130,21 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitSliceToDynamicThunk(
+       /*min_alignment=*/cpu_function_runtime::MinAlign());
+ }
+ 
++absl::StatusOr<ThunkSequence> ThunkEmitter::EmitGetOuterBatchValueThunk(
++    const HloInstruction* instruction) {
++  VLOG(2) << "Handling GetOuterBatchValue for instruction: "
++            << instruction->ToString();
++  const HloCustomCallInstruction* custom_call =
++      Cast<HloCustomCallInstruction>(instruction);
++  TF_ASSIGN_OR_RETURN(
++      auto kernel, ir_emitter_.EmitGetOuterBatchValueHostKernel(custom_call));
++  TF_ASSIGN_OR_RETURN(auto result_buffer,
++                      GetHostKernelAllocationSlices(instruction));
++  return MakeKernelThunkSequence(
++      instruction, result_buffer, kernel,
++      /*min_alignment=*/cpu_function_runtime::MinAlign());
++}
++
+ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitSliceThunk(
+     const HloInstruction* instruction) {
+   // TODO(ezhulenev): Consider implementing slice operations as separate
+diff --git a/third_party/xla/xla/service/cpu/thunk_emitter.h b/third_party/xla/xla/service/cpu/thunk_emitter.h
+index 9cdc8ae3981..9949fef0329 100644
+--- a/third_party/xla/xla/service/cpu/thunk_emitter.h
++++ b/third_party/xla/xla/service/cpu/thunk_emitter.h
+@@ -183,6 +183,9 @@ class ThunkEmitter {
+   absl::StatusOr<ThunkSequence> EmitSliceToDynamicThunk(
+       const HloInstruction* instruction);
+ 
++  absl::StatusOr<ThunkSequence> EmitGetOuterBatchValueThunk(
++      const HloInstruction* instruction);
++
+   absl::StatusOr<ThunkSequence> EmitTopKThunk(
+       const HloCustomCallInstruction* custom_call);
+ 
+diff --git a/third_party/xla/xla/service/elemental_ir_emitter.cc b/third_party/xla/xla/service/elemental_ir_emitter.cc
+index 89391a3bdd1..2963fd4a03d 100644
+--- a/third_party/xla/xla/service/elemental_ir_emitter.cc
++++ b/third_party/xla/xla/service/elemental_ir_emitter.cc
+@@ -3278,51 +3278,56 @@ absl::StatusOr<llvm::Value*> ElementalIrEmitter::EmitElementalConcatenate(
+   }
+ 
+   // We use bisection to select the input operand.
+-  int64_t current_offset = 0;
++  int64_t coffset = 0;
++  llvm::Value* current_offset = source_index.GetConstantWithIndexType(0);
+ 
+   // Offset for every operand.
+-  std::vector<std::pair<int64_t, const HloInstruction*>> cases;
++  std::vector<std::pair<llvm::Value*, const HloInstruction*>> cases;
+ 
+   cases.reserve(hlo->operand_count());
+   for (const HloInstruction* operand : hlo->operands()) {
+     cases.emplace_back(current_offset, operand);
+-    current_offset += operand->shape().dimensions(concat_dim);
++    llvm::Value* cdim = source_index.GetConstantWithIndexType(
++        operand->shape().dimensions(concat_dim));
++    if (concat_dim == 0 && operand->shape().outer_multiplier() > 0) {
++      cdim = llvm_ir::GetBatchDimByName(b_, operand->shape().outer_multiplier());
++    }
++    current_offset = b_->CreateAdd(current_offset, cdim, "current_offset");
++    coffset += operand->shape().dimensions(concat_dim);
+   }
+-  CHECK_EQ(current_offset, hlo->shape().dimensions(concat_dim));
++  CHECK_EQ(coffset, hlo->shape().dimensions(concat_dim));
+ 
+   std::function<llvm::BasicBlock*(
+-      absl::Span<const std::pair<int64_t, const HloInstruction*>> operands)>
++      absl::Span<const std::pair<llvm::Value*, const HloInstruction*>> operands)>
+       emit_tree =
+-          [&](absl::Span<const std::pair<int64_t, const HloInstruction*>>
++          [&](absl::Span<const std::pair<llvm::Value*, const HloInstruction*>>
+                   operands) {
+             llvm::IRBuilder<>::InsertPointGuard guard(*b_);
+             size_t mid = operands.size() / 2;
+-            const std::pair<int64_t, const HloInstruction*>& pivot =
++            const std::pair<llvm::Value*, const HloInstruction*>& pivot =
+                 operands[mid];
+             llvm::BasicBlock* block = llvm_ir::CreateBasicBlock(
+                 exit_block,
+-                absl::StrCat("concatenate.pivot.", pivot.first, "."), b_);
++                absl::StrCat("concatenate.pivot."), b_);
+             b_->SetInsertPoint(block);
+ 
+             // If there's only one element we're done. The range is contiguous
+             // so we can just jump to the block for it.
+             if (operands.size() == 1) {
+-              const std::pair<int64_t, const HloInstruction*>& operand =
++              const std::pair<llvm::Value*, const HloInstruction*>& operand =
+                   operands.back();
+               int64_t operand_id = to_unique_operand_id[operand.second];
+ 
+               source_index_phis[operand_id]->addIncoming(
+-                  source_index.GetConstantWithIndexType(operand.first),
++                  operand.first,
+                   b_->GetInsertBlock());
+               b_->CreateBr(emit_operand_blocks[operand_id]);
+               return block;
+             }
+ 
+             // Take the middle element and recurse.
+-            llvm::Constant* pivot_const = llvm::ConstantInt::get(
+-                source_index[concat_dim]->getType(), pivot.first);
+             llvm::Value* comp =
+-                b_->CreateICmpULT(source_index[concat_dim], pivot_const);
++                b_->CreateICmpULT(source_index[concat_dim], pivot.first);
+ 
+             llvm::BasicBlock* left_block = emit_tree(operands.subspan(0, mid));
+             llvm::BasicBlock* right_block = emit_tree(operands.subspan(mid));
+@@ -3616,11 +3621,21 @@ absl::StatusOr<llvm::Value*> ElementalIrEmitter::EmitElementalPad(
+             "in_bounds");
+     multi_index[i] =
+         SDiv(multi_index[i], index_typed_const(pad_dim.interior_padding() + 1));
+-    in_bounds =
+-        And(in_bounds,
+-            ICmpSLT(multi_index[i],
+-                    index_typed_const(hlo->operand(0)->shape().dimensions(i))),
+-            "in_bounds");
++
++    int64_t shape_dim = hlo->operand(0)->shape().dimensions(i);
++    llvm::Value* bound = index_typed_const(shape_dim);
++
++    int64_t multiplier =
++        (i == 0) ? hlo->operand(0)->shape().outer_multiplier() : -1;
++    if (multiplier > 0) {
++      bound = llvm_ir::GetBatchDimByName(b_, multiplier);
++    } else if (shape_dim == 977) {
++      // This should be deleted.
++      LOG(ERROR) << "Dynamic batch marker: No multiplier for batch dim: "
++                 << hlo->ToString();
++    }
++
++    in_bounds = And(in_bounds, ICmpSLT(multi_index[i], bound), "in_bounds");
+   }
+ 
+   // if (in_bounds) {
+@@ -3687,9 +3702,18 @@ absl::StatusOr<llvm::Value*> ElementalIrEmitter::EmitElementalDot(
+     return llvm::ConstantInt::get(index_type, c);
+   };
+ 
++  llvm::Value* contracted_bound = index_typed_const(contracted_dim_size);
++  int64_t multiplier = (lhs_contracting_dim == 0)
++                           ? hlo->operand(0)->shape().outer_multiplier()
++                           : -1;
++  if (multiplier > 0) {
++    llvm::Value* bdim_value = llvm_ir::GetBatchDimByName(b_, multiplier);
++    contracted_bound = bdim_value;
++  }
++
+   std::unique_ptr<llvm_ir::ForLoop> inner_loop = llvm_ir::ForLoop::EmitForLoop(
+-      IrName(hlo, "inner"), index_typed_const(0),
+-      index_typed_const(contracted_dim_size), index_typed_const(1), b_);
++      IrName(hlo, "inner"), index_typed_const(0), contracted_bound,
++      index_typed_const(1), b_);
+ 
+   SetToFirstInsertPoint(inner_loop->GetPreheaderBasicBlock(), b_);
+   PrimitiveType primitive_type = hlo->shape().element_type();
+@@ -3967,6 +3991,8 @@ llvm_ir::ElementGenerator ElementalIrEmitter::MakeElementGenerator(
+     case HloOpcode::kSlice:
+       return [this, hlo, &operand_to_generator](
+                  const IrArray::Index& index) -> absl::StatusOr<llvm::Value*> {
++        // [Steven] the problem is that slices are represented by integer ranges.
++        // If these are based on the magic number they are wrong.
+         IrArray::Index sliced_index = index.SourceIndexOfSlice(
+             /*operand_shape=*/hlo->operand(0)->shape(),
+             /*starts=*/hlo->slice_starts(),
+@@ -4236,11 +4262,22 @@ absl::StatusOr<llvm::Value*> ElementalIrEmitter::EmitElementalReduceWindow(
+     // comparison is equivalent to the unsigned comparison
+     // input_multi_index[i] < bound, as a negative value wraps to a large
+     // positive value.
++
++    int64_t dim_bound = reduce_window->inputs()[0]->shape().dimensions(i);
++    llvm::Value* shape_bound = index_typed_const(dim_bound);
++
++    int64_t multiplier =
++        (i == 0) ? reduce_window->inputs()[0]->shape().outer_multiplier() : -1;
++
++    if (multiplier > 0) {
++      llvm::Value* bdim_value = llvm_ir::GetBatchDimByName(b_, multiplier);
++      shape_bound = bdim_value;
++    }
++
+     in_bounds =
+         And(in_bounds,
+             ICmpULT(input_multi_index[i],
+-                    index_typed_const(
+-                        reduce_window->inputs()[0]->shape().dimensions(i))));
++                    shape_bound));
+   }
+ 
+   llvm_ir::LlvmIfData if_data =
+diff --git a/third_party/xla/xla/service/get_outer_batch_value_simplifier.cc b/third_party/xla/xla/service/get_outer_batch_value_simplifier.cc
+new file mode 100644
+index 00000000000..51a9dbe1b8a
+--- /dev/null
++++ b/third_party/xla/xla/service/get_outer_batch_value_simplifier.cc
+@@ -0,0 +1,42 @@
++#include "xla/service/get_outer_batch_value_simplifier.h"
++
++#include "xla/hlo/ir/dfs_hlo_visitor_with_default.h"
++#include "xla/service/hlo_creation_utils.h"
++#include "xla/hlo/ir/hlo_instruction.h"
++#include "xla/hlo/ir/hlo_instructions.h"
++#include "xla/hlo/ir/hlo_opcode.h"
++#include "xla/shape_util.h"
++
++namespace xla {
++
++// Use DfsHloRewriteVisitor to rewrite
++class GetOuterBatchValueRewriteVisitor : public DfsHloRewriteVisitor {
++ public:
++  absl::Status HandleCustomCall(HloInstruction* instr) override {
++    if (instr->custom_call_target() != "GetOuterBatchValue")
++      return absl::OkStatus();
++
++    if (instr->operand_count() != 1) return absl::OkStatus();
++    const HloInstruction* input = instr->operand(0);
++    const Shape& in_shape = input->shape();
++    int64_t multiplier = in_shape.outer_multiplier();
++
++    if (multiplier != -1) return absl::OkStatus();
++
++    int64_t batch_size = in_shape.dimensions(0);
++    auto const_instr =
++        instr->parent()->AddInstruction(HloInstruction::CreateConstant(
++            LiteralUtil::CreateR0<int32_t>(static_cast<int32_t>(batch_size))));
++
++    TF_RETURN_IF_ERROR(ReplaceInstruction(instr, const_instr));
++    return absl::OkStatus();
++  }
++};
++
++absl::StatusOr<bool> GetOuterBatchValueSimplifier::Run(
++    HloModule* module,
++    const absl::flat_hash_set<absl::string_view>& execution_threads) {
++  return GetOuterBatchValueRewriteVisitor{}.RunOnModule(module,
++                                                        execution_threads);
++}
++}  // namespace xla
+\ No newline at end of file
+diff --git a/third_party/xla/xla/service/get_outer_batch_value_simplifier.h b/third_party/xla/xla/service/get_outer_batch_value_simplifier.h
+new file mode 100644
+index 00000000000..0bdf3fc2730
+--- /dev/null
++++ b/third_party/xla/xla/service/get_outer_batch_value_simplifier.h
+@@ -0,0 +1,27 @@
++#ifndef XLA_SERVICE_CPU_GET_OUTER_BATCH_VALUE_SIMPLIFIER_H_
++#define XLA_SERVICE_CPU_GET_OUTER_BATCH_VALUE_SIMPLIFIER_H_
++
++#include "absl/container/flat_hash_set.h"
++#include "absl/strings/string_view.h"
++#include "absl/status/statusor.h"
++#include "xla/hlo/ir/hlo_module.h"
++#include "xla/hlo/pass/hlo_pass_interface.h"
++
++namespace xla {
++
++class GetOuterBatchValueSimplifier : public HloModulePass {
++ public:
++  absl::string_view name() const override {
++    return "get_outer_batch_value_simplifier";
++  }
++
++  using HloPassInterface::Run;
++  absl::StatusOr<bool> Run(
++      HloModule* module,
++      const absl::flat_hash_set<absl::string_view>& execution_threads
++  ) override;
++};
++
++}  // namespace xla
++
++#endif  // XLA_SERVICE_CPU_GET_OUTER_BATCH_VALUE_SIMPLIFIER_H_
+\ No newline at end of file
+diff --git a/third_party/xla/xla/service/llvm_ir/BUILD b/third_party/xla/xla/service/llvm_ir/BUILD
+index 599060b88ee..2a665c2d77f 100644
+--- a/third_party/xla/xla/service/llvm_ir/BUILD
++++ b/third_party/xla/xla/service/llvm_ir/BUILD
+@@ -84,6 +84,7 @@ cc_library(
+         "//xla/service/cpu:cpu_options",
+         "//xla/tsl/platform:byte_order",
+         "//xla/tsl/platform:logging",
++        "//xla/service/cpu:executable_run_options_offset",
+         "@com_google_absl//absl/algorithm:container",
+         "@com_google_absl//absl/base",
+         "@com_google_absl//absl/log",
+diff --git a/third_party/xla/xla/service/llvm_ir/ir_array.cc b/third_party/xla/xla/service/llvm_ir/ir_array.cc
+index 139d537c887..389eee09ef9 100644
+--- a/third_party/xla/xla/service/llvm_ir/ir_array.cc
++++ b/third_party/xla/xla/service/llvm_ir/ir_array.cc
+@@ -559,8 +559,43 @@ llvm::Value* IrArray::EmitArrayElementAddress(const IrArray::Index& index,
+     int64_t dimension = LayoutUtil::Major(shape_.layout(), i);
+     gep_indices.push_back(actual_index[dimension]);
+   }
+-  return b->CreateInBoundsGEP(pointee_type_, base_ptr_, gep_indices,
+-                              llvm_ir::AsStringRef(name));
++
++#define DYN_DIMS
++#ifdef DYN_DIMS
++
++  llvm::ArrayType* outerArray = llvm::dyn_cast<llvm::ArrayType>(pointee_type_);
++
++  CHECK(outerArray) << "Expected outer array type.";
++
++  llvm::Value* gep;
++
++  if (shape_.outer_multiplier() > 0) {
++
++    // Extract the inner array type: [N x T]
++    llvm::Type* innerArray = outerArray->getElementType();
++
++    CHECK(innerArray) << "Expected inner array type.";
++
++    // Create a new array type: [0 x [N x T]]
++    llvm::ArrayType* zeroOuterArray = llvm::ArrayType::get(innerArray, 0);
++
++    llvm::PointerType* newPtrTy = llvm::PointerType::getUnqual(zeroOuterArray);
++    llvm::Value* castedPtr = b->CreateBitCast(base_ptr_, newPtrTy);
++
++    gep =
++        b->CreateInBoundsGEP(zeroOuterArray,
++                            castedPtr,
++                            gep_indices, llvm_ir::AsStringRef(name));
++  } else {
++    gep = b->CreateInBoundsGEP(pointee_type_, base_ptr_, gep_indices,
++                               llvm_ir::AsStringRef(name));
++  }
++#else
++  auto gep = b->CreateInBoundsGEP(pointee_type_, base_ptr_, gep_indices,
++                                  llvm_ir::AsStringRef(name));
++#endif
++
++  return gep;
+ }
+ 
+ llvm::Value* IrArray::EmitLinearArrayElementAddress(
+diff --git a/third_party/xla/xla/service/llvm_ir/llvm_loop.cc b/third_party/xla/xla/service/llvm_ir/llvm_loop.cc
+index 43ee77ef0e8..f3159e0aacd 100644
+--- a/third_party/xla/xla/service/llvm_ir/llvm_loop.cc
++++ b/third_party/xla/xla/service/llvm_ir/llvm_loop.cc
+@@ -37,6 +37,7 @@ limitations under the License.
+ #include "xla/service/llvm_ir/llvm_util.h"
+ #include "xla/shape.h"
+ #include "xla/tsl/platform/logging.h"
++#include "llvm/include/llvm/Support/Debug.h"
+ 
+ namespace xla {
+ namespace llvm_ir {
+@@ -189,20 +190,29 @@ std::unique_ptr<ForLoop> ForLoopNest::AddLoop(absl::string_view suffix,
+                                               llvm::Value* start_index,
+                                               llvm::Value* end_index,
+                                               UnrollMode unroll_mode,
+-                                              bool prevent_vectorization) {
++                                              bool prevent_vectorization,
++                                              bool is_batch_dim) {
+   return AddLoop(suffix, start_index, end_index, GetConstantWithIndexType(1),
+-                 unroll_mode, prevent_vectorization);
++                 unroll_mode, prevent_vectorization, is_batch_dim);
+ }
+ 
+ std::unique_ptr<ForLoop> ForLoopNest::AddLoop(
+     absl::string_view suffix, llvm::Value* start_index, llvm::Value* end_index,
+-    llvm::Value* stride, UnrollMode unroll_mode, bool prevent_vectorization) {
++    llvm::Value* stride, UnrollMode unroll_mode, bool prevent_vectorization,
++    bool is_batch_dim) {
+   if (inner_loop_body_bb_ != nullptr) {
+     // Create this loop inside the previous one.
+     b_->SetInsertPoint(&*inner_loop_body_bb_->getFirstInsertionPt());
+   }
++  llvm::Value* actual_end = end_index;
++  if (is_batch_dim) {
++    // Get batch dim and compare with end_index to use minimum value
++    llvm::Value* batch_dim = GetBatchDimByName(b_);
++    actual_end = b_->CreateSelect(b_->CreateICmpULT(end_index, batch_dim),
++                                   end_index, batch_dim, "loop_end_min");
++  }
+   std::unique_ptr<ForLoop> loop(new ForLoop(
+-      /*prefix=*/name_, suffix, start_index, end_index, stride, unroll_mode,
++      /*prefix=*/name_, suffix, start_index, actual_end, stride, unroll_mode,
+       prevent_vectorization));
+   loop->Emit(b_);
+ 
+@@ -223,23 +233,30 @@ std::unique_ptr<ForLoop> ForLoopNest::AddLoop(int64_t start_index,
+                                               int64_t end_index,
+                                               absl::string_view suffix,
+                                               UnrollMode unroll_mode,
+-                                              bool prevent_vectorization) {
++                                              bool prevent_vectorization,
++                                              bool is_batch_dim) {
+   CHECK_LE(start_index, end_index);
+-  return AddLoop(suffix, GetConstantWithIndexType(start_index),
+-                 GetConstantWithIndexType(end_index), unroll_mode,
+-                 prevent_vectorization);
++
++  llvm::Value* end = is_batch_dim ? GetBatchDimByName(b_) : GetConstantWithIndexType(end_index);
++  is_batch_dim = false;
++  return AddLoop(suffix, GetConstantWithIndexType(start_index), end,
++                 unroll_mode, prevent_vectorization, is_batch_dim);
+ }
+ 
+ std::unique_ptr<ForLoop> ForLoopNest::AddLoop(int64_t start_index,
+                                               int64_t end_index, int64_t stride,
+                                               absl::string_view suffix,
+                                               UnrollMode unroll_mode,
+-                                              bool prevent_vectorization) {
++                                              bool prevent_vectorization,
++                                              bool is_batch_dim) {
+   CHECK_LE(start_index, end_index);
+-  return AddLoop(suffix, GetConstantWithIndexType(start_index),
+-                 GetConstantWithIndexType(end_index),
++
++  llvm::Value* end = is_batch_dim ? GetBatchDimByName(b_) : GetConstantWithIndexType(end_index);
++  is_batch_dim = false;
++
++  return AddLoop(suffix, GetConstantWithIndexType(start_index), end,
+                  GetConstantWithIndexType(stride), unroll_mode,
+-                 prevent_vectorization);
++                 prevent_vectorization, is_batch_dim);
+ }
+ 
+ IrArray::Index ForLoopNest::AddLoopsForShape(const Shape& shape,
+@@ -255,11 +272,14 @@ std::vector<llvm::Value*> ForLoopNest::AddLoopsForShapeOnDimensions(
+     absl::string_view suffix) {
+   std::vector<llvm::Value*> multi_index(shape.dimensions().size());
+   for (int64_t dimension : dimensions) {
++    bool is_batch_dim = (dimension == 0) && shape.outer_multiplier() > 0;
+     std::unique_ptr<llvm_ir::ForLoop> loop = AddLoop(
+         /*start_index=*/0,
+         /*end_index=*/shape.dimensions(dimension),
+         /*suffix=*/
+-        llvm_ir::IrName(suffix, absl::StrCat(dimension)));
++        llvm_ir::IrName(suffix, absl::StrCat(dimension)),
++        /*unroll_mode=*/llvm_ir::UnrollMode::kDefaultUnroll,
++        /*prevent_vectorization=*/false, is_batch_dim);
+     multi_index[dimension] = loop->GetIndVarValue();
+   }
+   return multi_index;
+diff --git a/third_party/xla/xla/service/llvm_ir/llvm_loop.h b/third_party/xla/xla/service/llvm_ir/llvm_loop.h
+index 7aa8ce9e32e..c6cbcafdda6 100644
+--- a/third_party/xla/xla/service/llvm_ir/llvm_loop.h
++++ b/third_party/xla/xla/service/llvm_ir/llvm_loop.h
+@@ -201,14 +201,14 @@ class ForLoopNest {
+       absl::string_view suffix, llvm::Value* start_index,
+       llvm::Value* end_index, llvm::Value* stride,
+       UnrollMode unroll_mode = xla::llvm_ir::UnrollMode::kDefaultUnroll,
+-      bool prevent_vectorization = false);
++      bool prevent_vectorization = false, bool is_batch_dim = false);
+ 
+   // Like the above, except that it defaults to a stride of one.
+   std::unique_ptr<ForLoop> AddLoop(
+       absl::string_view suffix, llvm::Value* start_index,
+       llvm::Value* end_index,
+       UnrollMode unroll_mode = xla::llvm_ir::UnrollMode::kDefaultUnroll,
+-      bool prevent_vectorization = false);
++      bool prevent_vectorization = false, bool is_batch_dim = false);
+ 
+   // A convenient wrapper of the other flavor of AddLoop. The given start and
+   // end index are constant.
+@@ -216,13 +216,13 @@ class ForLoopNest {
+       int64_t start_index, int64_t end_index, int64_t stride,
+       absl::string_view suffix,
+       UnrollMode unroll_mode = xla::llvm_ir::UnrollMode::kDefaultUnroll,
+-      bool prevent_vectorization = false);
++      bool prevent_vectorization = false, bool is_batch_dim = false);
+ 
+   // Like the above, except that it defaults to a stride of one.
+   std::unique_ptr<ForLoop> AddLoop(
+       int64_t start_index, int64_t end_index, absl::string_view suffix,
+       UnrollMode unroll_mode = xla::llvm_ir::UnrollMode::kDefaultUnroll,
+-      bool prevent_vectorization = false);
++      bool prevent_vectorization = false, bool is_batch_dim = false);
+ 
+   // Add loops to iterate through the indices within the specified
+   // shape. The returned index collects the induction variables of the
+diff --git a/third_party/xla/xla/service/llvm_ir/llvm_util.cc b/third_party/xla/xla/service/llvm_ir/llvm_util.cc
+index b1db780705b..b337b0dcc5b 100644
+--- a/third_party/xla/xla/service/llvm_ir/llvm_util.cc
++++ b/third_party/xla/xla/service/llvm_ir/llvm_util.cc
+@@ -80,11 +80,15 @@ limitations under the License.
+ #include "xla/xla_data.pb.h"
+ #include "tsl/profiler/lib/scoped_annotation.h"
+ 
++#include "xla/service/cpu/executable_run_options_offset.h"
++
+ namespace xla {
+ namespace llvm_ir {
+ 
+ namespace {
+ 
++constexpr llvm::StringLiteral kBdimValueName("bdim_value");
++
+ // This works for most llvm / mlir types. This also accepts a const pointer to
+ // objects which have a const print() method.
+ template <typename T>
+@@ -811,5 +815,63 @@ void EmitEarlyReturn(llvm::Value* condition, llvm::IRBuilderBase* b,
+   b->SetInsertPoint(continued, continued->getFirstInsertionPt());
+ }
+ 
++llvm::Value* GetBatchDimByName(llvm::IRBuilderBase* b, int64_t multiplier) {
++  llvm::Function* function = b->GetInsertBlock()->getParent();
++  llvm::LLVMContext& ctx = b->getContext();
++  llvm::IntegerType* i64Type = llvm::IntegerType::getInt64Ty(ctx);
++  llvm::Value* loadedValue = nullptr;
++  llvm::Value* bdim_scaled = nullptr;
++  for (auto& inst : function->getEntryBlock()) {
++    if (inst.getName() == kBdimValueName) {
++      loadedValue = &inst;
++    }
++  }
++  if (!loadedValue) {
++    // if missing, try to materialize it by loading from run_options+offset
++    llvm::Value* run_options = nullptr;
++    for (auto& arg : function->args()) {
++      if (arg.getName() == "run_options") {
++        run_options = &arg;
++        break;
++      }
++    }
++
++    if (!run_options) {
++      return nullptr;
++    }
++    // Materialize %bdim_value by loading ExecutableRunOptions::batch_size_ from
++    // the 'run_options' function argument using a known byte offset:
++    //
++    // 1) Bitcast 'run_options' to i8* to do byte-address arithmetic.
++    // 2) GEP by 'off' bytes to reach the batch_size field inside the object.
++    // 3) Bitcast resulting i8* to i64* and load it.
++    const int64_t off =
++        static_cast<int64_t>(xla::cpu::ExecutableRunOptionsBatchSizeOffset());
++
++    // Insert at the entry block.
++    llvm::IRBuilder<> entry_builder(
++        &function->getEntryBlock(),
++        function->getEntryBlock().getFirstInsertionPt());
++    llvm::Type* i8 = entry_builder.getInt8Ty();
++    llvm::Value* ro_i8 = entry_builder.CreateBitCast(
++        run_options, llvm::PointerType::getUnqual(i8), "run_options_i8");
++    llvm::Value* off_c = llvm::ConstantInt::get(i64Type, off);
++    llvm::Value* bdim_ptr_i8 =
++        entry_builder.CreateInBoundsGEP(i8, ro_i8, off_c, "bdim_ptr_i8");
++    llvm::Value* bdim_ptr = entry_builder.CreateBitCast(
++        bdim_ptr_i8, llvm::PointerType::getUnqual(i64Type), "bdim_ptr");
++    loadedValue = entry_builder.CreateLoad(i64Type, bdim_ptr, kBdimValueName);
++  }
++  if (multiplier < 1) {
++    llvm::errs() << "Multiplier is less than 1, this should not happen.\n";
++  } else if (multiplier == 1) {
++    bdim_scaled = loadedValue;
++  } else {
++    llvm::ConstantInt* m = llvm::ConstantInt::get(i64Type, multiplier, true);
++    bdim_scaled = b->CreateMul(loadedValue, m, "bdim_scaled");
++  }
++  return bdim_scaled;
++}
++
+ }  // namespace llvm_ir
+ }  // namespace xla
+diff --git a/third_party/xla/xla/service/llvm_ir/llvm_util.h b/third_party/xla/xla/service/llvm_ir/llvm_util.h
+index 88c1287d2f2..732e4400e3d 100644
+--- a/third_party/xla/xla/service/llvm_ir/llvm_util.h
++++ b/third_party/xla/xla/service/llvm_ir/llvm_util.h
+@@ -334,6 +334,8 @@ llvm::BasicBlock* EmitReturnBlock(llvm::IRBuilderBase* b);
+ void EmitEarlyReturn(llvm::Value* condition, llvm::IRBuilderBase* b,
+                      llvm::BasicBlock* return_block = nullptr);
+ 
++llvm::Value* GetBatchDimByName(llvm::IRBuilderBase* b, int64_t multiplier = 1);
++
+ }  // namespace llvm_ir
+ }  // namespace xla
+ 
+diff --git a/third_party/xla/xla/service/llvm_ir/loop_emitter.cc b/third_party/xla/xla/service/llvm_ir/loop_emitter.cc
+index 13f6a67764b..b0879c8ed4b 100644
+--- a/third_party/xla/xla/service/llvm_ir/loop_emitter.cc
++++ b/third_party/xla/xla/service/llvm_ir/loop_emitter.cc
+@@ -28,11 +28,13 @@ limitations under the License.
+ #include "llvm/IR/BasicBlock.h"
+ #include "llvm/IR/Constants.h"
+ #include "llvm/IR/IRBuilder.h"
++#include "llvm/IR/Module.h"
+ #include "llvm/IR/Type.h"
+ #include "llvm/IR/Value.h"
+ #include "xla/layout_util.h"
+ #include "xla/service/llvm_ir/ir_array.h"
+ #include "xla/service/llvm_ir/llvm_loop.h"
++#include "xla/service/llvm_ir/llvm_util.h"
+ #include "xla/shape.h"
+ #include "xla/shape_util.h"
+ #include "xla/tsl/platform/errors.h"
+@@ -183,6 +185,33 @@ std::vector<IrArray::Index> LoopEmitter::EmitIndexAndSetExitBasicBlock(
+ 
+   ForLoopNest loop_nest(loop_name, b_);
+ 
++  llvm::LLVMContext& ctx = b_->getContext();
++  llvm::IntegerType* i64Type = llvm::IntegerType::getInt64Ty(ctx);
++
++  llvm::PointerType* ptr = llvm::PointerType::getUnqual(ctx);
++  llvm::StructType* callFrameTy = llvm::StructType::create(
++      "XLA_CPU_KernelArg", ptr, ptr, i64Type, ptr, i64Type);
++
++  std::vector<llvm::Value*> dynamic_dims;
++  for (auto dim : shape_.dimensions()) {
++    dynamic_dims.push_back(llvm::ConstantInt::get(i64Type, dim));
++  }
++
++  bool dynamic = false;
++  for (int i = 0; i < shape_.dimensions_size(); i++) {
++    int64_t multiplier = (i == 0) ? shape_.outer_multiplier() : -1;
++    if (multiplier > 0) {
++      dynamic_dims[i] = xla::llvm_ir::GetBatchDimByName(b_, multiplier);
++      shape_.set_dynamic_dimension(i, true);
++      dynamic = true;
++    }
++  }
++
++  if (dynamic) {
++    // Assign dynamic batch
++    dynamic_dims_ = dynamic_dims;
++  }
++
+   IrArray::Index array_index = dynamic_dims_.empty()
+                                    ? EmitStaticIndex(&loop_nest, index_type)
+                                    : EmitDynamicIndex(&loop_nest, index_type);
+diff --git a/third_party/xla/xla/service/outer_dimension_propagation.cc b/third_party/xla/xla/service/outer_dimension_propagation.cc
+new file mode 100644
+index 00000000000..2f2c95e475f
+--- /dev/null
++++ b/third_party/xla/xla/service/outer_dimension_propagation.cc
+@@ -0,0 +1,1147 @@
++// Copyright 2024 The TensorFlow Authors
++//
++// Refactored OuterDimensionPropagationPass (v8):
++// - Encapsulates propagation state & logic into OutDimPropagator class.
++// - Preserves previous multiplier rules and tuple/call/while handling.
++// - Adds callsite index and small caches to reduce repeated module scans.
++// - Keeps conservative semantics: on conflict, mark conflicted and skip
++// metadata.
++//
++// Patch: algorithm/worklist optimizations:
++// - avoid duplicate enqueueing with in_queue_ set
++// - detect whether Merge would actually change mapping before performing merge
++//   and only serialize/write metadata when mapping truly changed
++// - only enqueue when a merge actually changed the mapping
++//
++// These changes reduce unnecessary work and serialization overhead.
++
++#include "xla/service/outer_dimension_propagation.h"
++
++#include <deque>
++#include <queue>
++#include <string>
++#include <vector>
++
++#include "absl/container/flat_hash_map.h"
++#include "absl/container/flat_hash_set.h"
++#include "absl/strings/numbers.h"
++#include "absl/strings/str_cat.h"
++#include "absl/strings/string_view.h"
++#include "absl/types/optional.h"
++#include "absl/status/status.h"
++#include "absl/status/statusor.h"
++#include "xla/hlo/ir/hlo_casting_utils.h"
++#include "xla/hlo/ir/hlo_instruction.h"
++#include "xla/hlo/ir/hlo_instructions.h"
++#include "xla/hlo/ir/hlo_computation.h"
++#include "xla/hlo/parser/hlo_parser.h"
++#include "xla/layout_util.h"
++#include "xla/shape_util.h"
++
++namespace xla {
++namespace {
++
++// Path and mapping types
++using Path = std::string;  // e.g., "0" or "1.2"
++using PathMulMap = absl::flat_hash_map<Path, int64_t>;
++
++// Utility functions (previous logic, kept local)
++static std::string MakePath(const Path& prefix, int64_t idx) {
++  if (prefix.empty()) return absl::StrCat(idx);
++  return absl::StrCat(prefix, ".", idx);
++}
++
++static bool MatchAndStripPrefix(const Path& key, const Path& candidate,
++                                std::string* remainder) {
++  if (candidate == key) {
++    *remainder = "";
++    return true;
++  }
++  if (candidate.size() > key.size() + 1 &&
++      candidate.substr(0, key.size()) == key && candidate[key.size()] == '.') {
++    *remainder = candidate.substr(key.size() + 1);
++    return true;
++  }
++  return false;
++}
++
++static bool MergePathMulMap(PathMulMap& dest, const PathMulMap& src) {
++  for (const auto& kv : src) {
++    auto it = dest.find(kv.first);
++    if (it == dest.end()) {
++      dest.emplace(kv.first, kv.second);
++    } else {
++      if (it->second != kv.second) {
++        LOG(ERROR) << "OuterDimensionPropagation conflict at path " << kv.first
++                   << ": existing=" << it->second << " new=" << kv.second;
++        return false;
++      }
++    }
++  }
++  return true;
++}
++
++static bool InsertPath(PathMulMap& dest, const Path& key, int64_t mul) {
++  auto it = dest.find(key);
++  if (it == dest.end()) {
++    dest.emplace(key, mul);
++    return true;
++  }
++  if (it->second != mul) {
++    LOG(ERROR) << "OuterDimensionPropagation conflict at path " << key
++               << ": existing=" << it->second << " new=" << mul;
++    return false;
++  }
++  return true;
++}
++
++// Serialize mapping according to shape: nested arrays for tuples, scalar or
++// "null" for non-tuple.
++static std::pair<bool, std::string> SerializeMappingForShape(
++    const Shape& shape, const PathMulMap& map, const Path& prefix = "") {
++  if (shape.IsTuple()) {
++    int64_t arity = shape.tuple_shapes_size();
++    std::string out;
++    absl::StrAppend(&out, "[");
++    for (int64_t i = 0; i < arity; ++i) {
++      if (i) absl::StrAppend(&out, ",");
++      std::string child_prefix = MakePath(prefix, i);
++      auto it_exact = map.find(child_prefix);
++      bool has_exact = (it_exact != map.end());
++      bool has_children = false;
++      for (const auto& kv : map) {
++        const Path& k = kv.first;
++        if (k.size() > child_prefix.size() + 1 &&
++            k.substr(0, child_prefix.size()) == child_prefix &&
++            k[child_prefix.size()] == '.') {
++          has_children = true;
++          break;
++        }
++      }
++      if (has_exact && has_children) {
++        LOG(ERROR) << "Outer-dim propagation structural conflict: both leaf "
++                      "and children for path "
++                   << child_prefix;
++        return {false, ""};
++      }
++      if (has_exact) {
++        absl::StrAppend(&out, absl::StrCat(it_exact->second));
++      } else if (has_children) {
++        const Shape& child_shape = shape.tuple_shapes(i);
++        auto sub = SerializeMappingForShape(child_shape, map, child_prefix);
++        if (!sub.first) return {false, ""};
++        absl::StrAppend(&out, sub.second);
++      } else {
++        absl::StrAppend(&out, "null");
++      }
++    }
++    absl::StrAppend(&out, "]");
++    return {true, out};
++  } else {
++    Path key = prefix.empty() ? std::string("0") : prefix;
++    auto it = map.find(key);
++    if (it != map.end()) {
++      return {true, absl::StrCat(it->second)};
++    }
++    return {true, "null"};
++  }
++}
++
++// Simplified recursive parser for the serialized mapping format produced by
++// SerializeMappingForShape. 
++static bool ParseSerializedMappingForShapeRec(const Shape& shape,
++                                             absl::string_view s, size_t& pos,
++                                             const Path& prefix, PathMulMap& out) {
++  auto skip_ws = [&](void) {
++    while (pos < s.size() && isspace(static_cast<unsigned char>(s[pos]))) ++pos;
++  };
++  skip_ws();
++  if (!shape.IsTuple()) {
++    // parse a number or 'null'
++    if (pos >= s.size()) return true;  // empty -> null
++    if (s.substr(pos, 4) == "null") {
++      pos += 4;
++      return true;
++    }
++    // parse optional sign and digits
++    size_t start = pos;
++    if (s[pos] == '+' || s[pos] == '-') ++pos;
++    while (pos < s.size() && isdigit(static_cast<unsigned char>(s[pos]))) ++pos;
++    if (start == pos) return false;  // no number
++    int64_t v = 0;
++    if (!absl::SimpleAtoi<int64_t>(std::string(s.substr(start, pos - start)), &v)) return false;
++    Path key = prefix.empty() ? std::string("0") : prefix;
++    out.emplace(key, v);
++    skip_ws();
++    return true;
++  }
++
++  // shape is tuple: expect '['
++  skip_ws();
++  if (pos >= s.size() || s[pos] != '[') return false;
++  ++pos;
++  skip_ws();
++  int64_t arity = shape.tuple_shapes_size();
++  for (int64_t i = 0; i < arity; ++i) {
++    const Shape& child_shape = shape.tuple_shapes(i);
++    // parse child value (could be nested array, number, or null)
++    if (child_shape.IsTuple()) {
++      if (!ParseSerializedMappingForShapeRec(child_shape, s, pos, MakePath(prefix, i), out)) return false;
++    } else {
++      // Non-tuple child: parse number or 'null'
++      skip_ws();
++      if (pos < s.size() && s.substr(pos, 4) == "null") {
++        pos += 4;
++      } else {
++        size_t start = pos;
++        if (pos < s.size() && (s[pos] == '+' || s[pos] == '-')) ++pos;
++        while (pos < s.size() && isdigit(static_cast<unsigned char>(s[pos]))) ++pos;
++        if (start == pos) return false;
++        int64_t v = 0;
++        if (!absl::SimpleAtoi<int64_t>(std::string(s.substr(start, pos - start)), &v)) return false;
++        out.emplace(MakePath(prefix, i), v);
++      }
++    }
++    skip_ws();
++    // after each child expect ',' or ']' (if last)
++    if (i < arity - 1) {
++      if (pos >= s.size() || s[pos] != ',') return false;
++      ++pos;
++      skip_ws();
++    }
++  }
++  skip_ws();
++  if (pos >= s.size() || s[pos] != ']') return false;
++  ++pos;
++  skip_ws();
++  return true;
++}
++
++static std::pair<bool, PathMulMap> ParseSerializedMappingForShape(
++    const Shape& shape, absl::string_view s, const Path& prefix = "") {
++  PathMulMap out;
++  size_t pos = 0;
++  if (!ParseSerializedMappingForShapeRec(shape, s, pos, prefix, out)) {
++    return {false, out};
++  }
++  // allow trailing spaces but nothing else
++  while (pos < s.size() && isspace(static_cast<unsigned char>(s[pos]))) ++pos;
++  if (pos != s.size()) return {false, out};
++  return {true, out};
++}
++
++static void UpdateOuterMulInMetadata(HloInstruction* instr,
++                                     const std::string& serialized) {
++  OpMetadata md = instr->metadata();
++  std::string op_name = md.op_name();
++  static const char kMarker[] = "|tf_outer_marker=";
++  size_t pos = op_name.rfind(kMarker);
++  if (pos != std::string::npos) op_name = op_name.substr(0, pos);
++  absl::StrAppend(&op_name, kMarker, serialized);
++  md.set_op_name(op_name);
++  instr->set_metadata(md);
++}
++
++static int64_t GetLeadingDimOrMinusOne(const Shape& shape) {
++  if (shape.dimensions_size() == 0) return -1;
++  int64_t d0 = shape.dimensions(0);
++  if (d0 <= 0) return -1;
++  return d0;
++}
++
++static absl::optional<int64_t> ComputeMultiplierForUserScalar(HloInstruction* operand,
++                                                 HloInstruction* user, int64_t operand_mul) {
++  if (!operand || !user) return absl::nullopt;
++
++  const Shape& in_shape = operand->shape();
++  const Shape& out_shape = user->shape();
++  int64_t flag_unsupport = -2;
++  int64_t flag_error = -1;
++
++  // 1. Basic Shape Checks
++  // todo: process tuple shape
++  if (in_shape.IsTuple() || out_shape.IsTuple()) {
++    return flag_unsupport;
++  }
++  if (out_shape.dimensions_size() == 0 &&
++      user->IsCustomCall("GetOuterBatchValue")) {
++    return operand_mul;
++  }
++  if (in_shape.dimensions_size() == 0 || out_shape.dimensions_size() == 0) {
++    return absl::nullopt;
++  }
++
++  // 2. Pre-calculate Dimensions and Potential Multiplier
++  int64_t in_lead = in_shape.dimensions(0);
++  int64_t out_lead = out_shape.dimensions(0);
++
++  // Filter dynamic dimensions represented by negative values
++  if (in_lead < 0 || out_lead < 0) {
++    return flag_error;
++  }
++
++  // Calculate generic arithmetic relationship
++  // operand_mul_val is the potential multiplier IF the relationship holds.
++  int64_t operand_mul_val = -1;
++  // todo 1: 
++  if ((in_lead > 0) && ((operand_mul * out_lead) % in_lead == 0)) {
++    operand_mul_val = operand_mul * out_lead / in_lead;
++  }
++
++  // Helper: check if 'operand' is actually an input to 'user' at specific index
++  auto is_operand_at = [&](int index) {
++    return index >= 0 && index < user->operand_count() &&
++           user->operand(index) == operand;
++  };
++
++  bool is_any_operand = false;
++  for (int i = 0; i < user->operand_count(); ++i) {
++    if (user->operand(i) == operand) {
++      is_any_operand = true;
++      break;
++    }
++  }
++  if (!is_any_operand) return flag_error;
++
++  // 3. Comprehensive Opcode Switch
++  switch (user->opcode()) {
++    // -------------------------------------------------------------------------
++    // Group 1: Opaque / Unknown / Complex Layouts
++    // -------------------------------------------------------------------------
++    case HloOpcode::kCustomCall:
++    case HloOpcode::kCall:
++    case HloOpcode::kConditional:
++    case HloOpcode::kRaggedAllToAll:
++    case HloOpcode::kRaggedDot:
++      return flag_unsupport;
++    case HloOpcode::kGather: {
++      // Gather is complex; output depends on indices when index_vector_dim not zero
++      if (is_operand_at(1)) {
++        const auto& dnums = user->gather_dimension_numbers();
++        if (dnums.index_vector_dim() != 0) {
++          return operand_mul;
++        }
++        return flag_error;
++      }
++      return absl::nullopt;
++    }
++
++    // -------------------------------------------------------------------------
++    // Group 2: Dot (Matrix Multiplication)
++    // -------------------------------------------------------------------------
++    case HloOpcode::kDot: {
++      // LHS (operand 0): Leading dim is preserved (Batch). operand_mul.
++      if (is_operand_at(0)) return operand_mul;
++      // RHS (operand 1): Leading dim is contracted or transposed.
++      return absl::nullopt;
++    }
++
++    // -------------------------------------------------------------------------
++    // Group 3: Strict Identity / Pass-Through on Operand 0
++    // -------------------------------------------------------------------------
++    // For these ops, the output leading dimension is strictly tied to
++    // operand 0. Other operands (kernels, updates, indices) do not dictate
++    // the output batch size in a broadcast/mult sense.
++    case HloOpcode::kConvolution:
++    case HloOpcode::kBatchNormInference:
++    case HloOpcode::kScatter:
++    case HloOpcode::kDynamicUpdateSlice:
++    case HloOpcode::kSetDimensionSize:
++      if (is_operand_at(0)) return operand_mul;
++      return absl::nullopt;
++
++    // -------------------------------------------------------------------------
++    // Group 4: Concatenate
++    // -------------------------------------------------------------------------
++    case HloOpcode::kConcatenate: {
++      int64_t concat_dim = user->concatenate_dimension();
++      if (concat_dim == 0) {
++        return operand_mul_val;
++      } else {
++        if (in_lead == out_lead) return operand_mul;
++        return flag_error;
++      }
++    }
++
++    // -------------------------------------------------------------------------
++    // Group 5: Collectives (Preserving or Multiplicative)
++    // -------------------------------------------------------------------------
++    case HloOpcode::kAllReduce:
++    case HloOpcode::kAllReduceStart:
++      if (is_operand_at(0)) return operand_mul;
++      return absl::nullopt;
++
++    case HloOpcode::kAllGather:
++    case HloOpcode::kAllGatherStart: {
++      int64_t all_gather_dim = Cast<HloAllGatherInstruction>(user)->all_gather_dimension();
++      if (all_gather_dim == 0) {
++        return operand_mul_val;
++      }
++      if (in_lead == out_lead) return operand_mul;
++      return flag_error;
++    }
++
++    case HloOpcode::kCollectivePermute:
++    case HloOpcode::kCollectivePermuteStart:
++    case HloOpcode::kCollectiveBroadcast: // Broadcasts data to other replicas
++      // Usually preserves shape on local device, or effectively 1:1 mapping
++      if (in_lead == out_lead) return operand_mul;
++      return flag_error;
++
++    case HloOpcode::kAllToAll:
++    case HloOpcode::kReduceScatter:
++      // These change shapes (split/concat). If it's a clean multiple, we return it.
++      return operand_mul_val;
++
++    // -------------------------------------------------------------------------
++    // Group 6: Reshape / Transpose / Slice (Scrambling)
++    // -------------------------------------------------------------------------
++    case HloOpcode::kTranspose: {
++       if (!user->dimensions().empty() && user->dimensions(0) == 0) {
++        return operand_mul_val;
++      }
++      return flag_error;
++    }
++    case HloOpcode::kReshape:
++    case HloOpcode::kDynamicReshape:
++    case HloOpcode::kBitcast:
++      // Dimensions are scrambled.
++      return operand_mul_val;
++
++    // -------------------------------------------------------------------------
++    // Group 7: Elementwise / Unary / Binary / Shape Preserving
++    // -------------------------------------------------------------------------
++    // For all these, if inputs and outputs are arrays, the generic check
++    // (out_lead % in_lead == 0) usually suffices.
++    case HloOpcode::kAbs:
++    case HloOpcode::kAdd:
++    case HloOpcode::kAddDependency:
++    case HloOpcode::kAnd:
++    case HloOpcode::kAtan2:
++    case HloOpcode::kBitcastConvert:
++    case HloOpcode::kCbrt:
++    case HloOpcode::kCeil:
++    case HloOpcode::kClamp:
++    case HloOpcode::kClz:
++    case HloOpcode::kCompare:
++    case HloOpcode::kComplex:
++    case HloOpcode::kConvert:
++    case HloOpcode::kCopy:
++    case HloOpcode::kCos:
++    case HloOpcode::kDivide:
++    case HloOpcode::kDomain:
++    case HloOpcode::kErf:
++    case HloOpcode::kExp:
++    case HloOpcode::kExpm1:
++    case HloOpcode::kFft:
++    case HloOpcode::kFloor:
++    case HloOpcode::kFusion: // Black box, but often preserves if elementwise
++    case HloOpcode::kImag:
++    case HloOpcode::kIota:
++    case HloOpcode::kIsFinite:
++    case HloOpcode::kLog:
++    case HloOpcode::kLog1p:
++    case HloOpcode::kLogistic:
++    case HloOpcode::kMap:
++    case HloOpcode::kMaximum:
++    case HloOpcode::kMinimum:
++    case HloOpcode::kMultiply:
++    case HloOpcode::kNegate:
++    case HloOpcode::kNot:
++    case HloOpcode::kOptimizationBarrier:
++    case HloOpcode::kOr:
++    case HloOpcode::kPopulationCount:
++    case HloOpcode::kPower:
++    case HloOpcode::kReal:
++    case HloOpcode::kReducePrecision:
++    case HloOpcode::kRemainder:
++    case HloOpcode::kReverse:
++    case HloOpcode::kRng:
++    case HloOpcode::kRngBitGenerator:
++    case HloOpcode::kRngGetAndUpdateState:
++    case HloOpcode::kRoundNearestAfz:
++    case HloOpcode::kRoundNearestEven:
++    case HloOpcode::kRsqrt:
++    case HloOpcode::kSelect:
++    case HloOpcode::kShiftLeft:
++    case HloOpcode::kShiftRightArithmetic:
++    case HloOpcode::kShiftRightLogical:
++    case HloOpcode::kSign:
++    case HloOpcode::kSin:
++    case HloOpcode::kSlice: // Changes size, operand_mul_val catches ratio
++    case HloOpcode::kDynamicSlice:
++    case HloOpcode::kSort:
++    case HloOpcode::kSqrt:
++    case HloOpcode::kStochasticConvert:
++    case HloOpcode::kSubtract:
++    case HloOpcode::kTan:
++    case HloOpcode::kTanh:
++    case HloOpcode::kTriangularSolve:
++    case HloOpcode::kCholesky:
++    case HloOpcode::kWhile: // Loop body usually preserves shape
++    case HloOpcode::kXor:
++      return operand_mul_val;
++
++    case HloOpcode::kReduce: {
++      if (!is_operand_at(0)) return absl::nullopt;
++      for (int64_t d : user->dimensions()) {
++        if (d == 0) {
++          // Reduce batch dimension to zero
++          return 0;
++        }
++      }
++      return operand_mul_val;
++    }
++
++    // TODO:fix kSelectAndScatter
++    case HloOpcode::kSelectAndScatter:
++    case HloOpcode::kReduceWindow: {
++      if (!is_operand_at(0)) return absl::nullopt;
++      const Window& w = user->window();
++      if (w.dimensions_size() == 0) return operand_mul_val;
++      const WindowDimension& dim0 = w.dimensions(0);
++      bool inert_on_dim0 =
++          dim0.size() == 1 && dim0.stride() == 1 && dim0.padding_low() == 0 &&
++          dim0.padding_high() == 0 && dim0.base_dilation() == 1 &&
++          dim0.window_dilation() == 1;
++      if (inert_on_dim0) {
++        return operand_mul_val;
++      }
++      return absl::nullopt;
++    }
++
++    case HloOpcode::kBroadcast: {
++      if (!user->dimensions().empty() && user->dimensions(0) == 0) {
++        return operand_mul_val;
++      }
++      if (in_lead == out_lead) {
++        return operand_mul;
++      }
++      return absl::nullopt;
++    }
++    case HloOpcode::kPad: {
++      if (!is_operand_at(0))
++        return absl::nullopt;
++      const auto& pad_config = user->padding_config();
++      if (pad_config.dimensions_size() > 0) {
++        const auto& dim0_config = pad_config.dimensions(0);
++        if (dim0_config.edge_padding_low() == 0 &&
++            dim0_config.edge_padding_high() == 0 &&
++            dim0_config.interior_padding() == 0) {
++          return operand_mul;
++        }
++      }
++      return flag_error;
++    }
++    case HloOpcode::kTuple:
++    case HloOpcode::kGetTupleElement:
++      return flag_unsupport;
++    // -------------------------------------------------------------------------
++    // Group 8: Token/Side-Effect (Mostly unreachable due to early checks)
++    // -------------------------------------------------------------------------
++    case HloOpcode::kParameter:
++    case HloOpcode::kConstant:
++    case HloOpcode::kReplicaId:
++    case HloOpcode::kPartitionId:
++    case HloOpcode::kInfeed:
++    case HloOpcode::kOutfeed:
++    case HloOpcode::kAsyncStart:
++    case HloOpcode::kAsyncUpdate:
++    case HloOpcode::kAsyncDone:
++    case HloOpcode::kCopyStart:
++    case HloOpcode::kCopyDone:
++    case HloOpcode::kRecv:
++    case HloOpcode::kRecvDone:
++    case HloOpcode::kSend:
++    case HloOpcode::kSendDone:
++    case HloOpcode::kTopK: // Returns tuple
++    case HloOpcode::kAfterAll:
++    case HloOpcode::kGetDimensionSize: // Scalar output
++    case HloOpcode::kBatchNormTraining: // Tuple output
++    case HloOpcode::kBatchNormGrad: // Tuple output
++    case HloOpcode::kAllReduceDone: // Async done wrapper
++    case HloOpcode::kAllGatherDone:
++    case HloOpcode::kCollectivePermuteDone:
++      // Fallback for these is operand_mul_val, but effectively blocked by
++      // is_tuple checks or rank checks earlier.
++      return operand_mul_val;
++  }
++
++  return absl::nullopt;
++}
++
++// -----------------------------------------------------------------------------
++
++// OutDimPropagator: encapsulates state & logic for the pass.
++class OutDimPropagator {
++ public:
++  explicit OutDimPropagator(HloModule* m) : module_(m), changed_(false) {
++    BuildCallsiteIndex();
++  }
++
++  absl::StatusOr<bool> Run() {
++    SeedParameters();
++    while (!work_queue_.empty()) {
++      HloInstruction* cur = work_queue_.front();
++      work_queue_.pop_front();
++      // Mark not in queue anymore
++      in_queue_.erase(cur);
++      if (conflicted_.contains(cur)) continue;
++      ProcessInstructionUsers(cur);
++    }
++    UpdateMultiplierToShape();
++    return changed_;
++  }
++
++ private:
++  void ApplyPathMulMapToShape(Shape* shape, const PathMulMap& map,
++                                     const Path& prefix = "") {
++    if (!shape) return;
++    if (shape->IsTuple()) {
++      // For tuple shapes, iterate children and recursively apply any mapping
++      // relevant to each child. If there is an exact mapping for the child
++      // prefix use it (leaf), otherwise look for nested keys.
++      int64_t arity = shape->tuple_shapes_size();
++      for (int64_t i = 0; i < arity; ++i) {
++        std::string child_prefix = MakePath(prefix, i);
++        // First check exact leaf mapping for child_prefix.
++        auto it_exact = map.find(child_prefix);
++        if (it_exact != map.end()) {
++          // Set the multiplier for the child shape (leaf mapping).
++          Shape* child = shape->mutable_tuple_shapes(i);
++          child->set_outer_multiplier(it_exact->second);
++        } else {
++          // See if there are any keys that are children of this prefix.
++          bool has_children = false;
++          for (const auto& kv : map) {
++            const Path& k = kv.first;
++            if (k.size() > child_prefix.size() + 1 &&
++                k.substr(0, child_prefix.size()) == child_prefix &&
++                k[child_prefix.size()] == '.') {
++              has_children = true;
++              break;
++            }
++          }
++          if (has_children) {
++            // Recurse into child shape with the same map and the new prefix.
++            Shape* child = shape->mutable_tuple_shapes(i);
++            ApplyPathMulMapToShape(child, map, child_prefix);
++          } else {
++            // No mapping for this child: leave multiplier as-is (-1).
++          }
++        }
++      }
++    } else {
++      // Non-tuple shape: its key is either prefix (if prefix non-empty) or "0".
++      Path key = prefix.empty() ? std::string("0") : prefix;
++      auto it = map.find(key);
++      if (it != map.end()) {
++        shape->set_outer_multiplier(it->second);
++      } else {
++        // No mapping for this scalar/array shape: leave multiplier unchanged.
++      }
++    }
++  }
++
++  void UpdateMultiplierToShape() {
++    for (auto it : element_mul_map_) {
++      Shape* shape = it.first->mutable_shape();
++      if (!shape)
++        LOG(ERROR) << "OuterDimensionPropagation ERROR: No shape for " << it.first->ToString();
++      ApplyPathMulMapToShape(shape, it.second, "");
++    }
++  }
++  // Build callee -> callsites map once to avoid scanning module repeatedly.
++  void BuildCallsiteIndex() {
++    for (HloComputation* comp : module_->computations()) {
++      for (HloInstruction* instr : comp->instructions()) {
++        if (instr->opcode() == HloOpcode::kCall) {
++          HloComputation* callee = instr->to_apply();
++          if (callee) callsite_index_[callee].push_back(instr);
++        } else if (instr->opcode() == HloOpcode::kFusion) {
++          HloComputation* fused = instr->fused_instructions_computation();
++          if (fused) callsite_index_[fused].push_back(instr);
++        }
++      }
++    }
++  }
++
++  // Seed parameters by parsing tf_outer_marker metadata if present.
++  void SeedParameters() {
++    static const char kMarker[] = "|tf_outer_marker=";
++    HloComputation* entry = module_->entry_computation();
++    if (entry == nullptr) return;
++    for (HloInstruction* instr : entry->instructions()) {
++      if (instr->opcode() == HloOpcode::kParameter) {
++        std::string opname = instr->metadata().op_name();
++        // If op_name contains the tf_outer_marker marker, try to parse a
++        // serialized mapping.
++        size_t pos = opname.rfind(kMarker);
++        if (pos != std::string::npos) {
++          // Extract content after marker to end of string.
++          std::string serialized = opname.substr(pos + strlen(kMarker));
++          // Try parse according to the parameter's shape.
++          auto parsed =
++              ParseSerializedMappingForShape(instr->shape(), serialized, "");
++          if (!parsed.first) {
++            // Failed to parse: log and fallback to a safe default mapping
++            // ("0"->1).
++            LOG(ERROR)
++                << "Failed to parse tf_outer_marker serialized mapping for "
++                << instr->ToString() << ", falling back to {\"0\":1}";
++            element_mul_map_[instr].emplace("0", 1);
++            UpdateOuterMulInMetadata(instr, "1");
++            changed_ = true;
++            Enqueue(instr);
++            continue;
++          }
++          // Merge parsed mapping into global map
++          for (const auto& kv : parsed.second) {
++            element_mul_map_[instr].emplace(kv.first, kv.second);
++          }
++          Enqueue(instr);
++        } else {
++          // Fallback: legacy marker without explicit serialized mapping.
++          std::string optype = instr->metadata().op_type();
++          if (absl::StrContains(optype, "XLA_Arg_dyn")) {
++            element_mul_map_[instr].emplace("0", 1);
++            UpdateOuterMulInMetadata(instr, "1");
++            changed_ = true;
++            Enqueue(instr);
++          }
++        }
++      }
++    }
++  }
++
++  void Enqueue(HloInstruction* instr) {
++    if (!in_queue_.contains(instr) && !conflicted_.contains(instr)) {
++      work_queue_.push_back(instr);
++      in_queue_.insert(instr);
++    }
++  }
++
++  enum MergeResult { kNoChange, kMerged, kConflict };
++
++  // Merge add_map into element_mul_map_[instr]; on success enqueue instr.
++  // Optimization: test whether merge would change mapping before doing
++  // insertions and before serializing. Only serialize/write when mapping
++  // actually changes.
++  MergeResult MergeAndEnqueue(HloInstruction* instr,
++                              const PathMulMap& add_map) {
++    if (conflicted_.contains(instr)) return kNoChange;
++    PathMulMap& cur = element_mul_map_[instr];  // creates if absent
++
++    // Fast-path: if add_map empty -> no change
++    if (add_map.empty()) return kNoChange;
++
++    // First pass: detect conflicts and whether any new entries / changed values
++    // exist.
++    bool would_change = false;
++    for (const auto& kv : add_map) {
++      auto it = cur.find(kv.first);
++      if (it == cur.end()) {
++        would_change = true;
++      } else if (it->second != kv.second) {
++        // conflict
++        conflicted_.insert(instr);
++        element_mul_map_.erase(instr);
++        LOG(ERROR) << "OuterDimensionPropagation: conflict merging for "
++                   << instr->ToString();
++        return kConflict;
++      }
++    }
++    if (!would_change) {
++      // Nothing to do.
++      return kNoChange;
++    }
++
++    // Perform actual merge (we already checked conflicts).
++    for (const auto& kv : add_map) {
++      auto it = cur.find(kv.first);
++      if (it == cur.end()) {
++        cur.emplace(kv.first, kv.second);
++      }  // else already equal
++    }
++
++    // Serialize and write metadata only after mapping changed.
++    auto ser = SerializeMappingForShape(instr->shape(), cur, "");
++    if (!ser.first) {
++      conflicted_.insert(instr);
++      element_mul_map_.erase(instr);
++      LOG(ERROR) << "OuterDimensionPropagation: serialization conflict for "
++                 << instr->ToString();
++      return kConflict;
++    }
++
++    if (instr->shape().IsTuple() || ser.second != "null") {
++      // Avoid writing metadata if the serialized suffix is identical to what is
++      // already present.
++      std::string existing_suffix;
++      OpMetadata md = instr->metadata();
++      std::string op_name = md.op_name();
++      static const char kMarker[] = "|tf_outer_marker=";
++      size_t pos = op_name.rfind(kMarker);
++      if (pos != std::string::npos)
++        existing_suffix = op_name.substr(pos + strlen(kMarker));
++      if (ser.second != existing_suffix) {
++        UpdateOuterMulInMetadata(instr, ser.second);
++        changed_ = true;
++      }
++    }
++
++    // Propagate callee root -> callsites if instr is a computation root.
++    if (instr->IsRoot()) {
++      HloComputation* comp = instr->parent();
++      auto cs_it = callsite_index_.find(comp);
++      if (cs_it != callsite_index_.end()) {
++        for (HloInstruction* potential_call : cs_it->second) {
++          // map callee root's mapping into call instruction
++          PathMulMap call_map = cur;  // copy
++          // merge into call (may enqueue)
++          MergeAndEnqueue(potential_call, call_map);
++        }
++      }
++    }
++
++    Enqueue(instr);
++    return kMerged;
++  }
++
++  // Process users of cur instruction
++  void ProcessInstructionUsers(HloInstruction* cur) {
++    auto it_find = element_mul_map_.find(cur);
++    PathMulMap cur_map;
++    if (it_find != element_mul_map_.end()) cur_map = it_find->second;
++
++    // iterate over users
++    for (HloInstruction* user : cur->users()) {
++      if (conflicted_.contains(user)) continue;
++
++      switch (user->opcode()) {
++        case HloOpcode::kCall: {
++          HloComputation* callee = user->to_apply();
++          PropagateToCallLike(user, callee, cur, cur_map);
++          break;
++        }
++        case HloOpcode::kFusion: {
++          HloComputation* fused = user->fused_instructions_computation();
++          PropagateToCallLike(user, fused, cur, cur_map);
++          break;
++        }
++        case HloOpcode::kWhile:
++          PropagateToWhile(user, cur, cur_map);
++          break;
++        case HloOpcode::kTuple:
++          HandleTupleOperand(user, cur, cur_map);
++          break;
++        case HloOpcode::kGetTupleElement:
++          HandleGetTupleElement(user);
++          break;
++        default:
++          HandleDefaultPropagation(user, cur, cur_map);
++          break;
++      }
++    }
++  }
++
++  // Propagate operand cur -> callee param and if callee root already has
++  // mapping, map it to call.
++  void PropagateToCallLike(HloInstruction* call_instr, HloComputation* callee,
++                           HloInstruction* cur, const PathMulMap& cur_map) {
++    if (!callee) return;
++    // find operand positions equal to cur
++    for (int j = 0; j < call_instr->operand_count(); ++j) {
++      if (call_instr->operand(j) != cur) continue;
++      if (j < callee->num_parameters()) {
++        HloInstruction* callee_param = callee->parameter_instruction(j);
++        PathMulMap param_map = cur_map;  // copy
++        MergeAndEnqueue(callee_param, param_map);
++      }
++    }
++    // If callee root already has mapping, apply it to call instruction (merged
++    // via MergeAndEnqueue)
++    auto it_root = element_mul_map_.find(callee->root_instruction());
++    if (it_root != element_mul_map_.end()) {
++      PathMulMap call_map = it_root->second;
++      MergeAndEnqueue(call_instr, call_map);
++    }
++  }
++  // Handle while: fixed-point propagation within body.
++  void PropagateToWhile(HloInstruction* while_instr, HloInstruction* cur,
++                        const PathMulMap& cur_map) {
++    HloComputation* body = while_instr->while_body();
++    if (!body) return;
++    // We only seed/use the while if init operand (operand 0) has mapping.
++    const HloInstruction* init_state = while_instr->operand(0);
++    auto it_init = element_mul_map_.find(init_state);
++    if (it_init == element_mul_map_.end()) return;
++
++    // Conservative: skip if body contains Calls (too complex for now)
++    for (HloInstruction* i : body->instructions()) {
++      if (i->opcode() == HloOpcode::kCall) {
++        LOG(ERROR) << "Skipping while propagation because body contains Call: "
++                  << while_instr->ToString();
++        return;
++      }
++    }
++
++    PathMulMap current = it_init->second;
++    // todo: no need set kMaxIters
++    const int kMaxIters = 2;
++    for (int iter = 0; iter < kMaxIters; ++iter) {
++      absl::flat_hash_map<const HloInstruction*, PathMulMap> seeds;
++      seeds.emplace(body->parameter_instruction(0), current);
++      absl::StatusOr<PathMulMap> maybe_body_map =
++          PropagateWithinComputation(body, seeds);
++      if (!maybe_body_map.ok()) {
++        // Mark the while instruction conflicted and stop further processing of it.
++        std::string reason = absl::StrCat(
++            "PropagateWithinComputation failed: ", maybe_body_map.status().ToString());
++        MarkConflicted(while_instr, reason);
++        return;
++      }
++      PathMulMap body_root_map = std::move(maybe_body_map.value());
++
++      // Compare body_root_map vs current_param_map
++      if (body_root_map == current) {
++        // Fixed point reached: map body_root_map back to while_instr
++        MergeAndEnqueue(while_instr, body_root_map);
++        return;
++      }
++      // If different, adopt body_root_map as next param map (conservative).
++      current = std::move(body_root_map);
++    }
++    MarkConflicted(while_instr, "while fixed-point did not converge");
++  }
++
++  // Tuple operand -> element i mapping
++  void HandleTupleOperand(HloInstruction* tuple_instr, HloInstruction* cur,
++                          const PathMulMap& cur_map) {
++    PathMulMap prefixed;
++    for (int i = 0; i < tuple_instr->operand_count(); ++i) {
++      if (tuple_instr->operand(i) != cur) continue;
++      // For each occurrence, prefix all keys with the element index.
++      for (const auto& kv : cur_map) {
++        if (kv.first.empty() || kv.first == "0") {
++          prefixed.emplace(absl::StrCat(i), kv.second);
++        } else {
++          prefixed.emplace(absl::StrCat(i, ".", kv.first), kv.second);
++        }
++      }
++    }
++    if (!prefixed.empty()) {
++      MergeAndEnqueue(tuple_instr, prefixed);
++    }
++  }
++
++  // GTE: extract child's map for the element index and merge as user's "0"
++  void HandleGetTupleElement(HloInstruction* gte) {
++    int64_t tuple_index = gte->tuple_index();
++    HloInstruction* tuple_operand = gte->mutable_operand(0);
++    auto it = element_mul_map_.find(tuple_operand);
++    if (it == element_mul_map_.end()) return;
++    const PathMulMap& tuple_map = it->second;
++    PathMulMap user_map;
++    Path key_prefix = absl::StrCat(tuple_index);
++    for (const auto& kv : tuple_map) {
++      std::string remainder;
++      if (MatchAndStripPrefix(key_prefix, kv.first, &remainder)) {
++        if (remainder.empty()) {
++          if (!InsertPath(user_map, "0", kv.second)) {
++            MarkConflicted(gte, "GTE conflict leaf");
++            return;
++          }
++        } else {
++          if (!InsertPath(user_map, remainder, kv.second)) {
++            MarkConflicted(gte, "GTE conflict nested");
++            return;
++          }
++        }
++      }
++    }
++    if (!user_map.empty()) MergeAndEnqueue(gte, user_map);
++  }
++
++  // Default propagation for non-tuple user ops using scalar-path "0"
++  void HandleDefaultPropagation(HloInstruction* user, HloInstruction* cur,
++                                const PathMulMap& cur_map) {
++    if (cur->shape().IsTuple()) {
++      LOG(ERROR) << "Can't handle tuple input in HandleDefaultPropagation:" << user->ToString();
++      return;
++    }
++    auto it0 = cur_map.find("0");
++    if (it0 == cur_map.end()) return;
++    int64_t operand_mul = it0->second;
++    absl::optional<int64_t> opt_mul =
++        ComputeMultiplierForUserScalar(cur, user, operand_mul);
++    if (opt_mul.has_value()) {
++      if (opt_mul.value() < 0) {
++        LOG(ERROR)
++            << "HandleDefaultPropagation error, opt_mul can't be negative"
++            << "for instruction: " << user->ToString();
++        return;
++      }
++      PathMulMap add;
++      add.emplace("0", opt_mul.value());
++      MergeAndEnqueue(user, add);
++    }
++  }
++
++  // Local propagation inside a computation (no metadata writes). Returns root
++  // map.
++  absl::StatusOr<PathMulMap> PropagateWithinComputation(
++      HloComputation* comp,
++      const absl::flat_hash_map<const HloInstruction*, PathMulMap>& seeds) {
++    // local state
++    absl::flat_hash_map<const HloInstruction*, PathMulMap> local_map = seeds;
++    absl::flat_hash_set<const HloInstruction*> local_conflicted;
++    std::deque<const HloInstruction*> local_q;
++    // seed queue
++    for (const auto& kv : seeds) {
++      if (kv.first->parent() == comp) local_q.push_back(kv.first);
++    }
++
++    auto LocalMerge = [&](const HloInstruction* instr,
++                          const PathMulMap& add) -> bool {
++      if (local_conflicted.contains(instr)) return true;
++      PathMulMap& cur = local_map[instr];
++      if (!MergePathMulMap(cur, add)) {
++        local_conflicted.insert(instr);
++        return false;
++      }
++      local_q.push_back(instr);
++      return true;
++    };
++
++    while (!local_q.empty()) {
++      const HloInstruction* cur = local_q.front();
++      auto it_find = local_map.find(cur);
++      PathMulMap cur_map;
++      if (it_find != local_map.end())
++        cur_map = it_find->second;
++      local_q.pop_front();
++      if (local_conflicted.contains(cur)) continue;
++      for (const HloInstruction* user : cur->users()) {
++        if (user->parent() != comp) continue;
++        if (local_conflicted.contains(user)) continue;
++        if (user->opcode() == HloOpcode::kCall) {
++          return xla::Internal(
++              "PropagateWithinComputation: encountered Call inside body; "
++              "aborting");
++        }
++        if (user->opcode() == HloOpcode::kTuple) {
++          PathMulMap prefixed;
++          for (int i = 0; i < user->operand_count(); ++i) {
++            if (user->operand(i) != cur) continue;
++            // For each occurrence, prefix all keys with the element index.
++            for (const auto& kv : cur_map) {
++              if (kv.first.empty() || kv.first == "0") {
++                prefixed.emplace(absl::StrCat(i), kv.second);
++              } else {
++                prefixed.emplace(absl::StrCat(i, ".", kv.first), kv.second);
++              }
++            }
++          }
++          if (!LocalMerge(user, prefixed))
++            return xla::Internal("local tuple merge conflict");
++          continue;
++        }
++        if (user->opcode() == HloOpcode::kGetTupleElement) {
++          int64_t tuple_index = user->tuple_index();
++          const HloInstruction* tuple_operand = user->operand(0);
++          PathMulMap user_map;
++          Path key_prefix = absl::StrCat(tuple_index);
++          for (const auto& kv : cur_map) {
++            std::string remainder;
++            if (MatchAndStripPrefix(key_prefix, kv.first, &remainder)) {
++              if (remainder.empty()) {
++                if (!InsertPath(user_map, "0", kv.second)) {
++                  return xla::Internal("local GTE conflict leaf");
++                }
++              } else {
++                if (!InsertPath(user_map, remainder, kv.second)) {
++                  return xla::Internal("local GTE conflict nested");
++                }
++              }
++            }
++          }
++          if (!user_map.empty()) {
++            if (!LocalMerge(user, user_map))
++              return xla::Internal("local GTE merge conflict");
++          }
++          continue;
++        }
++
++        // default scalar propagation
++        auto it0 = local_map[cur].find("0");
++        if (it0 != local_map[cur].end()) {
++          int64_t operand_mul = it0->second;
++          absl::optional<int64_t> opt_mul = ComputeMultiplierForUserScalar(
++              const_cast<HloInstruction*>(cur),
++              const_cast<HloInstruction*>(user), operand_mul);
++          if (opt_mul.has_value()) {
++            PathMulMap add;
++            add.emplace("0", opt_mul.value());
++            if (!LocalMerge(user, add))
++              return xla::Internal("local scalar merge conflict");
++          }
++        }
++      }  // for users
++    }    // while local_q
++
++    // Merge local_map results back into global element_mul_map_ so that
++    // instructions inside 'comp' get metadata written and global state reflects
++    // the propagation done within the body computation.
++    for (const auto& kv : local_map) {
++      const HloInstruction* instr = kv.first;
++      // Only merge back entries for instructions that belong to this computation.
++      if (instr->parent() != comp) continue;
++      // Convert const HloInstruction* to mutable for MergeAndEnqueue.
++      HloInstruction* mutable_instr = const_cast<HloInstruction*>(instr);
++      MergeResult mr = MergeAndEnqueue(mutable_instr, kv.second);
++      if (mr == kConflict) {
++        return xla::Internal("PropagateWithinComputation: conflict when merging local results to global state");
++      }
++    }
++
++    HloInstruction* root = comp->root_instruction();
++    PathMulMap res;
++    auto it_root = local_map.find(root);
++    if (it_root != local_map.end()) res = it_root->second;
++    return res;
++  }
++
++  void MarkConflicted(HloInstruction* instr, absl::string_view reason) {
++    conflicted_.insert(instr);
++    element_mul_map_.erase(instr);
++    LOG(ERROR) << "OuterDimensionPropagation: marking conflicted instr "
++               << instr->ToString() << " reason: " << reason;
++  }
++
++  // Members
++  HloModule* module_;
++  absl::flat_hash_map<HloInstruction*, PathMulMap> element_mul_map_;
++  absl::flat_hash_set<HloInstruction*> conflicted_;
++  std::deque<HloInstruction*> work_queue_;
++  absl::flat_hash_set<const HloInstruction*>
++      in_queue_;  // avoid duplicates in work_queue_
++  absl::flat_hash_map<const HloComputation*, std::vector<HloInstruction*>>
++      callsite_index_;
++  bool changed_;
++};
++
++}  // namespace
++
++
++// -----------------------------------------------------------------------------
++// Public pass entrypoint: wraps OutDimPropagator
++// -----------------------------------------------------------------------------
++absl::StatusOr<bool> OuterDimensionPropagationPass::Run(
++    HloModule* module,
++    const absl::flat_hash_set<absl::string_view>& execution_threads) {
++  OutDimPropagator p(module);
++  return p.Run();
++}
++
++}  // namespace xla
+diff --git a/third_party/xla/xla/service/outer_dimension_propagation.h b/third_party/xla/xla/service/outer_dimension_propagation.h
+new file mode 100644
+index 00000000000..14474d23e33
+--- /dev/null
++++ b/third_party/xla/xla/service/outer_dimension_propagation.h
+@@ -0,0 +1,29 @@
++#ifndef TENSORFLOW_COMPILER_XLA_SERVICE_OUTER_DIMENSION_PROPAGATION_H_
++#define TENSORFLOW_COMPILER_XLA_SERVICE_OUTER_DIMENSION_PROPAGATION_H_
++
++#include "absl/container/flat_hash_set.h"
++#include "absl/strings/string_view.h"
++#include "absl/status/statusor.h"
++#include "xla/hlo/ir/hlo_module.h"
++#include "xla/hlo/pass/hlo_pass_interface.h"
++
++namespace xla {
++
++// HLO pass that propagates "outer-dimension multiplier" information from
++// parameters marked by tf_outer_marker to subsequent instructions and writes
++// the relation into instruction metadata.
++class OuterDimensionPropagationPass : public HloModulePass {
++ public:
++  absl::string_view name() const override {
++    return "outer-dimension-propagation";
++  }
++
++  using HloPassInterface::Run;
++  absl::StatusOr<bool> Run(
++      HloModule* module,
++      const absl::flat_hash_set<absl::string_view>& execution_threads) override;
++};
++
++}  // namespace xla
++
++#endif  // TENSORFLOW_COMPILER_XLA_SERVICE_OUTER_DIMENSION_PROPAGATION_H_
+\ No newline at end of file
+diff --git a/third_party/xla/xla/shape.h b/third_party/xla/xla/shape.h
+index 8453dc17717..d9dc14ad4de 100644
+--- a/third_party/xla/xla/shape.h
++++ b/third_party/xla/xla/shape.h
+@@ -532,7 +532,10 @@ class Shape {
+     return Shape::Hash(std::move(h), s);
+   }
+ 
++  int64_t outer_multiplier() const { return outer_multiplier_; }
++  void set_outer_multiplier(int64_t m) { outer_multiplier_ = m; }
+  private:
++  int64_t outer_multiplier_ = -1;
+   friend absl::Status ValidateNonLayoutProperties(const Shape& shape);
+ 
+   // Define one state struct for each shape category. Depending on the element
