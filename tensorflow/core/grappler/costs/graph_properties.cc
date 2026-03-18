@@ -2051,6 +2051,12 @@ class SymbolicShapeRefiner {
           dims.push_back(dim);
           continue;
         }
+        // If already tagged with expr, keep it.
+        auto* dim_expr = ic->GetDimExpr(dim);
+        if (dim_expr != nullptr) {
+          dims.push_back(dim);
+          continue;
+        }
         auto output_shapes_it = node->attr().find("_output_shapes");
         if (output_shapes_it != node->attr().end() &&
             out < output_shapes_it->second.list().shape_size() &&
@@ -2062,11 +2068,6 @@ class SymbolicShapeRefiner {
             dims.push_back(ic->MakeDim(annotated_size));
             continue;
           }
-        }
-        // If already tagged with expr, keep it.
-        if (ic->GetDimExpr(dim) != nullptr) {
-          dims.push_back(dim);
-          continue;
         }
         // Canonicalize ALL unknown dims.
         DimensionHandle canon = GetUnknownOutputDim(node, out, d);
