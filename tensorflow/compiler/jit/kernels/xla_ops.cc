@@ -438,9 +438,52 @@ absl::Status CompileToLocalExecutable(
   XlaCompiler::CompileOptions compile_options =
       GenerateCompileOptions(has_ref_vars, may_alias_resource_update);
 
-  return xla_device_compiler->CompileIfNeeded(
-      options, function, args, compile_options, compile_mode, profiler,
-      compilation_result, executable);
+  MarkForCompilationPassFlags* flags = GetMarkForCompilationPassFlags();
+  if (flags->tf_xla_enable_dynamic_sizes) {
+    // Rewriting the argument with the magic number if they have dynamic
+    // dimension, detecting dynamic dimension via _is_batch attr in the
+    // argument.
+    std::vector<XlaCompiler::Argument> norm_args(args.begin(), args.end());
+    constexpr int64_t kMagicBound = 977;
+    if (options.flib_def != nullptr) {
+      const FunctionDef* fdef = options.flib_def->Find(function.name());
+      if (fdef != nullptr) {
+        for (const auto& kv : fdef->arg_attr()) {
+          int arg_index = kv.first;
+          const auto& attr_map = kv.second.attr();
+          auto it = attr_map.find("_is_batch");
+
+          const AttrValue& v = it->second;
+          if (it == attr_map.end()) continue;
+          norm_args[arg_index].dynamic_dim = 0;
+        }
+      }
+    }
+    for (int i = 0; i < norm_args.size(); ++i) {
+      auto& arg = norm_args[i];
+      // argument rewrite.
+      if (arg.dynamic_dim == 0) {
+        TensorShape& shp = std::get<TensorShape>(arg.shape);
+        int64_t old = shp.dim_size(0);
+        shp.set_dim(0, kMagicBound);
+      }
+      // constant argument rewrite otherwise it still store the incoming batch
+      // request.
+      if (arg.kind == XlaCompiler::Argument::kConstant) {
+        auto flat = arg.constant_value.flat<int32>();
+        int32 old_batch = flat(0);
+        flat(0) = static_cast<int32>(kMagicBound);
+      }
+    }
+
+    return xla_device_compiler->CompileIfNeeded(
+        options, function, norm_args, compile_options, compile_mode, profiler,
+        compilation_result, executable);
+  } else {
+    return xla_device_compiler->CompileIfNeeded(
+        options, function, args, compile_options, compile_mode, profiler,
+        compilation_result, executable);
+  }
 }
 
 absl::Status GetUpdatedVariables(
@@ -813,14 +856,24 @@ void XlaCompileOp::Compute(OpKernelContext* ctx) {
           ctx, function_, has_ref_vars_, platform_info_, args, compile_mode,
           /*may_alias_resource_update=*/false, &client, &kernel, &executable);
     }
+
     if (compile_mode != DeviceCompileMode::kLazy ||
         status.code() != error::UNIMPLEMENTED) {
-      OP_REQUIRES_OK(ctx, status);
+      if ((status != OkStatus()) &&
+          (status.code() != error::UNIMPLEMENTED) &&
+        (compile_mode == DeviceCompileMode::kLazy)) {
+        // We set the error to error::UNIMPLEMENTED so it falls in the
+        // conditions of the if to fall back to TensorFlow function call
+        status = tensorflow::errors::Unimplemented(status.ToString());
+      } else {
+        OP_REQUIRES_OK(ctx, status);
+      }
     }
 
     if (status.code() == error::UNIMPLEMENTED) {
-      LOG(WARNING) << "Compilation failed:" << status
-                   << ".  Falling back to TF function call.";
+      LOG(WARNING) << "[HUAWEI] Compilation of the cluster failed with:";
+      LOG(WARNING) << "[HUAWEI] " << status;
+      LOG(WARNING) << "[HUAWEI] Falling back to TF function call.\n";
 
       BroadcastOptimizationRemark(
           XlaOptimizationRemark::UNIMPLEMENTED_OPERATION, status.ToString())
@@ -828,6 +881,8 @@ void XlaCompileOp::Compute(OpKernelContext* ctx) {
       executable = nullptr;
       pjrt_executable = nullptr;
       mutex_lock guard(cannot_compile_cluster_mu_);
+      // TODO: decide if we want to set this flag to true, as we may want to
+      // allow the cluster to try to compile again later in time.
       cannot_compile_cluster_ = true;
     }
   }
@@ -963,6 +1018,15 @@ void XlaRunOp::Compute(OpKernelContext* ctx) {
   }
 
   xla::ExecutableRunOptions run_options;
+
+  MarkForCompilationPassFlags* flags = GetMarkForCompilationPassFlags();
+  if (flags->tf_xla_enable_dynamic_sizes) {
+    if (auto s = ctx->session_state()) {
+      run_options.set_batch_size(s->GetBatchSize());
+      VLOG(1) << "run_options.batch_size is set to: "
+              << run_options.batch_size();
+    }
+  }
 
   // Host callbacks used for HLO send/recv.
   xla::SendDeviceMemoryFunction send_function =

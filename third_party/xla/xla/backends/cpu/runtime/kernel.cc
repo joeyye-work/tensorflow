@@ -64,7 +64,7 @@ static absl::InlinedVector<XLA_CPU_KernelArg, 8> ConvertBuffersToKernelArgs(
 template <bool num_workgroups_x_only>
 class Kernel::Task {
  public:
-  Task(XLA_CPU_Kernel* kernel, NumWorkGroups num_workgroups,
+  Task(XLA_CPU_Kernel* kernel, NumWorkGroups num_workgroups, size_t batch_size,
        absl::Span<const XLA_CPU_KernelArg> args);
 
   // Invokes a host kernel for a given task index.
@@ -78,6 +78,7 @@ class Kernel::Task {
   XLA_CPU_Kernel* kernel_;
   XLA_CPU_NumWorkGroups num_workgroups_;
   absl::InlinedVector<XLA_CPU_KernelArg, 8> args_;
+  size_t batch_size_;
 
   size_t num_tasks_;
 
@@ -88,11 +89,12 @@ class Kernel::Task {
 
 template <bool num_workgroups_x_only>
 Kernel::Task<num_workgroups_x_only>::Task(
-    XLA_CPU_Kernel* kernel, NumWorkGroups num_workgroups,
+    XLA_CPU_Kernel* kernel, NumWorkGroups num_workgroups, size_t batch_size,
     absl::Span<const XLA_CPU_KernelArg> args)
     : kernel_(kernel),
       num_workgroups_({num_workgroups.x, num_workgroups.y, num_workgroups.z}),
       args_(args.begin(), args.end()),
+      batch_size_(batch_size),
       num_tasks_(num_workgroups.x * num_workgroups.y * num_workgroups.z),
       stride_z_(num_workgroups.y * num_workgroups.x),
       stride_y_(num_workgroups.x) {}
@@ -104,7 +106,8 @@ absl::Status Kernel::Task<num_workgroups_x_only>::operator()(
 
   XLA_CPU_WorkGroupId workgroup_id = Delinearize(task_index);
   XLA_CPU_KernelCallFrame call_frame = {&num_workgroups_, &workgroup_id,
-                                        args_.size(), args_.data()};
+                                        args_.size(), args_.data(),
+                                        batch_size_};
 
   XLA_CPU_KernelError* error = (*kernel_)(&call_frame);
 
@@ -140,11 +143,13 @@ Kernel::Kernel(unsigned arity, XLA_CPU_Kernel* kernel)
       arity_(arity) {}
 
 absl::Status Kernel::Launch(const NumWorkGroups& num_workgroups,
+                            size_t batch_size,
                             absl::Span<const DeviceMemoryBase> buffers) const {
-  return Launch(num_workgroups, ConvertBuffersToKernelArgs(buffers));
+  return Launch(num_workgroups, batch_size, ConvertBuffersToKernelArgs(buffers));
 }
 
 absl::Status Kernel::Launch(const NumWorkGroups& num_workgroups,
+                            size_t batch_size,
                             absl::Span<const XLA_CPU_KernelArg> args) const {
   for (uint64_t z = 0; z < num_workgroups.z; ++z) {
     for (uint64_t y = 0; y < num_workgroups.y; ++y) {
@@ -155,7 +160,7 @@ absl::Status Kernel::Launch(const NumWorkGroups& num_workgroups,
         XLA_CPU_WorkGroupId id = {x, y, z};
 
         XLA_CPU_KernelCallFrame call_frame = {&dim, &id, args.size(),
-                                              args.data()};
+                                              args.data(), batch_size};
 
         XLA_CPU_KernelError* error = (*kernel_)(&call_frame);
 
@@ -170,14 +175,15 @@ absl::Status Kernel::Launch(const NumWorkGroups& num_workgroups,
 }
 
 tsl::AsyncValueRef<LaunchEvent> Kernel::Launch(
-    const NumWorkGroups& num_workgroups,
+    const NumWorkGroups& num_workgroups, size_t batch_size,
     absl::Span<const DeviceMemoryBase> buffers,
     const Eigen::ThreadPoolDevice* device) const {
-  return Launch(num_workgroups, ConvertBuffersToKernelArgs(buffers), device);
+  return Launch(num_workgroups, batch_size, ConvertBuffersToKernelArgs(buffers),
+                device);
 }
 
 tsl::AsyncValueRef<LaunchEvent> Kernel::Launch(
-    const NumWorkGroups& num_workgroups,
+    const NumWorkGroups& num_workgroups, size_t batch_size,
     absl::Span<const XLA_CPU_KernelArg> args,
     const Eigen::ThreadPoolDevice* device) const {
   size_t num_tasks = num_workgroups.x * num_workgroups.y * num_workgroups.z;
@@ -185,7 +191,7 @@ tsl::AsyncValueRef<LaunchEvent> Kernel::Launch(
 
   // Short-circuit launch with a single task and run it in the caller thread.
   if (ABSL_PREDICT_TRUE(num_tasks == 1)) {
-    absl::Status launched = Launch(num_workgroups, args);
+    absl::Status launched = Launch(num_workgroups, batch_size, args);
     return ABSL_PREDICT_TRUE(launched.ok())
                ? OkLaunchEvent()
                : tsl::MakeErrorAsyncValueRef(std::move(launched));
@@ -198,11 +204,13 @@ tsl::AsyncValueRef<LaunchEvent> Kernel::Launch(
 
   if (ABSL_PREDICT_TRUE(num_workgroups.y == 1 && num_workgroups.z == 1)) {
     return Worker::Parallelize(device->getPool(), num_workers, num_tasks,
-                               Task<true>(kernel_, num_workgroups, args));
+                               Task<true>(kernel_, num_workgroups, batch_size,
+                                          args));
   }
 
   return Worker::Parallelize(device->getPool(), num_workers, num_tasks,
-                             Task<false>(kernel_, num_workgroups, args));
+                             Task<false>(kernel_, num_workgroups, batch_size,
+                                         args));
 }
 
 }  // namespace xla::cpu

@@ -365,6 +365,8 @@ llvm::BasicBlock* EmitReturnBlock(llvm::IRBuilderBase* b);
 void EmitEarlyReturn(llvm::Value* condition, llvm::IRBuilderBase* b,
                      llvm::BasicBlock* return_block = nullptr);
 
+llvm::Value* GetBatchDimByName(llvm::IRBuilderBase* b, int64_t multiplier = 1);
+
 absl::StatusOr<llvm::Value*> EmitReducePrecisionIR(
     PrimitiveType src_ty, llvm::Value* x, int64_t dest_exponent_bits,
     int64_t dest_mantissa_bits, bool quiet_nans, llvm::IRBuilderBase* b);

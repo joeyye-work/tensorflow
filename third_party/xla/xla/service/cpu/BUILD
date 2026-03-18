@@ -228,6 +228,8 @@ cc_library(
         "//xla/mlir_hlo:all_passes",
         "//xla/mlir_hlo:transforms_passes",
         "//xla/service:all_reduce_promotion",
+        "//xla/service:outer_dimension_propagation",
+        "//xla/service:get_outer_batch_value_simplifier",
         "//xla/service:all_to_all_decomposer",
         "//xla/service:batched_gather_scatter_normalizer",
         "//xla/service:batchnorm_expander",
@@ -1648,6 +1650,16 @@ cc_library(
     name = "cpu_executable_run_options",
     hdrs = ["cpu_executable_run_options.h"],
     deps = ["//xla/backends/cpu/collectives:cpu_collectives"],
+)
+
+cc_library(
+    name = "executable_run_options_offset",
+    srcs = ["executable_run_options_offset.cc"],
+    hdrs = ["executable_run_options_offset.h"],
+    copts = tsl_copts(),
+    deps = [
+        "//xla:executable_run_options",
+    ],
 )
 
 cc_library(

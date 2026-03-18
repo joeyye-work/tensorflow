@@ -156,6 +156,8 @@ limitations under the License.
 #include "xla/map_util.h"
 #include "xla/mlir_hlo/transforms/passes.h"
 #include "xla/service/all_reduce_promotion.h"
+#include "xla/service/outer_dimension_propagation.h"
+#include "xla/service/get_outer_batch_value_simplifier.h"
 #include "xla/service/all_to_all_decomposer.h"
 #include "xla/service/batched_gather_scatter_normalizer.h"
 #include "xla/service/batchnorm_expander.h"
@@ -504,7 +506,7 @@ std::unique_ptr<HloPassFix<HloPassPipeline>> CreateSimplificationPipeline(
                             .debug_options()
                             .xla_cpu_experimental_ynn_fusion_type(),
                         DebugOptions::LIBRARY_FUSION_TYPE_REDUCE)) {
-    pipeline->AddPass<TreeReductionRewriter>();
+    // pipeline->AddPass<TreeReductionRewriter>();
   }
 
 #ifdef XLA_YNNPACK
@@ -1102,6 +1104,8 @@ absl::Status CpuCompiler::RunHloPassesAfterLayoutAssn(
     pipeline.AddPass<SmallWhileLoopHoistingPass>(byte_threshold);
   }
 
+  pipeline.AddPass<OuterDimensionPropagationPass>();
+  pipeline.AddPass<GetOuterBatchValueSimplifier>();
   pipeline.AddPass<HloDCE>();
   return pipeline.Run(module).status();
 }

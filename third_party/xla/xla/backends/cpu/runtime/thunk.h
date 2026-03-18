@@ -303,6 +303,7 @@ class Thunk {
     CustomCallExecuteParams* custom_call_params = nullptr;
     XnnParams* xnn_params = nullptr;
     YnnParams* ynn_params = nullptr;
+    int64_t batch_size = 0;
     int64_t run_id = -1;          // -1 means no run id is set.
     int64_t device_ordinal = -1;  // -1 means no device ordinal is set.
     ExecuteSession session = ExecuteSession(ExecuteSession::kMaxWorkers,

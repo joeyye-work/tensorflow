@@ -69,13 +69,14 @@ class Kernel {
 
   // Calls the kernel once in the caller thread for a workgroup id (0,0,0).
   // This is a fast path for small host kernels that have just one workgroup.
-  absl::Status CallOnce(absl::Span<const XLA_CPU_KernelArg> args) const;
+  absl::Status CallOnce(absl::Span<const XLA_CPU_KernelArg> args,
+                        size_t batch_size) const;
 
   // Launches the kernel on the current thread by iterating over all workgroups
   // in `num_workgroups` and calling the kernel function.
-  absl::Status Launch(const NumWorkGroups& num_workgroups,
+  absl::Status Launch(const NumWorkGroups& num_workgroups, size_t batch_size,
                       absl::Span<const DeviceMemoryBase> buffers) const;
-  absl::Status Launch(const NumWorkGroups& num_workgroups,
+  absl::Status Launch(const NumWorkGroups& num_workgroups, size_t batch_size,
                       absl::Span<const XLA_CPU_KernelArg> args) const;
 
   // Launches the kernel by iterating over all workgroups in `num_workgroups`
@@ -85,12 +86,12 @@ class Kernel {
   // Async value returned in constructed state and the caller can access it to
   // get the number of tasks that are expected to be completed.
   tsl::AsyncValueRef<LaunchEvent> Launch(
-      const NumWorkGroups& num_workgroups,
+      const NumWorkGroups& num_workgroups, size_t batch_size,
       absl::Span<const DeviceMemoryBase> buffers,
       const Eigen::ThreadPoolDevice* device) const;
 
   tsl::AsyncValueRef<LaunchEvent> Launch(
-      const NumWorkGroups& num_workgroups,
+      const NumWorkGroups& num_workgroups, size_t batch_size,
       absl::Span<const XLA_CPU_KernelArg> args,
       const Eigen::ThreadPoolDevice* device) const;
 
@@ -116,12 +117,13 @@ class Kernel {
 };
 
 inline ABSL_ATTRIBUTE_ALWAYS_INLINE absl::Status Kernel::CallOnce(
-    absl::Span<const XLA_CPU_KernelArg> args) const {
+    absl::Span<const XLA_CPU_KernelArg> args,
+    size_t batch_size) const {
   constexpr XLA_CPU_NumWorkGroups num_workgroups = {1, 1, 1};
   constexpr XLA_CPU_WorkGroupId workgroup_id = {0, 0, 0};
 
   XLA_CPU_KernelCallFrame call_frame = {&num_workgroups, &workgroup_id,
-                                        args.size(), args.data()};
+                                        args.size(), args.data(), batch_size};
 
   XLA_CPU_KernelError* error = (*kernel_)(&call_frame);
 

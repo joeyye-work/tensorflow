@@ -167,6 +167,9 @@ class KernelApiIrBuilder {
   llvm::Function* EmitKernelFunction(llvm::Module& module,
                                      absl::string_view name);
 
+  llvm::Value* EmitGetBatchDim(llvm::IRBuilderBase& builder,
+                               llvm::Value* call_frame);
+
  private:
   llvm::LLVMContext& context_;
 
