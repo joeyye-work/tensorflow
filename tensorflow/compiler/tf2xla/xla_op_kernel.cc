@@ -736,7 +736,8 @@ absl::Status AssignVariableTensor(const Tensor& tensor, DataType type,
   xla::Shape xla_shape;
   TF_RETURN_IF_ERROR(TensorShapeToXLAShape(type, shape, &xla_shape));
   if (!xla::ShapeUtil::Compatible(xla_shape, representation_shape)) {
-    handle = xla::Reshape(handle, representation_shape.dimensions());
+    handle = xla::Reshape(handle, representation_shape.dimensions(),
+                          representation_shape.expressions());
   }
   variable->SetRepresentationShape(representation_shape);
   return variable->SetValue(handle);

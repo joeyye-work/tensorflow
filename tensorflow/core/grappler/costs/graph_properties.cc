@@ -27,6 +27,7 @@ limitations under the License.
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/framework/types.pb.h"
 #include "tensorflow/core/framework/versions.pb.h"
+#include "tensorflow/core/framework/tensor_shape_expr.h"
 #include "tensorflow/core/graph/tensor_id.h"
 #include "tensorflow/core/grappler/costs/utils.h"
 #include "tensorflow/core/grappler/mutable_graph_view.h"
@@ -189,6 +190,9 @@ class DisjointSet {
 
   absl::Status Merge(Handle x, Handle y);
   const typename HandleToObject<Handle>::Object GetMergedValue(Handle value);
+  // Returns a pointer that uniquely identifies the set containing `value`.
+  // This can be used as a stable key for associating metadata with a set.
+  void* RootId(Handle value) { return static_cast<void*>(Find(value)); }
 
  private:
   // All the handles that belong to the same set are part of the same tree, and
@@ -1148,32 +1152,32 @@ class SymbolicShapeRefiner {
   }
 
   struct ShapeId {
-    const NodeDef* node;
+    std::string node_name;
     int port_id;
 
     friend bool operator==(const ShapeId& lhs, const ShapeId& rhs) {
-      return lhs.node == rhs.node && lhs.port_id == rhs.port_id;
+      return lhs.node_name == rhs.node_name && lhs.port_id == rhs.port_id;
     }
 
     template <typename H>
     friend H AbslHashValue(H h, const ShapeId& s) {
-      return H::combine(std::move(h), s.node, s.port_id);
+      return H::combine(std::move(h), s.node_name, s.port_id);
     }
   };
 
   struct DimId {
-    const NodeDef* node;
+    std::string node_name;
     int port_id;
     int dim_index;
 
     friend bool operator==(const DimId& lhs, const DimId& rhs) {
-      return lhs.node == rhs.node && lhs.port_id == rhs.port_id &&
+      return lhs.node_name == rhs.node_name && lhs.port_id == rhs.port_id &&
              lhs.dim_index == rhs.dim_index;
     }
 
     template <typename H>
     friend H AbslHashValue(H h, const DimId& d) {
-      return H::combine(std::move(h), d.node, d.port_id, d.dim_index);
+      return H::combine(std::move(h), d.node_name, d.port_id, d.dim_index);
     }
   };
 
@@ -1391,7 +1395,7 @@ class SymbolicShapeRefiner {
   // Return the one ShapeHandle used to denote a fully unknown shape for a node
   // output.
   ShapeHandle GetUnknownOutputShape(const NodeDef* node, int index) {
-    ShapeId id{node, index};
+    ShapeId id{node->name(), index};
     auto it = unknown_shapes_.find(id);
     if (it != unknown_shapes_.end()) {
       return it->second;
@@ -1405,15 +1409,37 @@ class SymbolicShapeRefiner {
   // node output.
   DimensionHandle GetUnknownOutputDim(const NodeDef* node, int index,
                                       int dim_id) {
-    DimId id{node, index, dim_id};
+    DimId id{node->name(), index, dim_id};
     auto it = unknown_dims_.find(id);
     if (it != unknown_dims_.end()) {
       return it->second;
     }
     InferenceContext* c = GetContext(node);
-    DimensionHandle dim = c->UnknownDim();
+    int var_id = GetOrCreateStableVarId(id);
+    DimensionHandle dim;
+    if (node->op() == "_Arg") {
+      var_id *= -1;
+      // var_id would be minus when it's argument.
+      dim = c->UnknownDimWithExpr(DynExpr::Var(var_id));
+    } else {
+      dim = c->UnknownDimWithExpr(DynExpr::Var(var_id));
+    }
+    VLOG(1) << "[EXPR] GetUnknownOutputDim: node=" << node->name()
+            << " out=" << index << " dim=" << dim_id << " -> Var(" << var_id
+            << ")";
+    // Create an unknown dim with Var(var_id) expression.
     unknown_dims_[id] = dim;
     return dim;
+  }
+  // Get or create a stable integer variable ID for a given DimId.
+  int GetOrCreateStableVarId(const DimId& id) {
+    auto it = stable_var_ids_.find(id);
+    if (it != stable_var_ids_.end()) {
+      return it->second;
+    }
+    int var_id = next_var_id_++;
+    stable_var_ids_[id] = var_id;
+    return var_id;
   }
 
   // Returns true if all the output tensors have known values.
@@ -1712,7 +1738,50 @@ class SymbolicShapeRefiner {
     // but instantiate a new UnknownDim to prevent incorrect symbolic shape
     // inference through UnknownDim from Const.
     InferenceContext* ic = c->inference_context.get();
+    const std::string& op = node.op();
+    const bool is_bin =
+        (op == "Sub" || op == "Add" || op == "Mul" || op == "Div");
     if (!is_fed) {
+      if (is_bin) {
+        if (c->input_tensors_as_shapes_to_propagate.size() < 2)
+          return absl::OkStatus();
+        auto va = c->input_tensors_as_shapes_to_propagate[0];
+        auto vb = c->input_tensors_as_shapes_to_propagate[1];
+
+        if (va.SameHandle(tensorflow::shape_inference::ShapeHandle()) ||
+            vb.SameHandle(tensorflow::shape_inference::ShapeHandle())) {
+          return absl::OkStatus();
+        }
+
+        if (!ic->RankKnown(va) || !ic->RankKnown(vb)) return absl::OkStatus();
+        if (ic->Rank(va) != ic->Rank(vb)) return absl::OkStatus();
+
+        std::vector<tensorflow::shape_inference::DimensionHandle> out_elems;
+        out_elems.reserve(ic->Rank(va));
+
+        for (int i = 0; i < ic->Rank(va); ++i) {
+          auto da = ic->Dim(va, i);
+          auto db = ic->Dim(vb, i);
+
+          tensorflow::shape_inference::DimensionHandle r;
+          if (op == "Sub")
+            TF_RETURN_IF_ERROR(ic->Subtract(da, db, &r));
+          else if (op == "Add")
+            TF_RETURN_IF_ERROR(ic->Add(da, db, &r));
+          else if (op == "Mul")
+            TF_RETURN_IF_ERROR(ic->Multiply(da, db, &r));
+          else
+            TF_RETURN_IF_ERROR(
+                ic->Divide(da, db, /*evenly_divisible=*/false, &r));
+          out_elems.push_back(r);
+        }
+        c->output_tensors_as_shapes.resize(1);
+        c->output_tensors_as_shapes[0] = ic->MakeShape(out_elems);
+        // @TODO: Check if we need to do anything with output_tensor_protos.
+        // S.t  c->output_tensor_protos[0] = nullptr;
+        return absl::OkStatus();
+      }
+
       if (IsConstant(node)) {
         const TensorProto& tensor_proto = node.attr().at("value").tensor();
         c->output_tensor_protos.resize(1);
@@ -1759,7 +1828,7 @@ class SymbolicShapeRefiner {
         for (int i = 0; i < c->inference_context->num_inputs(); ++i) {
           c->output_tensors_as_shapes[i] = c->inference_context->input(i);
         }
-      } else if (node.op() == "ConcatV2") {
+      } else if (op == "ConcatV2") {
         bool valid = true;
         ShapeHandle result;
         for (int i = 0; i < ic->num_inputs() - 1; ++i) {
@@ -1919,6 +1988,75 @@ class SymbolicShapeRefiner {
     return absl::OkStatus();
   }
 
+  absl::Status CanonicalizeOutputDims(const NodeDef* node) {
+    NodeContext* ctx = GetNodeContext(node);
+    if (!ctx) return absl::OkStatus();
+
+    InferenceContext* ic = ctx->inference_context.get();
+    for (int out = 0; out < ic->num_outputs(); ++out) {
+      ShapeHandle s = ic->output(out);
+
+      if (!ic->RankKnown(s) && node->op() == "_Arg") {
+        // Treat batched function arguments as vectors with batch dim at dim0.
+        DimensionHandle d0 = GetUnknownOutputDim(node, out, /*dim_index=*/0);
+        ShapeHandle vec = ic->MakeShape({d0});
+        ic->set_output(out, vec);
+        s = vec;
+      }
+
+      if (!ic->RankKnown(s)){
+        //if Rank is not realized yet, get it from attr.
+        auto it = node->attr().find("_output_shapes");
+        if (it != node->attr().end() && it->second.list().shape_size()>0){
+          const TensorShapeProto& proto = it->second.list().shape(out);
+
+          std::vector<DimensionHandle> dims;
+          dims.reserve(proto.dim_size());
+
+          for(int d=0; d<proto.dim_size();++d){
+            int64_t size = proto.dim(d).size();
+            if (size >=0){
+              dims.push_back(ic->MakeDim(size));
+            } else {
+              dims.push_back(GetUnknownOutputDim(node, out, d));
+            }
+          }
+          s = ic->MakeShape(dims);
+          ic->set_output(out,s);
+        }else {
+          VLOG(1) << "RANK still unknown." << node->name();
+          continue;
+        }
+      }
+      bool changed = false;
+      std::vector<DimensionHandle> dims;
+      dims.reserve(ic->Rank(s));
+      for (int d = 0; d < ic->Rank(s); ++d) {
+        DimensionHandle dim = ic->Dim(s, d);
+        const int64_t v = ic->Value(dim);
+        // Keep concrete dims.
+        if (v >= 0) {
+          dims.push_back(dim);
+          continue;
+        }
+        // If already tagged with expr, keep it.
+        if (ic->DimExpr(dim) != nullptr) {
+          dims.push_back(dim);
+          continue;
+        }
+        // Canonicalize ALL unknown dims.
+        DimensionHandle canon = GetUnknownOutputDim(node, out, d);
+        changed |= !dim.SameHandle(canon);
+        dims.push_back(canon);
+      }
+      if (changed) {
+        ShapeHandle new_s = ic->MakeShape(dims);
+        ic->set_output(out, new_s);
+      }
+    }
+    return absl::OkStatus();
+  }
+
   absl::Status InferShapes(const NodeDef& node, NodeContext* c) {
     // Infer the shapes of output tensors.
     if (!c->op_data || c->op_data->shape_inference_fn == nullptr ||
@@ -1940,8 +2078,8 @@ class SymbolicShapeRefiner {
         status.Update(SetUnknownShape(&node, output_port));
       }
     }
-
     // Update NodeContext output fields after shape inference function runs.
+    status.Update(CanonicalizeOutputDims(&node));
     status.Update(MaybeUpdateNodeContextOutput(node, is_fed, c));
 
     return status;
@@ -2048,6 +2186,9 @@ class SymbolicShapeRefiner {
   absl::flat_hash_map<const NodeDef*, NodeContext> node_to_context_;
   absl::flat_hash_map<ShapeId, ShapeHandle> unknown_shapes_;
   absl::flat_hash_map<DimId, DimensionHandle> unknown_dims_;
+  // Stable variable IDs for canonical dimension symbols.
+  absl::flat_hash_map<DimId, int> stable_var_ids_;
+  int next_var_id_ = 1;
   // Store function instantiations only for valid function. If function
   // instantiation failed it will have an `absl::nullopt`.
   absl::flat_hash_map<string, absl::optional<GrapplerFunctionItem>>
@@ -2080,8 +2221,9 @@ class SymbolicShapeManager {
     if (InferenceContext::Rank(s1) > 0 && InferenceContext::Rank(s2) > 0) {
       CHECK_EQ(InferenceContext::Rank(s1), InferenceContext::Rank(s2));
       for (int i = 0; i < InferenceContext::Rank(s1); ++i) {
-        TF_RETURN_IF_ERROR(dims_.Merge(InferenceContext::DimKnownRank(s1, i),
-                                       InferenceContext::DimKnownRank(s2, i)));
+        TF_RETURN_IF_ERROR(
+            MergeDimsWithExpr(InferenceContext::DimKnownRank(s1, i),
+                              InferenceContext::DimKnownRank(s2, i)));
       }
     }
     return absl::OkStatus();
@@ -2090,7 +2232,7 @@ class SymbolicShapeManager {
     if (!d1.IsSet() || !d2.IsSet()) {
       return absl::OkStatus();
     }
-    return dims_.Merge(d1, d2);
+    return MergeDimsWithExpr(d1, d2);
   }
 
   void AsTensorProperties(const ShapeHandle& shape, const DataType& type,
@@ -2104,7 +2246,23 @@ class SymbolicShapeManager {
         shape_inference::DimensionHandle dim =
             InferenceContext::DimKnownRank(actual_shape, j);
         int64_t d = dims_.GetMergedValue(dim);
-        properties->mutable_shape()->add_dim()->set_size(d);
+        auto* out_dim = properties->mutable_shape()->add_dim();
+        out_dim->set_size(d < 0 ? -1 : d);
+        // Serialize expression for unknown dims
+        if (out_dim->size() < 0) {
+          void* root = dims_.RootId(dim);
+          DynExpr* expr = nullptr;
+          if (auto it = dim_root_expr_.find(root); it != dim_root_expr_.end()) {
+            expr = it->second;
+          } else {
+            // Fallback to checking the dim handle directly
+            expr = GetExprFromDimHandle(dim);
+          }
+          if (expr != nullptr) {
+            expr->ToProto(out_dim->mutable_expr());
+            // TODO: Apply simplification?
+          }
+        }
       }
     }
   }
@@ -2132,7 +2290,119 @@ class SymbolicShapeManager {
   }
 
  private:
+  // Get the variable ID from an expression, or -1 if not a variable.
+  static int32_t GetVarId(const DynExpr* e) {
+    if (!e || e->kind() != DynExpr::Kind::kVariable) return -1;
+    return static_cast<const Variable*>(e)->id();
+  }
+
+  static bool IsConst(const DynExpr* e) {
+    return e && e->kind() == DynExpr::Kind::kConstant;
+  }
+
+  static bool IsVar(const DynExpr* e) {
+    return e && e->kind() == DynExpr::Kind::kVariable;
+  }
+
+  static bool IsPlaceHolder(const DynExpr* e) {
+    if (!e) return false;
+    if (e->kind() != DynExpr::Kind::kVariable) return false;
+    return static_cast<const Variable*>(e)->id() < 0;
+  }
+
+  static bool IsCompound(const DynExpr* e) {
+    if (!e) return false;
+    switch (e->kind()) {
+      case DynExpr::Kind::kAdd:
+      case DynExpr::Kind::kSub:
+      case DynExpr::Kind::kMul:
+      case DynExpr::Kind::kDiv:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  // Ranking: Const > Arg_ > Compound > Var > null
+  static int InfoScore(const DynExpr* e) {
+    if (!e) return 0;
+    if (IsConst(e)) return 4;
+    if (IsPlaceHolder(e)) return 3;
+    if (IsCompound(e)) return 2;
+    if (IsVar(e)) return 1;
+    return 1;  // fallback (shouldn't happen)
+  }
+
+  // Prefer "more informative" but keep deterministic tie-break.
+  static DynExpr* PreferMoreInformative(DynExpr* a, DynExpr* b) {
+    if (a == b) return a;
+    const int sa = InfoScore(a);
+    const int sb = InfoScore(b);
+    if (sa > sb) return a;
+    if (sb > sa) return b;
+    // Same score: keep stable choice.
+    return a;
+  }
+
+  // Get the expr pointer from a dimension handle (accesses private member).
+  static DynExpr* GetExprFromDimHandle(const DimensionHandle& d) {
+    if (!d.IsSet()) return nullptr;
+    return d->expr_;
+  }
+
+  absl::Status MergeDimsWithExpr(DimensionHandle d1, DimensionHandle d2) {
+    if (!d1.IsSet() || !d2.IsSet()) return absl::OkStatus();
+
+    void* r1 = dims_.RootId(d1);
+    void* r2 = dims_.RootId(d2);
+
+    // Fetch best-known expr for each set.
+    auto get_best = [&](void* r, DimensionHandle d) -> DynExpr* {
+      auto it = dim_root_expr_.find(r);
+      if (it != dim_root_expr_.end()) return it->second;
+      return GetExprFromDimHandle(d);  // may be null
+    };
+
+    DynExpr* e1 = get_best(r1, d1);
+    DynExpr* e2 = get_best(r2, d2);
+
+    // If already in same UF set, just keep the most informative expr.
+    if (r1 == r2) {
+      DynExpr* existing = nullptr;
+      if (auto it = dim_root_expr_.find(r1); it != dim_root_expr_.end()) {
+        existing = it->second;
+      }
+      DynExpr* chosen = PreferMoreInformative(existing,
+                                            PreferMoreInformative(e1, e2));
+      if (chosen) dim_root_expr_[r1] = chosen;  // keep or upgrade
+      return absl::OkStatus();
+    }
+
+    // Perform UF merge (rank + path compression inside DisjointSet).
+    TF_RETURN_IF_ERROR(dims_.Merge(d1, d2));
+
+    // New root after merge.
+    void* new_root = dims_.RootId(d1);
+
+    // Choose best expr across both sets.
+    DynExpr* chosen = PreferMoreInformative(e1, e2);
+
+    // Remove stale root keys (only the old roots).
+    dim_root_expr_.erase(r1);
+    dim_root_expr_.erase(r2);
+
+    // Preserve any expr already stored at new_root (rare but safe).
+    if (auto it = dim_root_expr_.find(new_root); it != dim_root_expr_.end()) {
+      chosen = PreferMoreInformative(it->second, chosen);
+    }
+
+    if (chosen) dim_root_expr_[new_root] = chosen;
+
+    return absl::OkStatus();
+  }
   DisjointSet<shape_inference::ShapeHandle> shapes_;
+  // Map from union-find root pointer to the best expression for that set.
+  absl::flat_hash_map<void*, DynExpr*> dim_root_expr_;
   DisjointSet<shape_inference::DimensionHandle> dims_;
 };
 

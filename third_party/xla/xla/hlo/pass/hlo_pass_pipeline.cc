@@ -212,6 +212,7 @@ absl::StatusOr<bool> HloPassPipeline::RunPassesInternal(
       }
       TF_RETURN_IF_ERROR(status);
     }
+
     if (!pass->IsPassPipeline()) {
       compilation_stats_->EndPass(pass_name);
     }

@@ -66,9 +66,17 @@ class PackOp : public XlaOpKernel {
     TensorShape child_shape(shapes[0]);
     child_shape.InsertDim(axis, 1);
 
+    // Equivalent to InsertDim(axis, 1) for expressions
+    std::vector<xla::DynExpr*> exprs;
+    for (auto e : child_shape.get_expressions()) {
+      exprs.push_back(e);
+    }
+    exprs.insert(exprs.begin() + axis, xla::DynExpr::one);
+
     for (int i = 0; i < num; ++i) {
       // Reshape the inputs to have an extra dimension of size 1.
-      reshaped_inputs[i] = xla::Reshape(values[i], child_shape.dim_sizes());
+      reshaped_inputs[i] = xla::Reshape(values[i], child_shape.dim_sizes(),
+                                        exprs);
     }
 
     ctx->SetOutput(0, xla::ConcatInDim(ctx->builder(), reshaped_inputs, axis));

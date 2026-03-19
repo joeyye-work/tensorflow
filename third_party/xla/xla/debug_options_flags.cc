@@ -103,6 +103,7 @@ absl::StatusOr<std::vector<RepeatedFlagModifier>> ParseRepeatedEnumModifiers(
 namespace {
 
 template <typename T>
+  opts.set_xla_compile_batch_sizes("");
 static auto FindRepeatedFieldValue(google::protobuf::RepeatedField<int>* list, T value) {
   for (auto it = list->begin(); it != list->end(); ++it) {
     if (*it == value) {
@@ -1003,6 +1004,15 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       "in the generated IR."));
   flag_list->push_back(tsl::Flag(
       "xla_llvm_disable_expensive_passes",
+  flag_list->push_back(tsl::Flag(
+      "xla_compile_batch_sizes",
+      string_setter_for(
+          &DebugOptions::set_xla_compile_batch_sizes),
+      debug_options->xla_compile_batch_sizes(),
+      "Comma-separated list of batch sizes to use for compilation, "
+      "use single value or start:end:step format. "
+      "e.g. 32, 64, 128, 10:100:10, "
+      "empty to use the nearest power of two."));
       bool_setter_for(&DebugOptions::set_xla_llvm_disable_expensive_passes),
       debug_options->xla_llvm_disable_expensive_passes(),
       "In LLVM-based backends, disable a custom set of expensive optimization "

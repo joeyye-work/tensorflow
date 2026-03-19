@@ -154,8 +154,9 @@ XlaOp ArgMinMax(XlaOp input, PrimitiveType output_type, int axis, bool is_min) {
     int64_t dimension_size = input_shape.dimensions(axis);
     auto index_type = dimension_size <= INT32_MAX ? S32 : output_type;
     XlaOp index_init_value = Zero(builder, index_type);
-    auto iota_shape =
-        ShapeUtil::MakeShape(index_type, input_shape.dimensions());
+    auto iota_shape = ShapeUtil::MakeShape(index_type, input_shape.dimensions(),
+                                           input_shape.expressions());
+
     XlaOp iota = Iota(builder, iota_shape, axis);
 
     XlaComputation reducer = CreateMinMaxComputation(

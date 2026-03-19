@@ -110,7 +110,8 @@ class ConvNDOp : public XlaOpKernel {
         expanded_input_shape.set_dimensions(i + 1, input_shape.dimensions(i));
       }
       expanded_input_shape.set_dimensions(0, 1);
-      input = xla::Reshape(input, expanded_input_shape.dimensions());
+      input = xla::Reshape(input, expanded_input_shape.dimensions(),
+                           expanded_input_shape.expressions());
     } else if (attrs_.batch_dims > 1) {
       // Flatten batch_dims.
       std::vector<int64_t> to_collapse(attrs_.batch_dims);
@@ -131,7 +132,8 @@ class ConvNDOp : public XlaOpKernel {
     if (attrs_.batch_dims == 0) {
       xla::Shape no_batch_shape(out_shape);
       no_batch_shape.DeleteDimension(0);
-      out = xla::Reshape(out, no_batch_shape.dimensions());
+      out = xla::Reshape(out, no_batch_shape.dimensions(),
+                         no_batch_shape.expressions());
     } else if (attrs_.batch_dims > 1) {
       xla::Shape expanded_out_shape(input_shape);
       for (int i = attrs_.batch_dims; i < input_shape.dimensions().size();
@@ -139,7 +141,8 @@ class ConvNDOp : public XlaOpKernel {
         expanded_out_shape.set_dimensions(
             i, out_shape.dimensions(i - (attrs_.batch_dims - 1)));
       }
-      out = xla::Reshape(out, expanded_out_shape.dimensions());
+      out = xla::Reshape(out, expanded_out_shape.dimensions(),
+                         expanded_out_shape.expressions());
     }
     ctx->SetOutput(0, out);
   }

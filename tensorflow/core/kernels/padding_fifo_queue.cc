@@ -401,6 +401,10 @@ std::vector<TensorShape> PaddingFIFOQueue::ConvertShapesPartialDimensionsToZero(
     const PartialTensorShape& partial = partial_shapes[i];
     TensorShape& shape = shapes[i];
     for (int64_t s : partial.dim_sizes()) shape.AddDim(s < 0 ? 0 : s);
+    for (auto e : partial.get_expressions()){
+      shape.AddExpression(
+          e->is_constant() && e->get_val() < 0 ? xla::DynExpr::zero : e);
+      }
   }
   return shapes;
 }

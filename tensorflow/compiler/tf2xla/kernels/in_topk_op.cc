@@ -87,9 +87,11 @@ class InTopKOp : public XlaOpKernel {
     // which indicates the target is in topk.
     xla::XlaOp gt_r2 = xla::Gt(predictions_r2, targets_values_r1, {0});
     xla::XlaOp zero_r0 = xla::Zero(xla_builder, xla::S32);
-    xla::XlaOp zero_r2 = xla::Broadcast(zero_r0, predictions_shape.dim_sizes());
+    xla::XlaOp zero_r2 = xla::Broadcast(zero_r0, predictions_shape.dim_sizes(),
+                                        predictions_shape.get_expressions());
     xla::XlaOp one_r0 = xla::One(xla_builder, xla::S32);
-    xla::XlaOp one_r2 = xla::Broadcast(one_r0, predictions_shape.dim_sizes());
+    xla::XlaOp one_r2 = xla::Broadcast(one_r0, predictions_shape.dim_sizes(),
+                                       predictions_shape.get_expressions());
     xla::XlaOp one_hot_r2 = xla::Select(gt_r2, one_r2, zero_r2);
     xla::XlaOp num_gt_r1 = xla::Reduce(
         one_hot_r2, zero_r0,

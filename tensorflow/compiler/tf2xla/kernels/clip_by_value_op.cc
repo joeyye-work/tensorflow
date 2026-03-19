@@ -46,11 +46,11 @@ class ClipByValueOp : public XlaOpKernel {
 
     if (shape != min_shape) {
       OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(min_shape), shape_error());
-      min = xla::Broadcast(min, shape.dim_sizes());
+      min = xla::Broadcast(min, shape.dim_sizes(), shape.get_expressions());
     }
     if (shape != max_shape) {
       OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(max_shape), shape_error());
-      max = xla::Broadcast(max, shape.dim_sizes());
+      max = xla::Broadcast(max, shape.dim_sizes(), shape.get_expressions());
     }
     ctx->SetOutput(0, xla::Clamp(min, input, max));
   }

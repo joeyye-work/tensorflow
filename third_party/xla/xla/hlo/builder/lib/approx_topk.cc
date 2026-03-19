@@ -134,10 +134,10 @@ XlaOp AggregateToTopKBuilder(XlaBuilder* builder,
                            reduction_computation.value(), {reduction_dim});
     Shape op_shape = operands_shapes[0];
     op_shape.set_dimensions(reduction_dim, 1);
-    auto top1_vals =
-        Reshape(GetTupleElement(val_args, 0), op_shape.dimensions());
-    auto top1_args =
-        Reshape(GetTupleElement(val_args, 1), op_shape.dimensions());
+    auto top1_vals = Reshape(GetTupleElement(val_args, 0),
+                             op_shape.dimensions(), op_shape.expressions());
+    auto top1_args = Reshape(GetTupleElement(val_args, 1),
+                             op_shape.dimensions(), op_shape.expressions());
     return Tuple(builder, {top1_vals, top1_args});
   }
 

@@ -234,7 +234,8 @@ xla::XlaOp SetMatrixDiag(const xla::XlaOp input, const xla::XlaOp diag,
 
     // Broadcast and mask.
     xla::XlaOp diag_broadcast = xla::BroadcastInDim(
-        diag_slice, input_shape.dim_sizes(), broadcast_dimensions);
+        diag_slice, input_shape.dim_sizes(), broadcast_dimensions,
+        input_shape.get_expressions());
     const auto mask = xla::GetDiagonalMask(output, diag_index);
     output = xla::Select(mask, diag_broadcast, output);
   }
@@ -328,7 +329,8 @@ class MatrixDiagOp : public XlaOpKernel {
     output_shape.RemoveLastDims((num_diags == 1) ? 1 : 2);
     output_shape.AddDim(num_rows);
     output_shape.AddDim(num_cols);
-    xla::XlaOp output = xla::Broadcast(padding_value, output_shape.dim_sizes());
+    xla::XlaOp output = xla::Broadcast(padding_value, output_shape.dim_sizes(),
+                                       output_shape.get_expressions());
     xla::XlaOp diag = context->Input(0);
     context->SetOutput(
         0, SetMatrixDiag(output, diag, output_shape, diag_rank, num_diags,
@@ -447,7 +449,8 @@ class MatrixDiagPartOp : public XlaOpKernel {
     }
     auto concat =
         xla::ConcatInDim(context->builder(), diag_list, input_rank - 2);
-    context->SetOutput(0, xla::Reshape(concat, output_shape.dim_sizes()));
+    context->SetOutput(0, xla::Reshape(concat, output_shape.dim_sizes(),
+                                       output_shape.get_expressions()));
   }
 
  private:

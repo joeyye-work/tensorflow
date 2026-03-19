@@ -337,6 +337,10 @@ class ShapeUtil {
   // GetDimensionNumber(dimension_number).
   static int64_t GetDimension(const Shape& shape, int64_t dimension_number);
 
+  // Extracts the shape's expressions at dimension number
+  // GetDimensionNumber(dimension_number).
+  static DynExpr* GetExpression(const Shape& shape, int64_t dimension_number);
+
   // Resolves a dimension number, supporting negative indexing.
   //
   // Negative indexing has similar semantics to Python. For an N-dimensional
@@ -446,8 +450,9 @@ class ShapeUtil {
   // Constructs a new shape with the given element type and sequence of
   // dimensions.
   static Shape MakeShape(PrimitiveType element_type,
-                         absl::Span<const int64_t> dimensions) {
-    return MakeValidatedShape(element_type, dimensions).value();
+                         absl::Span<const int64_t> dimensions,
+                         absl::Span<DynExpr* const> expressions = {}) {
+    return MakeValidatedShape(element_type, dimensions, expressions).value();
   }
 
   // Make a scalar shape with given primitive type.
@@ -467,8 +472,10 @@ class ShapeUtil {
   // the same size.
   static Shape MakeShape(PrimitiveType element_type,
                          absl::Span<const int64_t> dimensions,
-                         const std::vector<bool>& dynamic_dimensions) {
-    return MakeValidatedShape(element_type, dimensions, dynamic_dimensions)
+                         const std::vector<bool>& dynamic_dimensions,
+                         absl::Span<DynExpr* const> expressions = {}) {
+    return MakeValidatedShape(element_type, dimensions, dynamic_dimensions,
+                              expressions)
         .value();
   }
 
@@ -485,10 +492,13 @@ class ShapeUtil {
   // size fits in std::numeric_limits<int64_t>::max(), and dynamic size is not
   // marked static.
   static absl::StatusOr<Shape> MakeValidatedShape(
-      PrimitiveType element_type, absl::Span<const int64_t> dimensions);
+      PrimitiveType element_type, absl::Span<const int64_t> dimensions,
+      absl::Span<DynExpr* const> expressions = {});
+
   static absl::StatusOr<Shape> MakeValidatedShape(
       PrimitiveType element_type, absl::Span<const int64_t> dimensions,
-      const std::vector<bool>& dynamic_dimensions);
+      const std::vector<bool>& dynamic_dimensions,
+      absl::Span<DynExpr* const> expressions = {});
 
   // Creates a Shape with element type corresponding to T and the given
   // dimensions
@@ -548,14 +558,16 @@ class ShapeUtil {
   // Constructs a new shape with major-first layout (i.e. {n, n-1, ..., 0}).
   // Crashes if the result is invalid.
   static Shape MakeShapeWithDescendingLayout(
-      PrimitiveType element_type, absl::Span<const int64_t> dimensions) {
+      PrimitiveType element_type, absl::Span<const int64_t> dimensions,
+      absl::Span<DynExpr* const> expressions = {}) {
     return MakeValidatedShapeWithDescendingLayout(element_type, dimensions)
         .value();
   }
 
   // Constructs a new shape with major-first layout (i.e. {n, n-1, ..., 0}).
   static absl::StatusOr<Shape> MakeValidatedShapeWithDescendingLayout(
-      PrimitiveType element_type, absl::Span<const int64_t> dimensions);
+      PrimitiveType element_type, absl::Span<const int64_t> dimensions,
+      absl::Span<DynExpr* const> expressions = {});
 
   // Returns a new Shape based on the given Shape with low-dimension-major
   // layout (i.e. {n, n-1, ..., 0}, like Fortran), and with the dimensions

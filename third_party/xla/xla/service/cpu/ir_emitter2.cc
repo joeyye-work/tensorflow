@@ -203,16 +203,10 @@ IrEmitter2::EmitGetOuterBatchValueHostKernel(const HloInstruction* getBatch) {
                       EmitKernelPrototype(getBatch));
   llvm_ir::IrArray operand_array = kernel_prototype.arguments[0];
   llvm_ir::IrArray output_array = kernel_prototype.results[0];
-  int64_t multiplier = getBatch->operand(0)->shape().outer_multiplier();
-  if (multiplier <= 0) {
-    LOG(ERROR) << "Invalid outer multiplier for GetOuterBatchValue: "
-               << multiplier;
-    return absl::InvalidArgumentError(
-        "Invalid outer multiplier for GetOuterBatchValue");
-  }
+  xla::DynExpr* expr = getBatch->operand(0)->shape().expressions(0);
   llvm::IRBuilder<> b(module_->getContext());
   b.SetInsertPoint(kernel_prototype.function->getEntryBlock().getTerminator());
-  llvm::Value* bdim_value = llvm_ir::GetBatchDimByName(&b, multiplier);
+  llvm::Value* bdim_value = llvm_ir::EmitExpression(&b, expr);
   llvm_ir::IrArray::Index output_index(/*multidimensional_index=*/{},
                                        getBatch->shape(), b.getInt32Ty());
   llvm::Value* output_ptr =

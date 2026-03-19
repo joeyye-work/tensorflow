@@ -192,6 +192,7 @@ absl::StatusOr<Shape> InferWindowOutputShape(const Shape& base_shape,
 
   std::vector<int64_t> output_dimensions(window.dimensions_size());
   std::vector<bool> output_is_dynamic(window.dimensions_size());
+  std::vector<DynExpr*> output_expressions(window.dimensions_size());
   for (int64_t i = 0; i < window.dimensions_size(); ++i) {
     const auto& dim = window.dimensions(i);
     if (dim.size() <= 0) {
@@ -227,10 +228,12 @@ absl::StatusOr<Shape> InferWindowOutputShape(const Shape& base_shape,
           padded_dilated_base, dilated_window, dim.stride());
     }
     output_is_dynamic[i] = base_shape.is_dynamic_dimension(i);
+    output_expressions[i] = base_shape.expressions(i);
   }
 
   return ShapeUtil::MakeValidatedShape(element_type, output_dimensions,
-                                       output_is_dynamic);
+                                       output_is_dynamic,
+                                       output_expressions);
 }
 
 // Encapsulates inferred dimension size and bound size.
@@ -469,6 +472,7 @@ absl::StatusOr<DimAndBound> InferMostSpecificDimAndBound(int64_t dim,
           HloOpcodeString(opcode));
   }
 }
+  std::vector<xla::DynExpr*> expressions(operand_shape.dimensions_size());
 
 /* static */ absl::StatusOr<Shape> ShapeInference::InferTopKShape(
     const Shape& operand_shape, int64_t k) {
@@ -485,10 +489,13 @@ absl::StatusOr<DimAndBound> InferMostSpecificDimAndBound(int64_t dim,
     is_dynamic[i] =
         i == last_dim ? false : operand_shape.is_dynamic_dimension(i);
     dimensions[i] = i == last_dim ? k : operand_shape.dimensions(i);
+    expressions[i] =
+        i == last_dim ? xla::DynExpr::_(k) : operand_shape.expressions(i);
   }
 
-  Shape out = ShapeUtil::MakeShape(operand_shape.element_type(), dimensions,
-                                   is_dynamic);
+  Shape out =
+      ShapeUtil::MakeShape(operand_shape.element_type(), dimensions, is_dynamic,
+                           expressions);
   Shape idxs_shape = ShapeUtil::ChangeElementType(out, PrimitiveType::S32);
   return ShapeUtil::MakeTupleShape({out, idxs_shape});
 }
@@ -548,9 +555,11 @@ absl::StatusOr<DimAndBound> InferMostSpecificDimAndBound(int64_t dim,
   int64_t rank = arg_shape->dimensions().size();
   std::vector<int64_t> inferred_sizes(rank, Shape::kUnboundedSize);
   std::vector<int64_t> inferred_bounds(rank, Shape::kUnboundedSize);
+  std::vector<xla::DynExpr*> inferred_expressions(rank, DynExpr::zero);
   // Note: for the concatenate dimension, 0 should be the identity element:
   // Any dim size can keep unchanged when concatenated with 0
   inferred_sizes[dimension] = 0;
+  inferred_expressions[dimension] = DynExpr::zero;
 
   for (const Shape* shape : arg_shapes) {
     for (int dim = 0; dim < rank; ++dim) {
@@ -560,24 +569,32 @@ absl::StatusOr<DimAndBound> InferMostSpecificDimAndBound(int64_t dim,
       int64_t leftSize = inferred_sizes[dim];
       int64_t rightSize = dimension_size;
       int64_t leftBound = inferred_bounds[dim];
+      xla::DynExpr* leftExpression = inferred_expressions[dim];
       int64_t rightBound = shape->is_dynamic_dimension(dim)
                                ? dimension_size
                                : Shape::kUnboundedSize;
+      xla::DynExpr* rightExpression = shape->expressions(dim);
+      xla::DynExpr* inferred_expression = xla::DynExpr::zero;
+
       if (dim == dimension) {
         inferred_dim_and_bound = InferConcatenatedDimAndBound(
             leftSize, rightSize, leftBound, rightBound);
+        inferred_expression = *leftExpression + *rightExpression;
       } else {
         TF_ASSIGN_OR_RETURN(
             inferred_dim_and_bound,
             InferMostSpecificDimAndBound(dim, leftSize, rightSize, leftBound,
                                          rightBound));
+        inferred_expression = rightExpression;
       }
       inferred_sizes[dim] = inferred_dim_and_bound.dimension;
       inferred_bounds[dim] = inferred_dim_and_bound.bound;
+      inferred_expressions[dim] = inferred_expression->s();
     }
   }
 
-  Shape result = ShapeUtil::MakeShape(element_type, inferred_sizes);
+  Shape result =
+      ShapeUtil::MakeShape(element_type, inferred_sizes, inferred_expressions);
   for (int64_t i = 0; i < inferred_bounds.size(); ++i) {
     if (!IsUnboundedDynamicSize(inferred_bounds[i]) ||
         IsUnboundedDynamicSize(inferred_sizes[i])) {
@@ -762,6 +779,7 @@ absl::StatusOr<DimAndBound> InferMostSpecificDimAndBound(int64_t dim,
   }
 
   std::vector<int64_t> dimensions(operand_shape.dimensions().size());
+  std::vector<DynExpr*> expressions(operand_shape.dimensions_size());
   std::vector<bool> is_dynamic(operand_shape.dimensions().size());
   for (int64_t i = 0; i < operand_shape.dimensions().size(); ++i) {
     const auto& p = padding_config.dimensions(i);
@@ -778,11 +796,13 @@ absl::StatusOr<DimAndBound> InferMostSpecificDimAndBound(int64_t dim,
       }
     }
     is_dynamic[i] = operand_shape.is_dynamic_dimension(i);
+    auto diff = dimensions[i] - operand_shape.dimensions(i);
+    expressions[i] = (*operand_shape.expressions(i) + diff)->s();
   }
 
   return ShapeUtil::MakeShape(
       ShapeUtil::HigherPrecisionElementType(operand_shape, padding_value_shape),
-      dimensions, is_dynamic);
+      dimensions, is_dynamic, expressions);
 }
 
 // Current DotDimensionNumbers Requirements:
@@ -906,7 +926,9 @@ absl::Status CheckDotDimensionConstraints(
 void GenerateDotResultDimensions(
     const Shape& lhs, const Shape& rhs,
     const DotDimensionNumbers& dimension_numbers,
-    std::vector<int64_t>& dimensions, std::vector<bool>& is_dynamic,
+    std::vector<int64_t>& dimensions,
+    std::vector<DynExpr*>& expressions,
+    std::vector<bool>& is_dynamic,
     std::vector<int64_t> rhs_group_dimensions = {}) {
   const auto& lhs_batch_dimensions = dimension_numbers.lhs_batch_dimensions();
   const auto lhs_batch_dimensions_size =
@@ -916,9 +938,11 @@ void GenerateDotResultDimensions(
       dimension_numbers.rhs_contracting_dimensions().size() -
       dimension_numbers.rhs_batch_dimensions().size();
   dimensions.reserve(lhs_batch_dimensions_size);
+  expressions.reserve(lhs_batch_dimensions_size);
   is_dynamic.reserve(lhs_batch_dimensions_size);
   for (const int64_t lhs_dim : lhs_batch_dimensions) {
     dimensions.push_back(lhs.dimensions(lhs_dim));
+    expressions.push_back(lhs.expressions(lhs_dim));
     is_dynamic.push_back(lhs.is_dynamic_dimension(lhs_dim));
   }
   for (int64_t i = 0; i < lhs.dimensions().size(); i++) {
@@ -926,6 +950,7 @@ void GenerateDotResultDimensions(
                                i) &&
         !absl::c_linear_search(dimension_numbers.lhs_batch_dimensions(), i)) {
       dimensions.push_back(lhs.dimensions(i));
+      expressions.push_back(lhs.expressions(i));
       is_dynamic.push_back(lhs.is_dynamic_dimension(i));
     }
   }
@@ -935,6 +960,7 @@ void GenerateDotResultDimensions(
         !absl::c_linear_search(dimension_numbers.rhs_batch_dimensions(), i) &&
         !absl::c_linear_search(rhs_group_dimensions, i)) {
       dimensions.push_back(rhs.dimensions(i));
+      expressions.push_back(rhs.expressions(i));
       is_dynamic.push_back(rhs.is_dynamic_dimension(i));
     }
   }
@@ -957,12 +983,14 @@ void GenerateDotResultDimensions(
 
   std::vector<int64_t> dimensions;
   std::vector<bool> is_dynamic;
+  std::vector<DynExpr*> expressions;
   GenerateDotResultDimensions(lhs, rhs, dimension_numbers, dimensions,
-                              is_dynamic);
+                              expressions, is_dynamic);
 
   PrimitiveType type = preferred_element_type.value_or(
       ShapeUtil::HigherPrecisionElementType(lhs, rhs));
-  Shape result = ShapeUtil::MakeShape(type, dimensions, is_dynamic);
+  Shape result =
+      ShapeUtil::MakeShape(type, dimensions, is_dynamic, expressions);
 
   DCHECK_OK(ShapeUtil::ValidateShapeWithOptionalLayout(result));
   VLOG(2) << "inferred dot shape: " << ShapeUtil::HumanString(result);
@@ -1160,6 +1188,7 @@ void GenerateDotResultDimensions(
   PrimitiveType type = preferred_element_type.value_or(
       ShapeUtil::HigherPrecisionElementType(lhs, rhs));
   std::vector<int64_t> dimensions;
+  std::vector<DynExpr*> expressions;
   std::vector<bool> is_dynamic;
   // Add the group dimension to the result shape in case of ragged contracting.
   if (mode == kContracting) {
@@ -1167,9 +1196,10 @@ void GenerateDotResultDimensions(
     is_dynamic.push_back(is_dynamic_group_sizes);
   }
   GenerateDotResultDimensions(lhs, rhs, dimension_numbers, dimensions,
-                              is_dynamic, rhs_group_dimensions);
+                              expressions, is_dynamic, rhs_group_dimensions);
 
-  Shape result = ShapeUtil::MakeShape(type, dimensions, is_dynamic);
+  Shape result =
+      ShapeUtil::MakeShape(type, dimensions, is_dynamic, expressions);
   DCHECK_OK(ShapeUtil::ValidateShapeWithOptionalLayout(result));
   VLOG(2) << "inferred ragged dot shape: " << ShapeUtil::HumanString(result);
   return result;
@@ -1234,6 +1264,7 @@ ShapeInference::InferDegenerateDimensionBroadcastShape(const Shape& lhs,
                              ShapeUtil::HumanString(rhs));
     }
   }
+  std::vector<DynExpr*> output_dimensions_expressions(lhs.dimensions_size());
 
   return ShapeUtil::MakeShape(ShapeUtil::HigherPrecisionElementType(lhs, rhs),
                               output_dimensions, output_dimensions_is_dynamic);
@@ -1260,6 +1291,7 @@ ShapeInference::InferDegenerateDimensionBroadcastShape(const Shape& lhs,
         "%u.",
         smaller_shape.dimensions().size(), broadcast_dimensions.size()));
   }
+      output_dimensions_expressions[i] = lhs.expressions(i);
 
   // broadcast_dimensions is a sequence of dimensions; its length is equal to
   // the rank of the lower-rank operand. The lower-rank operand's dimensions
@@ -1276,6 +1308,9 @@ ShapeInference::InferDegenerateDimensionBroadcastShape(const Shape& lhs,
   //   [2, 3]          [2, 1, 4]       {0, 1}                [2, 3, 4]
   //
   // The column output_shape may not be the final shape of the XLA
+      output_dimensions_expressions[i] = lhs.is_unbounded_dynamic_dimension(i)
+                                             ? rhs.expressions(i)
+                                             : lhs.expressions(i);
   // operation. After the "InDim" broadcasting implemented in this function
   // expands the rank, degenerate-dimension broadcasting (implemented in
   // InferDegenerateDimensionBroadcastShape) broadcasts dimensions of size one
@@ -1318,6 +1353,7 @@ ShapeInference::InferDegenerateDimensionBroadcastShape(const Shape& lhs,
                     dimension_to_match, larger_shape.dimensions().size()));
     }
     int64_t small_dimension_size = smaller_shape.dimensions(i);
+    DynExpr* small_dimension_exp = smaller_shape.expressions(i);
     int64_t large_dimension_size = larger_shape.dimensions(dimension_to_match);
     bool small_is_dynamic = smaller_shape.is_dynamic_dimension(i);
     bool large_is_dynamic =
@@ -1356,6 +1392,7 @@ ShapeInference::InferDegenerateDimensionBroadcastShape(const Shape& lhs,
 
     output_shape.set_dimensions(dimension_to_match, small_dimension_size,
                                 small_is_dynamic);
+    output_shape.set_expression(dimension_to_match, small_dimension_exp);
   }
 
   return output_shape;
@@ -1697,7 +1734,9 @@ ShapeInference::InferScalarBroadcastShape(absl::Span<const Shape> shapes) {
       output_shape.element_type(), arg_shape->dimensions(),
       /*dynamic_dimensions=*/
       std::vector<bool>(arg_shape->dynamic_dimensions().begin(),
-                        arg_shape->dynamic_dimensions().end()));
+                        arg_shape->dynamic_dimensions().end()),
+      /*expressions=*/
+      arg_shape->expressions());
 }
 
 /* static */ absl::StatusOr<Shape> ShapeInference::InferBatchNormTrainingShape(
@@ -1783,8 +1822,12 @@ ShapeInference::InferScalarBroadcastShape(absl::Span<const Shape> shapes) {
 
   const int64_t feature_count = operand_shape.dimensions(feature_index);
   bool dynamic_feature = operand_shape.is_dynamic_dimension(feature_index);
-  Shape output_shape_for_mean_and_var = ShapeUtil::MakeShape(
-      operand_shape.element_type(), {feature_count}, {dynamic_feature});
+  DynExpr* expression_feature =
+      operand_shape.expressions(feature_index);
+
+  Shape output_shape_for_mean_and_var =
+      ShapeUtil::MakeShape(operand_shape.element_type(), {feature_count},
+                           {dynamic_feature}, {expression_feature});
 
   if (!CompatibleDimensionSizes(ShapeUtil::GetDimension(offset_shape, 0),
                                 feature_count)) {
@@ -2071,8 +2114,12 @@ ShapeInference::InferScalarBroadcastShape(absl::Span<const Shape> shapes) {
 
   const int64_t feature_count = operand_shape.dimensions(feature_index);
   bool dynamic_feature = operand_shape.is_dynamic_dimension(feature_index);
+  DynExpr* expression_feature =
+      operand_shape.expressions(feature_index);
+
   Shape feature_shape = ShapeUtil::MakeShape(
-      operand_shape.element_type(), {feature_count}, {dynamic_feature});
+      operand_shape.element_type(), {feature_count}, {dynamic_feature},
+      {expression_feature});
 
   if (!CompatibleDimensionSizes(ShapeUtil::GetDimension(mean_shape, 0),
                                 feature_count)) {
@@ -2321,13 +2368,17 @@ ShapeInference::InferScalarBroadcastShape(absl::Span<const Shape> shapes) {
   }
 
   std::vector<bool> dynamic_dimensions(input_spatial_dims.size());
+  std::vector<DynExpr*> expressions(input_spatial_dims.size());
   for (auto it = input_spatial_dims.begin(); it != input_spatial_dims.end();
        ++it) {
     dynamic_dimensions[it - input_spatial_dims.begin()] =
         IsUnboundedDynamicSize(*it);
+    expressions[it - input_spatial_dims.begin()] =
+        DynExpr::_(-70);
   }
   Shape base_shape = ShapeUtil::MakeShape(
-      lhs.element_type(), input_spatial_dims, dynamic_dimensions);
+      lhs.element_type(), input_spatial_dims, dynamic_dimensions,
+      expressions);
   TF_ASSIGN_OR_RETURN(
       Shape window_output_shape,
       InferWindowOutputShape(base_shape, window, lhs.element_type()));
@@ -2380,7 +2431,8 @@ ShapeInference::InferScalarBroadcastShape(absl::Span<const Shape> shapes) {
   }
   PrimitiveType type = preferred_element_type.value_or(
       ShapeUtil::HigherPrecisionElementType(lhs, rhs));
-  return ShapeUtil::MakeShape(type, dimensions, is_dynamic);
+  return ShapeUtil::MakeShape(type, dimensions, is_dynamic,
+                              expressions);
 }
 
 /* static */ absl::StatusOr<Shape> ShapeInference::InferFftShape(
@@ -2706,8 +2758,10 @@ ShapeInference::InferScalarBroadcastShape(absl::Span<const Shape> shapes) {
 
   const std::vector<bool> dynamic_dimensions(shape.dynamic_dimensions().begin(),
                                              shape.dynamic_dimensions().end());
+  auto exprs = shape.expressions();
+  std::vector<DynExpr*> expressions(exprs.begin(), exprs.end());
   return ShapeUtil::MakeShape(shape.element_type(), new_dimensions,
-                              dynamic_dimensions);
+                              dynamic_dimensions, expressions);
 }
 
 /* static */ absl::StatusOr<Shape> ShapeInference::InferAllToAllTupleShape(
@@ -3098,7 +3152,9 @@ ShapeInference::InferCollectivePermuteDoneShape(const Shape& operand_shape) {
 
 /* static */ absl::StatusOr<Shape> ShapeInference::InferSliceShape(
     const Shape& arg, absl::Span<const int64_t> starts,
-    absl::Span<const int64_t> limits, absl::Span<const int64_t> strides) {
+    absl::Span<const int64_t> limits, absl::Span<const int64_t> strides,
+    absl::Span<DynExpr* const> start_exprs,
+    absl::Span<DynExpr* const> limit_exprs) {
   auto error = [&](const std::string& message) {
     return InvalidArgument(
         "%s in slice operation; argument shape: %s; starts: {%s}; limits: "
@@ -3128,8 +3184,10 @@ ShapeInference::InferCollectivePermuteDoneShape(const Shape& operand_shape) {
   }
 
   std::vector<int64_t> sizes;
+  std::vector<DynExpr*> expressions;
   const auto starts_size = starts.size();
   sizes.reserve(starts_size);
+  expressions.reserve(starts_size);
   for (int64_t dimension = 0; dimension < starts_size; ++dimension) {
     int64_t start_index = starts[dimension];
     int64_t limit_index = limits[dimension];
@@ -3157,6 +3215,14 @@ ShapeInference::InferCollectivePermuteDoneShape(const Shape& operand_shape) {
       return InvalidArgument("Stride (%d) must be positive.", stride);
     }
     sizes.push_back((limit_index - start_index + stride - 1) / stride);
+
+    auto limit_expr =
+        limit_exprs.empty() ? DynExpr::_(limit_index) : limit_exprs[dimension];
+    auto start_expr =
+        start_exprs.empty() ? DynExpr::_(start_index) : start_exprs[dimension];
+
+    auto new_expr = (*(*(*limit_expr - *start_expr) + stride) - 1)->s();
+    expressions.push_back((*new_expr/stride)->s());
   }
 
   std::vector<bool> is_dynamic(arg.dimensions().size());
@@ -3168,12 +3234,14 @@ ShapeInference::InferCollectivePermuteDoneShape(const Shape& operand_shape) {
     is_dynamic[i] = arg.is_bounded_dynamic_dimension(i);
   }
 
-  return ShapeUtil::MakeShape(arg.element_type(), sizes, is_dynamic);
+  return ShapeUtil::MakeShape(arg.element_type(), sizes, is_dynamic,
+                              expressions);
 }
 
 /* static */ absl::StatusOr<Shape> ShapeInference::InferDynamicSliceShape(
     const Shape& operand_shape, absl::Span<const Shape> start_index_shapes,
-    absl::Span<const int64_t> slice_sizes, bool allow_scalar_indices) {
+    absl::Span<const int64_t> slice_sizes,
+    absl::Span<DynExpr* const> slice_exprs, bool allow_scalar_indices) {
   TF_RETURN_IF_ERROR(ExpectArray(operand_shape, "operand of dynamic slice"));
   auto number_of_indices = start_index_shapes.size();
   // TODO(b/118437727): Remove this path.
@@ -3273,8 +3341,8 @@ ShapeInference::InferCollectivePermuteDoneShape(const Shape& operand_shape) {
     VLOG(2) << StrFormat("slice_sizes[%d] = %d", dim, slice_dim_size);
   }
 
-  Shape result =
-      ShapeUtil::MakeShape(operand_shape.element_type(), slice_sizes);
+  Shape result = ShapeUtil::MakeShape(operand_shape.element_type(), slice_sizes,
+                                      slice_exprs);
 
   for (int64_t dimension = 0; dimension < operand_shape.dimensions().size();
        ++dimension) {
@@ -3574,7 +3642,8 @@ ShapeInference::InferCollectivePermuteDoneShape(const Shape& operand_shape) {
 }
 
 /* static */ absl::StatusOr<Shape> ShapeInference::InferBroadcastShape(
-    const Shape& operand, absl::Span<const int64_t> broadcast_sizes) {
+    const Shape& operand, absl::Span<const int64_t> broadcast_sizes,
+    absl::Span<DynExpr* const> broadcast_exprs) {
   // This method is used to infer shape for xla::BroadcastInDim.
   TF_RETURN_IF_ERROR(ExpectArray(operand, "operand of broadcast"));
   TF_RET_CHECK(!operand.is_unbounded_dynamic());
@@ -3663,7 +3732,8 @@ ShapeInference::InferCollectivePermuteDoneShape(const Shape& operand_shape) {
 /* static */ absl::StatusOr<Shape> ShapeInference::InferDynamicReshapeShape(
     const Shape& operand, absl::Span<const Shape* const> dim_size_shapes,
     absl::Span<const int64_t> new_size_bounds,
-    const std::vector<bool>& dims_are_dynamic) {
+    const std::vector<bool>& dims_are_dynamic,
+    absl::Span<DynExpr* const> expressions) {
   if (new_size_bounds.size() != dims_are_dynamic.size()) {
     return InvalidArgument(
         "DynamicReshape has to have the same number of elements in new_sizes "
@@ -3679,9 +3749,8 @@ ShapeInference::InferCollectivePermuteDoneShape(const Shape& operand_shape) {
           dim_size_shape->ToString());
     }
   }
-
   Shape inferred_shape = ShapeUtil::MakeShape(
-      operand.element_type(), new_size_bounds, dims_are_dynamic);
+      operand.element_type(), new_size_bounds, dims_are_dynamic, expressions);
   if (ShapeUtil::ElementsIn(operand) != ShapeUtil::ElementsIn(inferred_shape)) {
     return InvalidArgument(
         "Reshape operation has mismatched element counts: from=%d (%s) "
@@ -3695,10 +3764,21 @@ ShapeInference::InferCollectivePermuteDoneShape(const Shape& operand_shape) {
 
 /* static */ absl::StatusOr<Shape> ShapeInference::InferReshapeShape(
     const Shape& operand, absl::Span<const int64_t> dimensions,
-    int64_t inferred_dimension) {
+    int64_t inferred_dimension, absl::Span<DynExpr* const> expressions) {
   TF_RETURN_IF_ERROR(ExpectArray(operand, "reshape"));
   Shape inferred_shape =
-      ShapeUtil::MakeShape(operand.element_type(), dimensions);
+      ShapeUtil::MakeShape(operand.element_type(), dimensions, expressions);
+
+  if (expressions.empty() && operand.expressions().size() > 0 &&
+      operand.expressions(0)->is_dynamic()) {
+    return InvalidArgument("Expressions is empty but operand is dynamic");
+  }
+
+  // if (!expressions.empty() && expressions[0]->is_constant() &&
+  //     expressions[0]->get_val() == 977) {
+  //   return InvalidArgument("Expressions[0] is the magic number (977).");
+  // }
+
   VLOG(3) << "Reshape inferred shape: "
           << ShapeUtil::HumanString(inferred_shape);
 
@@ -4253,10 +4333,12 @@ static absl::Status ValidateGatherDimensionNumbers(
   output_dim_bounds.reserve(result_rank);
 
   std::vector<bool> output_dim_is_dynamic;
+  std::vector<DynExpr*> output_expressions;
   output_dim_is_dynamic.reserve(result_rank);
   for (int64_t i = 0; i < result_rank; i++) {
     int64_t current_bound;
     bool dim_dynamic = false;
+    DynExpr* expression = DynExpr::_(-80);
     bool is_window_index =
         absl::c_binary_search(gather_dim_numbers.offset_dims(), i);
     if (is_window_index) {
@@ -4278,6 +4360,9 @@ static absl::Status ValidateGatherDimensionNumbers(
       if (slice_sizes[offset_dims_seen] ==
           input_shape.dimensions(offset_dims_seen)) {
         dim_dynamic = input_shape.is_dynamic_dimension(offset_dims_seen);
+        expression = input_shape.expressions(offset_dims_seen);
+      } else {
+        expression = DynExpr::_(slice_sizes[offset_dims_seen]);
       }
       current_bound = slice_sizes[offset_dims_seen++];
     } else {
@@ -4287,15 +4372,17 @@ static absl::Status ValidateGatherDimensionNumbers(
       // Forward dynamic dimensions from indices.
       dim_dynamic =
           expanded_start_indices_shape_dynamic_dimensions[gather_dims_seen];
-
+      expression = expanded_start_indices_shape_expressions[gather_dims_seen];
       current_bound = expanded_start_indices_shape[gather_dims_seen++];
     }
     output_dim_is_dynamic.push_back(dim_dynamic);
+    output_expressions.push_back(expression);
     output_dim_bounds.push_back(current_bound);
   }
 
-  return ShapeUtil::MakeShape(input_shape.element_type(), output_dim_bounds,
-                              output_dim_is_dynamic);
+  auto s = ShapeUtil::MakeShape(input_shape.element_type(), output_dim_bounds,
+                                output_dim_is_dynamic, output_expressions);
+  return s;
 }
 
 namespace {
