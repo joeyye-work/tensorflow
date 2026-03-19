@@ -84,9 +84,14 @@ absl::Status FeedInputs(
     const AttrValue* shape_attr = node_attrs.FindByString("_output_shapes");
     if (shape_attr && shape_attr->has_list()) {
       const TensorShapeProto& shape = shape_attr->list().shape(0);
-      if (shape.dim_size() >= 1 && shape.dim(0).size() == -1) {
-        feed_node->AddAttr("_is_batch", true);
+      for (int i = 0; i < shape.dim_size(); ++i) {
+        if (shape.dim(i).size() == -1) {
+          feed_node->AddAttr("_dynamic_dim", i);
+          break;
+        }
       }
+      // Keep _output_shapes for further runs of shape inference
+      feed_node->AddAttr("_output_shapes", *shape_attr);
     }
     // Update name_index
     (*name_index)[feed_node->name()] = feed_node;

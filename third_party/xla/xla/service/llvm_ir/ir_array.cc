@@ -281,10 +281,10 @@ IrArray::Index IrArray::Index::SourceIndexOfReshape(
       // linear index by each dimension size.
       for (int64_t i = common_factors[k + 1].first - 1;
            i >= common_factors[k].first; --i) {
-        bool is_dynamic = input_shape.expressions(i)->is_dynamic();
+        xla::DynExpr* input_expr = input_shape.expressions(i);
+        bool is_dynamic = input_expr != nullptr && input_expr->is_dynamic();
         llvm::Value* divisor =
-            is_dynamic ? llvm_ir::EmitExpression(builder,
-                                                 input_shape.expressions(i))
+            is_dynamic ? llvm_ir::EmitExpression(builder, input_expr)
                        : GetConstantWithIndexType(input_shape.dimensions(i));
         if (input_shape.dimensions(i) == 1) {
           source_multidim_index[i] = GetConstantWithIndexType(0);

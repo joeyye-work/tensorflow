@@ -424,7 +424,7 @@ static xla::DynExpr* DimExprToDynExpr(const DimExpr* e) {
     }
     case DimExpr::Kind::kVariable: {
       auto* av = static_cast<const Variable*>(e);
-      return xla::DynExpr::V(1);  // Use 1 all the time for now
+      return xla::DynExpr::V(1);
     }
     case DimExpr::Kind::kAdd: {
       auto* ee = static_cast<const ExprAdd*>(e);
@@ -497,14 +497,27 @@ absl::Status CompileToLocalExecutable(
 
   MarkForCompilationPassFlags* flags = GetMarkForCompilationPassFlags();
   if (flags->tf_xla_enable_dynamic_sizes) {
-    // Rewriting the argument with the magic number if they have dynamic
-    // dimension, detecting dynamic dimension via _is_batch attr in the
-    // argument.
+    // Rewriting the argument with expressions if they have dynamic
+    // dimension, detecting dynamic dimension via either _dynamic_dim or
+    // _output_shapes attr in the argument.
     std::vector<XlaCompiler::Argument> norm_args(args.begin(), args.end());
     int64_t filled_batch = 0;
-    int64_t old_batch = 0;
+    bool saw_dynamic_dim_value = false;
+    // Only supporting one dynamic dimension. 
+    bool has_multiple_dynamic_dim_values = false;
+    int64_t dynamic_dim_value = 0;
     XlaBatchMatcher* xla_batch_matcher =
         xla_device_compiler->xla_batch_matcher();
+    auto record_dynamic_dim_value = [&](int64_t dim_size) {
+      if (!saw_dynamic_dim_value) {
+        saw_dynamic_dim_value = true;
+        dynamic_dim_value = dim_size;
+        return;
+      }
+      if (dynamic_dim_value != dim_size) {
+        has_multiple_dynamic_dim_values = true;
+      }
+    };
     if (options.flib_def != nullptr) {
       const FunctionDef* fdef = options.flib_def->Find(function.name());
       if (fdef != nullptr) {
@@ -521,12 +534,10 @@ absl::Status CompileToLocalExecutable(
                 std::get<TensorShape>(norm_args[arg_index].shape);
             const AttrValue& v = dyn_dim_attr->second;
             int64_t idx = v.i();
+            record_dynamic_dim_value(shp.dim_size(idx));
             if (!filled_batch && xla_batch_matcher) {
-              TensorShape& shp =
-                  std::get<TensorShape>(norm_args[arg_index].shape);
-              old_batch = shp.dim_size(0);
               filled_batch =
-                  xla_batch_matcher->get_xla_compile_batch(old_batch);
+                  xla_batch_matcher->get_xla_compile_batch(shp.dim_size(idx));
             }
 
             std::vector<xla::DynExpr*> dyn_exprs;
@@ -550,11 +561,9 @@ absl::Status CompileToLocalExecutable(
               // value and exit loop.
               auto e = DimExprToDynExpr(ExprFromProto(exp[idx]).get())->s();
               if (e->is_dynamic()) {
-                const std::string& node_name =
-                    fdef->signature().input_arg(arg_index).name();
-                old_batch = shp.dim_size(idx);
+                record_dynamic_dim_value(shp.dim_size(idx));
                 filled_batch =
-                    xla_batch_matcher->get_xla_compile_batch(old_batch);
+                    xla_batch_matcher->get_xla_compile_batch(shp.dim_size(idx));
                 break;
               }
             }
@@ -581,61 +590,76 @@ absl::Status CompileToLocalExecutable(
       int64_t old_value;
     };
     std::vector<SaveOldVar> old_vars;
-    // We will rewrite the argument shapes and constant values with the magic
-    // batch number, so we need to restore them after compilation.
+    auto maybe_rewrite_scalar_constant = [&](int arg_index) {
+      if (!saw_dynamic_dim_value || has_multiple_dynamic_dim_values) {
+        return;
+      }
+
+      auto& arg = norm_args[arg_index];
+      // Only scalar integer constants can stand in for a folded batch-size
+      // value. Rewriting the first element of a larger tensor would corrupt it.
+      if (arg.kind != XlaCompiler::Argument::kConstant ||
+          arg.constant_value.NumElements() != 1) {
+        return;
+      }
+
+      if (arg.constant_value.dtype() == DT_INT32) {
+        const int32 old_value = arg.constant_value.flat<int32>()(0);
+        // Heuristic: rewrite only scalar constants whose runtime value matches
+        // the observed dynamic batch size.
+        if (old_value == dynamic_dim_value) {
+          // Deep-copy before rewrite so the compile-time patch does not mutate
+          // a Tensor buffer shared with caller-visible inputs.
+          Tensor scalar_copy(arg.constant_value.dtype(),
+                             arg.constant_value.shape());
+          scalar_copy.flat<int32>()(0) = old_value;
+          arg.constant_value = std::move(scalar_copy);
+          arg.constant_value.flat<int32>()(0) =
+              static_cast<int32>(filled_batch);
+        }
+      } else if (arg.constant_value.dtype() == DT_INT64) {
+        const int64_t old_value = arg.constant_value.flat<int64_t>()(0);
+        // Same heuristic for int64 scalar constants.
+        if (old_value == dynamic_dim_value) {
+          Tensor scalar_copy(arg.constant_value.dtype(),
+                             arg.constant_value.shape());
+          scalar_copy.flat<int64_t>()(0) = old_value;
+          arg.constant_value = std::move(scalar_copy);
+          arg.constant_value.flat<int64_t>()(0) = filled_batch;
+        }
+      }
+    };
+    // We rewrite only dynamic dimensions to the padded compile batch and then
+    // restore the original runtime sizes after compilation. Some scalar
+    // constants are actually runtime batch sizes folded by earlier TF passes,
+    // so rewrite only those that match the detected dynamic runtime value.
+    // Scalar constants are deep-copied before rewrite so the change stays
+    // local to norm_args and does not require restoration.
     if (filled_batch) {
       for (int i = 0; i < norm_args.size(); ++i) {
-        auto& arg = norm_args[i];
         TensorShape& shp = std::get<TensorShape>(norm_args[i].shape);
-        // argument rewrite.
         for (int j = 0; j < shp.get_expressions().size(); ++j) {
           auto e = shp.get_expression(j);
           if (e->is_dynamic()) {
             int64_t old = shp.dim_size(j);
             old_vars.push_back({i, j, old});
-          shp.set_dim(j, filled_batch);
+            shp.set_dim(j, filled_batch);
             // Necessary because set_dim removes the expression:
             shp.set_expression(j, e);
           }
         }
-        // constant argument rewrite otherwise it still store the incoming batch
-        // request.
-        if (arg.kind == XlaCompiler::Argument::kConstant) {
-          // To deal with both int32 and int64
-          if (arg.constant_value.dtype() == DT_INT32) {
-            auto flat = arg.constant_value.flat<int32>();
-            int64_t old = flat(0);
-            flat(0) = static_cast<int32>(filled_batch);
-            old_vars.push_back({i, -1, old});
-          } else if (arg.constant_value.dtype() == DT_INT64) {
-            auto flat = arg.constant_value.flat<int64>();
-            int64_t old = flat(0);
-            flat(0) = static_cast<int64_t>(filled_batch);
-            old_vars.push_back({i, -1, old});
-          }
-        }
+        maybe_rewrite_scalar_constant(i);
       }
     }
     auto status = xla_device_compiler->CompileIfNeeded(
         options, function, norm_args, compile_options, compile_mode, profiler,
         compilation_result, executable);
-    // Restore the old argument shapes and constant values if filled_batch is not zero.
+    // Restore the original runtime dimensions after compilation.
     if (filled_batch) {
       for (const auto& old_var : old_vars) {
-        auto& arg = norm_args[old_var.arg_index];
-        if (old_var.dyn_dim != -1) {
-          TensorShape& shp = std::get<TensorShape>(arg.shape);
-          shp.set_dim(old_var.dyn_dim, old_var.old_value);
-        }
-        if (arg.kind == XlaCompiler::Argument::kConstant) {
-          if (arg.constant_value.dtype() == DT_INT32) {
-            auto flat = arg.constant_value.flat<int32>();
-            flat(0) = static_cast<int32>(old_var.old_value);
-          } else if (arg.constant_value.dtype() == DT_INT64) {
-            auto flat = arg.constant_value.flat<int64>();
-            flat(0) = static_cast<int64_t>(old_var.old_value);
-          }
-        }
+        TensorShape& shp =
+            std::get<TensorShape>(norm_args[old_var.arg_index].shape);
+        shp.set_dim(old_var.dyn_dim, old_var.old_value);
       }
     }
     return status;
@@ -1097,7 +1121,6 @@ XlaRunOp::XlaRunOp(OpKernelConstruction* ctx)
 void XlaRunOp::Compute(OpKernelContext* ctx) {
   VLOG(3) << "XlaRunOp " << def().name();
   Tensor key_tensor = ctx->input(ctx->num_inputs() - 1);
-
   bool use_pjrt =
       GetXlaOpsCommonFlags()
           ->tf_xla_use_device_api.IsEnabledInXlaCompileAndRunForDevice(
@@ -1181,22 +1204,64 @@ void XlaRunOp::Compute(OpKernelContext* ctx) {
 
   MarkForCompilationPassFlags* flags = GetMarkForCompilationPassFlags();
   if (flags->tf_xla_enable_dynamic_sizes) {
-    BatchSizeResource* bsr = nullptr;
-    ScopedStepContainer* step_container = ctx->step_container();
+    bool is_set = false;
+    std::set<int64_t> dyn_vals;
+    const auto* comp_result = closure.compilation_result();
+    const int num_constant_args = closure.num_constant_args();
+    for (int i = 0; i < comp_result->xla_input_shapes.size(); i++) {
+      const auto& xla_shape = closure.compilation_result()->xla_input_shapes[i];
+      if (!xla_shape.IsArray() || xla_shape.expressions().empty()) continue;
 
-    absl::Status st = step_container->Lookup<BatchSizeResource>(
-        ctx->resource_manager(), BatchSizeResourceName, &bsr);
-
-    if (st.ok()) {
-      run_options.set_batch_size(bsr->GetBatchSize());
-      VLOG(1) << "run_options.batch_size is set to: "
-              << run_options.batch_size() << ". step_id: " << ctx->step_id();
-      bsr->Unref();
-
-    } else if (IsNotFound(st)) {
-      VLOG(1) << "Warning: Not found BatchSizeResource in step_container.";
+      for (int dim = 0; dim < xla_shape.expressions().size(); dim++) {
+        xla::DynExpr* expr = xla_shape.expressions(dim);
+        if (expr && expr->is_dynamic()) {
+          int input_idx = comp_result->input_mapping[i] - num_constant_args;
+          if (input_idx < 0 || input_idx >= ctx->num_inputs()) {
+            VLOG(1) << "Warning: Input index is out of range";
+            continue;
+          }
+          VLOG(1) << "input shape is " << ctx->input(input_idx).shape()
+                  << ", corresponding xla input shape is " << xla_shape;
+          int64_t size = ctx->input(input_idx).shape().dim_size(dim);
+          int64_t dyn_val = expr->solve(size); // TODO: check if the result is correct later.
+          VLOG(1) << "Found dynamic input. Real size is: " << size
+                        << ", solved dynamic value is " << dyn_val;
+          if (dyn_val == -1) {
+            VLOG(1) << "Warning: Failed to solve the expression";
+            continue;
+          }
+          dyn_vals.insert(dyn_val);
+        }
+      }
+    }
+  
+    if (dyn_vals.size() == 1) {
+      run_options.set_batch_size(*(dyn_vals.begin()));
+      is_set = true;
     } else {
-      OP_REQUIRES_OK(ctx, st);
+      // Found multiple variables
+      VLOG(1) << "Warning: Found multiple variables";
+    }
+    
+    if (!is_set) {
+      // TODO: Fallback to BatchSizeResource for now. Remove it later.
+      BatchSizeResource* bsr = nullptr;
+      ScopedStepContainer* step_container = ctx->step_container();
+
+      absl::Status st = step_container->Lookup<BatchSizeResource>(
+          ctx->resource_manager(), BatchSizeResourceName, &bsr);
+
+      if (st.ok()) {
+        run_options.set_batch_size(bsr->GetBatchSize());
+        VLOG(1) << "run_options.batch_size is set to: "
+                << run_options.batch_size() << ". step_id: " << ctx->step_id();
+        bsr->Unref();
+
+      } else if (IsNotFound(st)) {
+        VLOG(1) << "Warning: Not found BatchSizeResource in step_container.";
+      } else {
+        OP_REQUIRES_OK(ctx, st);
+      }
     }
   }
 
@@ -1228,7 +1293,8 @@ void XlaRunOp::Compute(OpKernelContext* ctx) {
       launch_context.PopulateOutputs(
           ctx, closure.compilation_result(), execution_output->ConsumeResult(),
           /*missing_ctx_input_prefix=*/closure.num_constant_args(),
-          absl::MakeSpan(*variable_infos), input_output_alias, snapshot_ptrs));
+          absl::MakeSpan(*variable_infos), input_output_alias, snapshot_ptrs,
+          &run_options));
 }
 
 XlaMergeOp::XlaMergeOp(OpKernelConstruction* ctx) : OpKernel(ctx) {}

@@ -421,7 +421,7 @@ absl::StatusOr<Shape> Shape::FromProto(const ShapeProto& shape_proto) {
       // value is invalid.
       DynExpr* expression = (i < num_expressions)
                                 ? ExprFromProto(shape_proto.expressions(i))
-                                : DynExpr::_(-30);
+                                : DynExpr::_(shape_proto.dimensions(i));
       shape.UnsafeAddDimension(shape_proto.dimensions(i), is_dynamic,
                                expression);
     }
@@ -566,7 +566,8 @@ void Shape::add_dimensions(int64_t value, bool is_dynamic, DynExpr* expr) {
     CHECK_EQ(value, kUnboundedSize)
         << "dynamic dimension must have size == kUnboundedSize or >= 0.";
   }
-  UnsafeAddDimension(value, is_dynamic, expr);
+  UnsafeAddDimension(value, is_dynamic,
+                     expr != nullptr ? expr : DynExpr::_(value));
 }
 
 void Shape::set_dynamic_dimension(int dimension, bool is_dynamic) {
@@ -578,14 +579,18 @@ void Shape::set_dynamic_dimension(int dimension, bool is_dynamic) {
 
 void Shape::set_expression(int dimension, DynExpr* e) {
   auto& state = array_state();
-  state.expressions[dimension] = e;
+  state.expressions[dimension] =
+      e != nullptr ? e : DynExpr::_(state.dimensions[dimension]);
 }
 
 void Shape::set_expressions(std::vector<DynExpr*> exps) {
   auto& state = array_state();
-  state.expressions.clear();
-  for (auto e : exps){
-    state.expressions.push_back(e);
+  CHECK_LE(exps.size(), state.dimensions.size());
+  state.expressions.resize(state.dimensions.size());
+  for (size_t i = 0; i < state.dimensions.size(); ++i) {
+    DynExpr* expr = i < exps.size() ? exps[i] : DynExpr::_(state.dimensions[i]);
+    state.expressions[i] =
+        expr != nullptr ? expr : DynExpr::_(state.dimensions[i]);
   }
 }
 
@@ -627,7 +632,7 @@ void Shape::UnsafeAddDimension(int64_t value, bool is_dynamic, DynExpr* exp) {
       << "where the shape is " << ToString();
   state.dimensions.push_back(value);
   state.dynamic_dimensions.push_back(is_dynamic);
-  state.expressions.push_back(exp);
+  state.expressions.push_back(exp != nullptr ? exp : DynExpr::_(value));
 }
 
 bool Shape::is_static() const {

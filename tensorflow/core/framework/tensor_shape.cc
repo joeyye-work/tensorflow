@@ -293,6 +293,9 @@ absl::Status TensorShapeBase<Shape>::BuildTensorShapeBase(
         }
       }
     }
+    for (const auto& e : proto.expressions()) {
+      out->AddExpression(ExprFromProto(e));
+    }
   }
   return absl::OkStatus();
 }
@@ -475,6 +478,19 @@ int64_t TensorShapeBase<Shape>::dim_size(int d) const {
 void TensorShapeRep::Clear() {
   ClearAllButDataType();
   set_data_type(DT_INVALID);
+}
+
+void TensorShapeRep::set_expression(int d, xla::DynExpr* expr) {
+  expressions_[d] = expr;
+}
+
+void TensorShapeRep::AddExpression(xla::DynExpr* expr) {
+  CHECK_LT(expressions_.size(), ndims_byte());
+  expressions_.push_back(expr);
+}
+
+void TensorShapeRep::set_expressions(std::vector<xla::DynExpr*> exprs) {
+  expressions_ = exprs;
 }
 
 void TensorShapeRep::ClearAllButDataType() {
@@ -717,8 +733,6 @@ void TensorShapeBase<Shape>::set_dim(int d, int64_t size) {
 
 template <class Shape>
 absl::Status TensorShapeBase<Shape>::SetDimWithStatus(int d, int64_t size) {
-  if (get_expressions().size() > d) set_expression(d, xla::DynExpr::_(size));
-
   if (TF_PREDICT_FALSE(d < 0)) {
     return errors::InvalidArgument("Index must be non-negative, got ", d);
   }
@@ -754,6 +768,7 @@ absl::Status TensorShapeBase<Shape>::SetDimWithStatus(int d, int64_t size) {
     }
   }
 
+  if (get_expressions().size() > d) set_expression(d, xla::DynExpr::_(size));
   return RecomputeNumElements();
 }
 
@@ -818,7 +833,6 @@ absl::Status TensorShapeBase<Shape>::RemoveDimRangeWithStatus(int begin,
       return s;
     }
   }
-
   return RecomputeNumElements();
 }
 
