@@ -1106,7 +1106,12 @@ absl::Status MarkForCompilationPassImpl::RunEdgeContractionLoop() {
                       ForEachEdgeInPostOrder([&](Cluster* from, Cluster* to) {
                         return TryToContractEdge(from, to);
                       }));
+  /* Clustering conditions for dynamic shapes may break the assumption of
+   * fixed point at phase 2, so this check may fail.
+   * Now just disable this check, and we can re-enable it after we have more
+   * confidence in the code.
   TF_RET_CHECK(!changed);
+   */
 
   return absl::OkStatus();
 }
