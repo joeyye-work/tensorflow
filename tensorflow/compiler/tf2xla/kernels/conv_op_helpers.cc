@@ -97,8 +97,11 @@ xla::XlaOp TransposeFilterForGroupConvolutionBackpropInput(
   CHECK_GE(num_dims, 2);  // Crash OK
   xla::Shape new_shape = filter_shape;
   new_shape.set_dimensions(num_dims - 1, num_groups);
-  new_shape.add_dimensions(filter_shape.dimensions(num_dims - 1) / num_groups);
-  xla::XlaOp result = xla::Reshape(filter, new_shape.dimensions());
+  new_shape.add_dimensions(
+      filter_shape.dimensions(num_dims - 1) / num_groups,
+      (*filter_shape.expressions(num_dims - 1) / num_groups)->s());
+  xla::XlaOp result =
+      xla::Reshape(filter, new_shape.dimensions(), new_shape.expressions());
 
   // 2. Transpose to [H, W, ..., G, filter_in_depth, out_depth / G]
   std::vector<int64_t> transpose_dims(num_dims + 1);
@@ -118,7 +121,8 @@ xla::XlaOp ReshapeFilterForDepthwiseConvolution(const xla::Shape& filter_shape,
                                                 xla::XlaOp filter) {
   return xla::Reshape(
       filter,
-      GroupedFilterShapeForDepthwiseConvolution(filter_shape).dimensions());
+      GroupedFilterShapeForDepthwiseConvolution(filter_shape).dimensions(),
+      GroupedFilterShapeForDepthwiseConvolution(filter_shape).expressions());
 }
 
 // Performs some basic checks on ConvOpAttrs that are true for all kinds of XLA
@@ -163,8 +167,8 @@ absl::Status CheckConvAttrs(const ConvOpAttrs& attrs) {
 absl::Status ConvBackpropComputeDimensionsV2XlaShapes(
     absl::string_view label, int num_spatial_dims,
     const xla::Shape& input_shape, const xla::Shape& filter_shape,
-    const xla::Shape& out_backprop_shape, absl::Span<const int32_t> dilations,
-    const std::vector<int32_t>& strides, Padding padding,
+    const xla::Shape& out_backprop_shape, absl::Span<const int32> dilations,
+    const std::vector<int32>& strides, Padding padding,
     TensorFormat data_format, ConvBackpropDimensions* dims,
     absl::Span<const int64_t> explicit_paddings) {
   TensorShape input_tensor_shape, filter_tensor_shape,
@@ -203,7 +207,7 @@ absl::StatusOr<ConvOpAttrs> ConvOpAttrs::Create(int num_spatial_dims,
         ctx->GetAttr("explicit_paddings", &attrs.explicit_paddings));
   }
 
-  std::string data_format;
+  string data_format;
   TF_RETURN_IF_ERROR(ctx->GetAttr("data_format", &data_format));
   if (!FormatFromString(data_format, &attrs.data_format)) {
     return errors::InvalidArgument("Invalid data format: ", data_format);
@@ -231,7 +235,7 @@ absl::StatusOr<ConvNDOpAttrs> ConvNDOpAttrs::Create(OpKernelConstruction* ctx) {
         ctx->GetAttr("explicit_paddings", &attrs.explicit_paddings));
   }
 
-  std::string data_format_str;
+  string data_format_str;
   TF_RETURN_IF_ERROR(ctx->GetAttr("data_format", &data_format_str));
   if (!(data_format_str == "CHANNELS_LAST" ||
         data_format_str == "CHANNELS_FIRST")) {
@@ -603,7 +607,8 @@ absl::StatusOr<xla::XlaOp> MakeXlaBackpropFilterConvOp(
   }
 
   if (attrs.depthwise) {
-    filter_backprop = xla::Reshape(filter_backprop, filter_shape.dimensions());
+    filter_backprop = xla::Reshape(filter_backprop, filter_shape.dimensions(),
+                                   filter_shape.expressions());
   }
 
   return filter_backprop;

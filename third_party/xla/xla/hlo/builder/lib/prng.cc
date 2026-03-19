@@ -24,7 +24,6 @@ limitations under the License.
 #include <vector>
 
 #include "absl/algorithm/container.h"
-#include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
@@ -42,8 +41,9 @@ namespace xla {
 xla::XlaOp ConcatScalars(xla::XlaBuilder* builder,
                          absl::Span<const xla::XlaOp> scalars) {
   std::vector<xla::XlaOp> vectors;
-  absl::c_transform(scalars, std::back_inserter(vectors),
-                    [](xla::XlaOp x) { return xla::Reshape(x, {1}); });
+  absl::c_transform(scalars, std::back_inserter(vectors), [](xla::XlaOp x) {
+    return xla::Reshape(x, {1}, {xla::DynExpr::one});
+  });
   return ConcatInDim(builder, vectors, 0);
 }
 
@@ -155,7 +155,8 @@ std::pair<ThreeFry2x32State, XlaOp> GetThreeFryInputsAndUpdatedState(
   XlaBuilder* builder = initial_state.builder();
   auto u64_shape = ShapeUtil::MakeShape(U64, shape.dimensions());
   // initial_state is an R1, so reshape it to a scalar.
-  auto input_u64 = Broadcast(Reshape(initial_state, {}), shape.dimensions());
+  auto input_u64 = Broadcast(Reshape(initial_state, {}), shape.dimensions(),
+                             shape.expressions());
   int64_t trailing_dims_product = 1;
   for (int64_t i = shape.dimensions().size() - 1; i >= 0; --i) {
     if (shape.dimensions(i) < 2) {
@@ -182,39 +183,48 @@ struct SplitShapePair {
 // Split the shape on a dimension > 1 into two halves.
 SplitShapePair SplitShapeIntoHalves(const Shape& shape) {
   SplitShapePair pair;
-  const auto& dims = shape.dimensions();
-  if (dims.empty()) {
+  if (shape.dimensions().size() == 0) {
     pair.half_shape = ShapeUtil::MakeShape(shape.element_type(), {1});
     pair.concat_shape = ShapeUtil::MakeShape(shape.element_type(), {2});
     pair.split_dim = 0;
     pair.new_concat_dim = 0;
     return pair;
   }
-
-  if (auto it = absl::c_find_if(dims, [](int64_t dim) { return dim % 2 == 0; });
-      it != dims.end()) {
-    pair.split_dim = std::distance(dims.begin(), it);
-  } else {
-    pair.split_dim = std::distance(dims.begin(), absl::c_max_element(dims));
+  pair.split_dim = -1;
+  for (int64_t i = 0; i < shape.dimensions().size(); ++i) {
+    if (shape.dimensions(i) % 2 == 0) {
+      pair.split_dim = i;
+      break;
+    }
   }
-
+  if (pair.split_dim == -1) {
+    // No even dims. Find a dimension with maximum size.
+    for (int64_t i = 0; i < shape.dimensions().size(); ++i) {
+      if (pair.split_dim == -1 ||
+          shape.dimensions(i) > shape.dimensions(pair.split_dim)) {
+        pair.split_dim = i;
+      }
+    }
+  }
+  if (pair.split_dim < 0) {
+    LOG(ERROR) << "This point shouldn't have been reached.";
+  }
   std::vector<int64_t> half_shape_dims;
   std::vector<int64_t> concat_shape_dims;
-  const auto rank = dims.size();
+  const auto rank = shape.dimensions().size();
   half_shape_dims.reserve(rank + 1);
   concat_shape_dims.reserve(rank + 1);
   for (int64_t i = 0; i < rank; ++i) {
     if (i == pair.split_dim) {
       // Create a new trivial dim for the later concat, which is more friendly
       // to sharding propagation.
-      auto dim_size = CeilOfRatio<int64_t>(dims[i], 2);
-      half_shape_dims.push_back(dim_size);
+      half_shape_dims.push_back(CeilOfRatio<int64_t>(shape.dimensions(i), 2));
       half_shape_dims.push_back(1);
-      concat_shape_dims.push_back(dim_size);
+      concat_shape_dims.push_back(half_shape_dims[i]);
       concat_shape_dims.push_back(2);
     } else {
-      half_shape_dims.push_back(dims[i]);
-      concat_shape_dims.push_back(dims[i]);
+      half_shape_dims.push_back(shape.dimensions(i));
+      concat_shape_dims.push_back(shape.dimensions(i));
     }
   }
   pair.new_concat_dim = pair.split_dim + 1;
@@ -228,7 +238,7 @@ SplitShapePair SplitShapeIntoHalves(const Shape& shape) {
 XlaOp CombineShapePair(absl::Span<const XlaOp> pair,
                        const SplitShapePair& shape_pair,
                        const Shape& original_shape) {
-  if (original_shape.dimensions().empty()) {
+  if (original_shape.dimensions().size() == 0) {
     return Reshape(pair[0], {});
   }
   XlaBuilder* builder = pair[0].builder();
@@ -237,8 +247,12 @@ XlaOp CombineShapePair(absl::Span<const XlaOp> pair,
       original_shape.dimensions(shape_pair.split_dim);
   std::vector<int64_t> reshape_dims(original_shape.dimensions().begin(),
                                     original_shape.dimensions().end());
+  std::vector<DynExpr*> reshape_exprs(original_shape.expressions().begin(),
+                                     original_shape.expressions().end());
   reshape_dims[shape_pair.split_dim] = RoundUpTo<int64_t>(pre_split_size, 2);
-  result = Reshape(result, reshape_dims);
+  reshape_exprs[shape_pair.split_dim] =
+      DynExpr::_(RoundUpTo<int64_t>(pre_split_size, 2));
+  result = Reshape(result, reshape_dims, reshape_exprs);
   if (reshape_dims[shape_pair.split_dim] != pre_split_size) {
     result = Slice(result,
                    std::vector<int64_t>(original_shape.dimensions().size(), 0),
@@ -425,27 +439,6 @@ std::pair<Philox4x32State, XlaOp> GeneratePhiloxBits(int64_t num_elems,
   return std::make_pair(outputs, new_state);
 }
 
-// Interleaves slices of Philox results in a round-robin fashion to align with
-// non-XLA implementations.
-XlaOp InterleavePhiloxResults(XlaBuilder* builder,
-                              absl::Span<const XlaOp> results,
-                              int64_t num_elems) {
-  const int kNumResults = results.size();
-  CHECK_GT(kNumResults, 0);
-  int64_t bits_len = CeilOfRatio<int64_t>(num_elems, kNumResults);
-  std::vector<XlaOp> reshaped_results;
-  reshaped_results.reserve(kNumResults);
-  for (const auto& result : results) {
-    reshaped_results.push_back(Reshape(result, {bits_len, 1}));
-  }
-  XlaOp numbers = ConcatInDim(builder, reshaped_results,
-                              /*dimension=*/1);
-  numbers = Reshape(numbers, {bits_len * kNumResults});
-  return Slice(numbers, /*start_indices=*/{0},
-               /*limit_indices=*/{num_elems},
-               /*strides=*/{1});
-}
-
 // Generates an array of primitive type U32 with the given shape containing
 // random bits generated by the Philox algorithm. Returns the array and the new
 // state of the random number generator.
@@ -458,8 +451,19 @@ RngOutput PhiloxRngBit32(XlaOp op_key, XlaOp initial_state,
   Philox4x32State bits;
   XlaOp new_state;
   std::tie(bits, new_state) = GeneratePhiloxBits(num_elems, initial_state, key);
-  XlaOp numbers = InterleavePhiloxResults(builder, bits, num_elems);
-  return {Reshape(numbers, shape.dimensions()), new_state};
+  // Combining bits[i] in a round-robin fashion, to align with non-XLA
+  // implementations
+  int64_t bits_len = (num_elems + 3) / 4;
+  for (auto i = 0; i < 4; ++i) {
+    bits[i] = Reshape(bits[i], {bits_len, 1});
+  }
+  XlaOp numbers = ConcatInDim(builder, {bits[0], bits[1], bits[2], bits[3]},
+                              /*dimension=*/1);
+  numbers = Reshape(numbers, {bits_len * 4}, {});
+  numbers = Slice(numbers, /*start_indices=*/{0},
+                  /*limit_indices=*/{num_elems},
+                  /*strides=*/{1});
+  return {Reshape(numbers, shape.dimensions(), shape.expressions()), new_state};
 }
 
 // Generates an array of primitive type U16 with the given shape containing
@@ -490,15 +494,26 @@ RngOutput PhiloxRngBit64(XlaOp op_key, XlaOp initial_state,
   Philox4x32Key key = Uint64ToUint32s(op_key);
   Philox4x32State bits32;
   XlaOp new_state;
-  constexpr int kNum32BitIntsFor64BitInt = sizeof(uint64_t) / sizeof(uint32_t);
-  std::tie(bits32, new_state) = GeneratePhiloxBits(
-      num_elems * kNum32BitIntsFor64BitInt, initial_state, key);
+  std::tie(bits32, new_state) =
+      GeneratePhiloxBits(num_elems * 2, initial_state, key);
 
   std::array<XlaOp, 2> bits64;
   bits64[0] = Uint32sToUint64({bits32[0], bits32[1]});
   bits64[1] = Uint32sToUint64({bits32[2], bits32[3]});
-  XlaOp numbers = InterleavePhiloxResults(builder, bits64, num_elems);
-  return {Reshape(numbers, shape.dimensions()), new_state};
+
+  // Combining bits64[i] in a round-robin fashion, to align with non-XLA
+  // implementations
+  int64_t bits64_len = (num_elems + 1) / 2;
+  for (auto i = 0; i < 2; ++i) {
+    bits64[i] = Reshape(bits64[i], {bits64_len, 1});
+  }
+  XlaOp numbers = ConcatInDim(builder, {bits64[0], bits64[1]},
+                              /*dimension=*/1);
+  numbers = Reshape(numbers, {bits64_len * 2});
+  numbers = Slice(numbers, /*start_indices=*/{0},
+                  /*limit_indices=*/{num_elems},
+                  /*strides=*/{1});
+  return {Reshape(numbers, shape.dimensions(), shape.expressions()), new_state};
 }
 
 XlaOp ConvertRandomBitsToUniformFloatingPoint(XlaOp bits, XlaOp minval,
@@ -520,7 +535,6 @@ XlaOp ConvertRandomBitsToUniformFloatingPoint(XlaOp bits, XlaOp minval,
           primitive_util::LowercasePrimitiveTypeName(bit_type));
     }
 
-    XlaOp values;
     if (value_type == F16 && bit_type == U16) {
       // This path follows the approach of the non-XLA kernels (see
       // `tsl::random::Uint16ToHalf`). IEEE754 halfs are formatted as follows
@@ -531,19 +545,11 @@ XlaOp ConvertRandomBitsToUniformFloatingPoint(XlaOp bits, XlaOp minval,
       //    exponent == 15  -- an excess 15 representation of a zero exponent
       //    mantissa == 10 random bits
 
-      const int trailing_significand_width =
-          primitive_util::SignificandWidth(F16) - 1;
-      const uint16_t trailing_significand_mask =
-          LsbMask<uint16_t>(trailing_significand_width);
-      auto mantissa =
-          bits &
-          ScalarLike(bits, trailing_significand_mask);  // 10 bit mantissa
-      auto exponent = ScalarLike(
-          bits, static_cast<uint16_t>(primitive_util::ExponentBias(F16))
-                    << trailing_significand_width);
+      auto mantissa = bits & ScalarLike(bits, 0x3ffu);  // 10 bit mantissa
+      auto exponent = ScalarLike(bits, static_cast<uint16_t>(15) << 10);
       auto u16_result = exponent | mantissa;
       auto result = BitcastConvertType(u16_result, F16);
-      values = result - ScalarLike(result, 1.0);
+      return result - ScalarLike(result, 1.0);
     } else {
       // TODO: b/256715195 - Consider using the approach in the F16 case.
       // Form random mantissa bits for float/double, with a leading 1 bit.
@@ -565,15 +571,15 @@ XlaOp ConvertRandomBitsToUniformFloatingPoint(XlaOp bits, XlaOp minval,
 
       // We have an integer-valued floating point number in the range
       // [0, 2**{num_mantissa_bits}).
-      values = ConvertElementType(bits, value_type);
+      XlaOp values = ConvertElementType(bits, value_type);
 
       // Multiply by 2**{-num_mantissa_bits} to get a number in the range
       // [0.0, 1.0).
       values = values * ScalarLike(values, std::ldexp(1., -num_mantissa_bits));
-    }
 
       // Multiply and add to shift to the range [minval, maxval).
-    return values * (maxval - minval) + minval;
+      return values * (maxval - minval) + minval;
+    }
   });
 }
 

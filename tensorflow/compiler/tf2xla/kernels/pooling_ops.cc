@@ -88,8 +88,8 @@ class PoolingOp : public XlaOpKernel {
         num_spatial_dims_(num_spatial_dims),
         reduction_type_(reduction_type) {
     if (ctx->num_inputs() == 1) {
-      std::vector<int32_t> ksize_int;
-      std::vector<int32_t> stride_int;
+      std::vector<int32> ksize_int;
+      std::vector<int32> stride_int;
       OP_REQUIRES_OK(ctx, ctx->GetAttr("ksize", &ksize_int));
       OP_REQUIRES(ctx, ksize_int.size() == num_dims(),
                   errors::InvalidArgument("Sliding window ksize field must "
@@ -255,19 +255,23 @@ class MaxPoolOp : public PoolingOp {
           ctx->builder()->GetShape(pooling);
       OP_REQUIRES_OK(ctx, result_shape.status());
 
-      int64_t num_channels = result_shape->dimensions(1);
+      int64 num_channels = result_shape->dimensions(1);
       OP_REQUIRES(
           ctx, num_channels % *vect_width == 0,
           errors::FailedPrecondition("Result of NCHW_VECT_C op must have "
                                      "channels multiple of ",
                                      *vect_width, ", but was ", num_channels));
 
-      absl::InlinedVector<int64_t, 5> new_dims(
-          result_shape->dimensions().begin(), result_shape->dimensions().end());
+      absl::InlinedVector<int64, 5> new_dims(result_shape->dimensions().begin(),
+                                             result_shape->dimensions().end());
+      absl::InlinedVector<xla::DynExpr*, 5> new_exprs(
+          result_shape->expressions().begin(),
+          result_shape->expressions().end());
       new_dims[1] /= *vect_width;
+      new_exprs[1] = *new_exprs[1] / *vect_width;
       new_dims.insert(new_dims.begin() + 2, *vect_width);
-      pooling =
-          xla::Transpose(xla::Reshape(pooling, new_dims), {0, 1, 3, 4, 2});
+      pooling = xla::Transpose(xla::Reshape(pooling, new_dims, new_exprs),
+                               {0, 1, 3, 4, 2});
     }
 
     ctx->SetOutput(0, pooling);
@@ -298,7 +302,7 @@ class AvgPoolOp : public PoolingOp {
       : PoolingOp(ctx, /*num_spatial_dims=*/num_spatial_dims,
                   /*reduction_type=*/
                   XlaHelpers::SumAccumulationType(ctx->input_type(0))) {
-    std::string data_format_str;
+    string data_format_str;
     OP_REQUIRES_OK(ctx, ctx->GetAttr("data_format", &data_format_str));
     OP_REQUIRES(ctx, FormatFromString(data_format_str, &data_format_),
                 errors::InvalidArgument("Invalid data format"));
@@ -466,7 +470,7 @@ class MaxPool2DGradOp : public MaxPoolGradOp {
  public:
   explicit MaxPool2DGradOp(OpKernelConstruction* ctx)
       : MaxPoolGradOp(ctx, /*num_spatial_dims=*/2) {
-    std::string data_format;
+    string data_format;
     OP_REQUIRES_OK(ctx, ctx->GetAttr("data_format", &data_format));
     OP_REQUIRES(ctx, FormatFromString(data_format, &data_format_),
                 errors::InvalidArgument("Invalid data format"));
@@ -505,7 +509,7 @@ class AvgPoolGradOp : public XlaOpKernel {
                 errors::Unimplemented(
                     "Pooling is not yet supported on the batch dimension."));
 
-    std::string data_format;
+    string data_format;
     OP_REQUIRES_OK(ctx, ctx->GetAttr("data_format", &data_format));
     OP_REQUIRES(ctx, FormatFromString(data_format, &data_format_),
                 errors::InvalidArgument("Invalid data format"));
@@ -561,7 +565,7 @@ class AvgPoolGradOp : public XlaOpKernel {
  protected:
   const int num_spatial_dims_;
   std::vector<int64_t> ksize_;
-  std::vector<int32_t> stride_;
+  std::vector<int32> stride_;
   Padding padding_;
   TensorFormat data_format_ = FORMAT_NHWC;
 };
@@ -677,7 +681,7 @@ class MaxPoolGradGradOp : public XlaOpKernel {
 
     auto b = ctx->builder();
 
-    auto sixteen = xla::ConstantR0<uint32_t>(b, 16);
+    auto sixteen = xla::ConstantR0<uint32>(b, 16);
     // in (f32) -> round to 7 mantissa bits (bf16)-> 16-high-bit u32.
     //
     // NOTE: Use a ReducePrecision operation instead of a cast to BF16 and back
@@ -702,7 +706,7 @@ class MaxPoolGradGradOp : public XlaOpKernel {
       const xla::Shape scalar = xla::ShapeUtil::MakeShape(xla::F32, {});
       auto lhs = xla::Parameter(rb.get(), 0, scalar, "lhs");
       auto rhs = xla::Parameter(rb.get(), 1, scalar, "rhs");
-      auto sixteen = xla::ConstantR0<int32_t>(rb.get(), 16);
+      auto sixteen = xla::ConstantR0<int32>(rb.get(), 16);
       auto lhs_criteria =
           xla::ShiftLeft(xla::ShiftRightLogical(
                              xla::BitcastConvertType(lhs, xla::S32), sixteen),
@@ -749,7 +753,7 @@ class MaxPool2DGradGradOp : public MaxPoolGradGradOp {
  public:
   explicit MaxPool2DGradGradOp(OpKernelConstruction* ctx)
       : MaxPoolGradGradOp(ctx, /*num_spatial_dims=*/2) {
-    std::string data_format;
+    string data_format;
     OP_REQUIRES_OK(ctx, ctx->GetAttr("data_format", &data_format));
     OP_REQUIRES(ctx, FormatFromString(data_format, &data_format_),
                 errors::InvalidArgument("Invalid data format"));
@@ -767,7 +771,7 @@ class MaxPool3DGradGradOp : public MaxPoolGradGradOp {
  public:
   explicit MaxPool3DGradGradOp(OpKernelConstruction* ctx)
       : MaxPoolGradGradOp(ctx, /*num_spatial_dims=*/3) {
-    std::string data_format;
+    string data_format;
     OP_REQUIRES_OK(ctx, ctx->GetAttr("data_format", &data_format));
     OP_REQUIRES(ctx, FormatFromString(data_format, &data_format_),
                 errors::InvalidArgument("Invalid data format"));

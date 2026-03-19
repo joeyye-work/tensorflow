@@ -67,8 +67,8 @@ int64_t FindMostFrequentScatterDim(
     frequency.resize(std::max(dim + 1, static_cast<int64_t>(frequency.size())),
                      0);
     frequency[dim]++;
-    min_rank = std::min(min_rank,
-                        static_cast<int64_t>(it->shape().dimensions().size()));
+    min_rank =
+        std::min(min_rank, static_cast<int64_t>(it->shape().dimensions_size()));
   }
 
   int64_t most_frequent_dim = std::distance(
@@ -126,14 +126,14 @@ absl::Status CombineReduceScatters(
 
       // Build permutation to align gather dimension.
       auto& perm = operand_permutations.back();
-      perm = std::vector<int64_t>(operand_shape.dimensions().size());
+      perm = std::vector<int64_t>(operand_shape.dimensions_size());
       std::iota(perm->begin(), perm->end(), 0);
       std::swap((*perm)[most_frequent_dim], (*perm)[rs->scatter_dimension()]);
 
       // Bitcast operand and update output shape.
+      auto sh = ShapeUtil::PermuteDimensions(*perm, operand_shape), operand;
       operands.back() =
-          computation.AddInstruction(HloInstruction::CreateBitcast(
-              ShapeUtil::PermuteDimensions(*perm, operand_shape), operand));
+          computation.AddInstruction(HloInstruction::CreateBitcast(sh));
       output_shapes.back() = ShapeUtil::PermuteDimensions(*perm, hlo->shape());
     }
   }
@@ -256,7 +256,7 @@ ReduceScatterCombiner::ReduceScatterCombiner(int64_t combine_threshold_in_bytes,
       combine_by_dim_(combine_by_dim),
       combine_while_loops_(combine_while_loops) {}
 
-absl::StatusOr<bool> ReduceScatterCombiner::RunImpl(
+absl::StatusOr<bool> ReduceScatterCombiner::Run(
     HloModule* module,
     const absl::flat_hash_set<absl::string_view>& execution_threads) {
   TF_ASSIGN_OR_RETURN(

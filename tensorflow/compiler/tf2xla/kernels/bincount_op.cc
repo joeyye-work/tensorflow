@@ -117,9 +117,13 @@ class DenseBincountOp : public XlaOpKernel {
           xla::ShapeUtil::MakeShape(input_xla_type, {input_shape.dimensions()});
       auto i = xla::Iota(ctx->builder(), i_shape, 0);
       i = xla::Reshape(
-          i, {input_shape.dimensions(0) * input_shape.dimensions(1), 1});
+          i, {input_shape.dimensions(0) * input_shape.dimensions(1), 1},
+          {(*input_shape.expressions(0) * *input_shape.expressions(1))->s(),
+           xla::DynExpr::one});
       auto j = xla::Reshape(
-          input, {input_shape.dimensions(0) * input_shape.dimensions(1), 1});
+          input, {input_shape.dimensions(0) * input_shape.dimensions(1), 1},
+          {(*input_shape.expressions(0) * *input_shape.expressions(1))->s(),
+           xla::DynExpr::one});
       std::vector<xla::XlaOp> iotas_to_concat;
       iotas_to_concat.push_back(i);
       iotas_to_concat.push_back(j);
@@ -130,7 +134,8 @@ class DenseBincountOp : public XlaOpKernel {
           zero, {output_shape.dimensions(0), output_shape.dimensions(1)});
       if (has_weights && !binary_output_) {
         weights = xla::Reshape(
-            weights, {input_shape.dimensions(0) * input_shape.dimensions(1)});
+            weights, {input_shape.dimensions(0) * input_shape.dimensions(1)},
+            {(*input_shape.expressions(0) * *input_shape.expressions(1))->s()});
         updates = weights;
       }
     } else {

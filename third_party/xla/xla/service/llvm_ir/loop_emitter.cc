@@ -199,9 +199,9 @@ std::vector<IrArray::Index> LoopEmitter::EmitIndexAndSetExitBasicBlock(
 
   bool dynamic = false;
   for (int i = 0; i < shape_.dimensions_size(); i++) {
-    int64_t multiplier = (i == 0) ? shape_.outer_multiplier() : -1;
-    if (multiplier > 0) {
-      dynamic_dims[i] = xla::llvm_ir::GetBatchDimByName(b_, multiplier);
+    auto expr = shape_.expressions(i);
+    if (expr->is_dynamic()) {
+      dynamic_dims[i] = xla::llvm_ir::EmitExpression(b_, expr);
       shape_.set_dynamic_dimension(i, true);
       dynamic = true;
     }

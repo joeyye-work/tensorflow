@@ -929,8 +929,8 @@ absl::Status CpuCompiler::RunHloPassesAfterLayoutAssn(
     pipeline.AddPass<SmallWhileLoopHoistingPass>(byte_threshold);
   }
 
-  pipeline.AddPass<OuterDimensionPropagationPass>();
-  pipeline.AddPass<GetOuterBatchValueSimplifier>();
+  // pipeline.AddPass<OuterDimensionPropagationPass>();
+  // pipeline.AddPass<GetOuterBatchValueSimplifier>();
   pipeline.AddPass<HloDCE>();
   return pipeline.Run(module).status();
 }

@@ -100,6 +100,9 @@ absl::Status XLAShapeToTensorShape(const xla::Shape& shape,
   for (int i = 0; i < shape.dimensions().size(); ++i) {
     TF_RETURN_IF_ERROR(tensor_shape->AddDimWithStatus(shape.dimensions(i)));
   }
+  std::vector<xla::DynExpr*> bexprs(shape.expressions().begin(),
+                                    shape.expressions().end());
+  tensor_shape->set_expressions(bexprs);
   return absl::OkStatus();
 }
 
@@ -167,6 +170,7 @@ xla::Shape TensorShapeToXLAShape(xla::PrimitiveType type,
   }
   int rank = tensor_shape.dims();
   std::vector<int64_t> dimensions(rank);
+  std::vector<xla::DynExpr*> expressions(rank);
   std::vector<int64_t> layout(rank);
   for (int d = 0; d < rank; ++d) {
     dimensions[d] = tensor_shape.dim_size(d);
@@ -175,11 +179,13 @@ xla::Shape TensorShapeToXLAShape(xla::PrimitiveType type,
                       "shape; returning unknown sentinel value";
       return xla::ShapeUtil::MakeShapeWithDenseLayout(type, {0}, {0});
     }
+    expressions[d] = tensor_shape.get_expression(d);
   }
   // XLA uses minor-to-major; Tensorflow uses major-to-minor.
   std::iota(layout.rbegin(), layout.rend(), 0);
   xla::Shape result =
       xla::ShapeUtil::MakeShapeWithDenseLayout(type, dimensions, layout);
+  result.set_expressions(expressions);
   return result;
 }
 
@@ -200,18 +206,29 @@ absl::StatusOr<xla::Shape> TensorShapeToXLAShape(
   return out;
 }
 
+inline static int var_id = 1;
+
 xla::Shape TensorShapeToXLAShape(xla::PrimitiveType type,
                                  const TensorShape& tensor_shape) {
   int rank = tensor_shape.dims();
   std::vector<int64_t> dimensions(rank);
   std::vector<int64_t> layout(rank);
+  std::vector<xla::DynExpr*> expressions(rank);
+
   for (int d = 0; d < rank; ++d) {
     dimensions[d] = tensor_shape.dim_size(d);
+    expressions[d] = (d < tensor_shape.get_expressions().size())
+                         ? tensor_shape.get_expression(d)
+                         : xla::DynExpr::_(dimensions[d]);
   }
+
   // XLA uses minor-to-major; Tensorflow uses major-to-minor.
   std::iota(layout.rbegin(), layout.rend(), 0);
 
-  return xla::ShapeUtil::MakeShapeWithDenseLayout(type, dimensions, layout);
+  auto shape =
+      xla::ShapeUtil::MakeShapeWithDenseLayout(type, dimensions, layout);
+  shape.set_expressions(expressions);
+  return shape;
 }
 
 absl::StatusOr<std::vector<int>> GetShapeLayoutVector(const xla::Shape& shape) {

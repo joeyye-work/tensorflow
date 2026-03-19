@@ -118,7 +118,8 @@ class ScatterNdOp : public XlaOpKernel {
 
     xla::XlaBuilder* builder = context->builder();
     auto buffer = xla::Broadcast(XlaHelpers::Zero(builder, dtype),
-                                 buffer_shape.dim_sizes());
+                                 buffer_shape.dim_sizes(),
+                                 buffer_shape.get_expressions());
     auto indices = context->Input(0);
     auto updates = context->Input(1);
     auto combine =

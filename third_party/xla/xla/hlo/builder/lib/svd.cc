@@ -152,9 +152,9 @@ absl::StatusOr<HouseHolderResult> HouseRow(
   auto beta = Div(ScalarLike(v_0j, 2.0),
                   (Square(Div(sigma, v_0j, broadcast_dims)) + one));
 
-  v = Select(
-      BroadcastInDim(Lt(sigma, eps), x_shape.dimensions(), broadcast_dims), v,
-      v / v_0j);
+  v = Select(BroadcastInDim(Lt(sigma, eps), x_shape.dimensions(),
+                            broadcast_dims, x_shape.expressions()),
+             v, v / v_0j);
   v = Select(Eq(idx, j), zeros + one, v);
 
   beta = Select(Lt(Add(sigma, ZerosLike(beta), broadcast_dims), eps),
@@ -219,9 +219,9 @@ absl::StatusOr<HouseHolderResult> HouseCol(
   auto beta = Div(ScalarLike(v_0i, 2.0),
                   (Square(Div(sigma, v_0i, broadcast_dims)) + one));
 
-  v = Select(
-      BroadcastInDim(Lt(sigma, eps), x_shape.dimensions(), broadcast_dims), v,
-      v / v_0i);
+  v = Select(BroadcastInDim(Lt(sigma, eps), x_shape.dimensions(),
+                            broadcast_dims, x_shape.expressions()),
+             v, v / v_0i);
   v = Select(Eq(idx, i), zeros + one, v);
 
   beta = Select(Lt(Add(sigma, ZerosLike(beta), broadcast_dims), eps),
@@ -582,11 +582,11 @@ absl::StatusOr<XlaOp> ComputeToleranceComparison(XlaOp w, XlaOp epsilon) {
   diag = Select(Lt(diag, ZerosLike(diag)), -diag, diag);
   std::vector<int64_t> broadcasted_dims(num_dims - 1);
   std::iota(broadcasted_dims.begin(), broadcasted_dims.end(), 0);
-  auto broadcast_to_rows =
-      BroadcastInDim(diag, shape.dimensions(), broadcasted_dims);
+  auto broadcast_to_rows = BroadcastInDim(
+      diag, shape.dimensions(), broadcasted_dims, shape.expressions());
   broadcasted_dims.back() = num_dims - 1;
-  auto broadcast_to_columns =
-      BroadcastInDim(diag, shape.dimensions(), broadcasted_dims);
+  auto broadcast_to_columns = BroadcastInDim(
+      diag, shape.dimensions(), broadcasted_dims, shape.expressions());
   // Compute tolerance = w_{i,i} * w_{j,j} * epsilon^2
   // Use at least F32 precision to avoid precision issues with small denormal.
   XlaOp tolerance;
@@ -745,6 +745,7 @@ absl::StatusOr<SVDResult> SortBySingularValuesAndPostProcessing(
   TF_ASSIGN_OR_RETURN(Shape shape, builder->GetShape(result.d));
   const int64_t num_dims = shape.dimensions().size();
   auto dimensions = shape.dimensions();
+  auto expressions = shape.expressions();
   const int64_t m = ShapeUtil::GetDimension(shape, -2);
   const int64_t n = ShapeUtil::GetDimension(shape, -1);
 
@@ -763,7 +764,7 @@ absl::StatusOr<SVDResult> SortBySingularValuesAndPostProcessing(
   d = Select(Ge(d, zeros), d, -d);
   result.v = Mul(result.v, sign, broadcast_dims);
 
-  d = BroadcastInDim(d, dimensions, broadcast_dims);
+  d = BroadcastInDim(d, dimensions, broadcast_dims, expressions);
 
   // As m >= n, only first n column vectors need to be permuted, and the rest of
   // m - n vectors are appended after the sorting is done.

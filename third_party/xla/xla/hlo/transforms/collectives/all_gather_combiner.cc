@@ -124,9 +124,9 @@ absl::Status CombineAllGathers(absl::Span<HloInstruction* const> to_combine,
                 (*perm)[ag->all_gather_dimension()]);
 
       // Bitcast operand and update output shape.
+      auto sh = ShapeUtil::PermuteDimensions(*perm, operand_shape);
       operands.back() =
-          computation.AddInstruction(HloInstruction::CreateBitcast(
-              ShapeUtil::PermuteDimensions(*perm, operand_shape), operand));
+          computation.AddInstruction(HloInstruction::CreateBitcast(sh, operand));
       output_shapes.back() = ShapeUtil::PermuteDimensions(*perm, hlo->shape());
     }
   }
@@ -269,7 +269,7 @@ absl::StatusOr<bool> AllGatherCombiner::RunWithKeyCombiner(
   return changed;
 }
 
-absl::StatusOr<bool> AllGatherCombiner::RunImpl(
+absl::StatusOr<bool> AllGatherCombiner::Run(
     HloModule* module,
     const absl::flat_hash_set<absl::string_view>& execution_threads) {
   TF_ASSIGN_OR_RETURN(

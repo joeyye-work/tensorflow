@@ -570,7 +570,7 @@ class IrEmitter : public DfsHloVisitorWithDefault,
   // Emits LLVM IR to transfer "element_count" elements of type "primitive_type"
   // from the address "source" to the address "target".
   void EmitTransferElements(llvm::Value* target, llvm::Value* source,
-                            int64_t element_count, PrimitiveType primitive_type,
+                            xla::DynExpr* element_count, PrimitiveType primitive_type,
                             const llvm_ir::IrArray& target_array,
                             const llvm_ir::IrArray& source_array);
 
@@ -860,7 +860,7 @@ class IrEmitter : public DfsHloVisitorWithDefault,
 
 // Decoupled implementation of IrEmitter::EmitTransferElements.
 void EmitTransferElements(llvm::Value* target, llvm::Value* source,
-                          int64_t element_count, PrimitiveType primitive_type,
+                          xla::DynExpr* element_count, PrimitiveType primitive_type,
                           const llvm_ir::IrArray& target_array,
                           const llvm_ir::IrArray& source_array,
                           llvm::Module* module, llvm::IRBuilderBase& b);

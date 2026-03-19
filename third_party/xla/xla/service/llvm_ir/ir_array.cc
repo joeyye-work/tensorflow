@@ -281,8 +281,11 @@ IrArray::Index IrArray::Index::SourceIndexOfReshape(
       // linear index by each dimension size.
       for (int64_t i = common_factors[k + 1].first - 1;
            i >= common_factors[k].first; --i) {
+        bool is_dynamic = input_shape.expressions(i)->is_dynamic();
         llvm::Value* divisor =
-            GetConstantWithIndexType(input_shape.dimensions(i));
+            is_dynamic ? llvm_ir::EmitExpression(builder,
+                                                 input_shape.expressions(i))
+                       : GetConstantWithIndexType(input_shape.dimensions(i));
         if (input_shape.dimensions(i) == 1) {
           source_multidim_index[i] = GetConstantWithIndexType(0);
         } else if (i == common_factors[k].first) {
@@ -560,42 +563,24 @@ llvm::Value* IrArray::EmitArrayElementAddress(const IrArray::Index& index,
     gep_indices.push_back(actual_index[dimension]);
   }
 
-#define DYN_DIMS
-#ifdef DYN_DIMS
-
-  llvm::ArrayType* outerArray = llvm::dyn_cast<llvm::ArrayType>(pointee_type_);
-
-  CHECK(outerArray) << "Expected outer array type.";
-
-  llvm::Value* gep;
-
-  if (shape_.outer_multiplier() > 0) {
-
-    // Extract the inner array type: [N x T]
-    llvm::Type* innerArray = outerArray->getElementType();
-
-    CHECK(innerArray) << "Expected inner array type.";
-
-    // Create a new array type: [0 x [N x T]]
-    llvm::ArrayType* zeroOuterArray = llvm::ArrayType::get(innerArray, 0);
-
-    llvm::PointerType* newPtrTy = llvm::PointerType::getUnqual(zeroOuterArray);
-    llvm::Value* castedPtr = b->CreateBitCast(base_ptr_, newPtrTy);
-
-    gep =
-        b->CreateInBoundsGEP(zeroOuterArray,
-                            castedPtr,
-                            gep_indices, llvm_ir::AsStringRef(name));
+  // Do not make a dynamic "GEP" if only the first dimension is dynamic since
+  // it's always indiced with 0 (i.e. the dynamic dimension has no impact on the
+  // address computation).
+  auto expressions = shape_.expressions();
+  bool dynamic_first_dim =
+      expressions[0]->is_dynamic() &&
+      std::all_of(expressions.begin() + 1, expressions.end(),
+                  [](DynExpr* e) { return e->is_constant(); });
+  if (!dynamic_first_dim && shape_.has_dynamic_expr()) {
+    llvm::Type* element_type =
+        PrimitiveTypeToIrType(shape_.element_type(), b->getContext());
+    return llvm_ir::createDynamicGEP(
+        b, base_ptr_, gep_indices, shape_.dimensions(), expressions,
+        element_type, llvm_ir::AsStringRef(name));
   } else {
-    gep = b->CreateInBoundsGEP(pointee_type_, base_ptr_, gep_indices,
-                               llvm_ir::AsStringRef(name));
+    return b->CreateInBoundsGEP(pointee_type_, base_ptr_, gep_indices,
+                                llvm_ir::AsStringRef(name));
   }
-#else
-  auto gep = b->CreateInBoundsGEP(pointee_type_, base_ptr_, gep_indices,
-                                  llvm_ir::AsStringRef(name));
-#endif
-
-  return gep;
 }
 
 llvm::Value* IrArray::EmitLinearArrayElementAddress(

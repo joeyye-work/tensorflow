@@ -327,7 +327,7 @@ void ConsiderConstantFoldableNode(
     std::unordered_map<const Node*, gtl::FlatSet<Node*>>* constant_control_deps,
     std::unordered_map<const Node*, std::vector<Tensor>>* shape_replacement_map,
     bool* internal_node_inserted) {
-  if (!IsConstantFoldable(n, opts.shape_map, opts.consider,
+    if (!IsConstantFoldable(n, opts.shape_map, opts.consider,
                           opts.max_constant_size_in_bytes,
                           shape_replacement_map)) {
     return;
@@ -630,8 +630,8 @@ absl::Status ConstantFold(const ConstantFoldingOptions& opts,
   std::atomic_int_fast64_t constant_unique_id{0};
   if (generate_new_name == nullptr) {
     generate_new_name = [&constant_unique_id](Graph* graph, string old_name) {
-      return absl::StrCat(graph->NewName(old_name), "__cf__",
-                          constant_unique_id.fetch_add(1));
+      return strings::StrCat(graph->NewName(old_name), "__cf__",
+                             constant_unique_id.fetch_add(1));
     };
   }
 
@@ -676,7 +676,7 @@ absl::Status ConstantFold(const ConstantFoldingOptions& opts,
             });
   for (auto n : tensors_to_fetch_sorted) {
     tensors_to_fetch_names.push_back(
-        absl::StrCat(n.first.first->name(), ":", n.first.second));
+        strings::StrCat(n.first.first->name(), ":", n.first.second));
     tensors_to_replace.push_back(n.second);
   }
 

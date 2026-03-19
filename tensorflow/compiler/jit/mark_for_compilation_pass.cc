@@ -70,6 +70,9 @@ limitations under the License.
 #include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/public/version.h"
 #include "tensorflow/core/util/dump_graph.h"
+#include "tensorflow/core/framework/tensor_shape.pb.h"
+#include "tensorflow/core/grappler/costs/graph_properties.h"
+#include "tensorflow/core/grappler/grappler_item.h"
 
 namespace tensorflow {
 
@@ -1919,7 +1922,6 @@ absl::Status MarkForCompilationPassImpl::Run() {
     // MarkForCompilationPassImpl is not set up to run the subsequent phases.
     return absl::OkStatus();
   }
-
   TF_RETURN_IF_ERROR(RunEdgeContractionLoop());
   TF_RETURN_IF_ERROR(DeclusterNodes());
   TF_RETURN_IF_ERROR(CreateClusters());

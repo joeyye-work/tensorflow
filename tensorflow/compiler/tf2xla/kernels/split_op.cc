@@ -81,17 +81,21 @@ class SplitOp : public XlaOpKernel {
     // All the slices are the same size: this is the size along the
     // split dimension.
     const int32_t slice_size = input_shape.dim_size(split_dim) / num_split;
+    auto slice_expr = *input_shape.get_expression(split_dim) / num_split;
 
     // The vectors we will use to define the slice. The entry for the
     // split dimensions varies for each output.
     std::vector<int64_t> begin(input_shape.dims(), 0);
     std::vector<int64_t> limits(input_shape.dims());
+    std::vector<xla::DynExpr*> begin_expr(input_shape.dims(), xla::DynExpr::zero);
+    std::vector<xla::DynExpr*> limits_expr(input_shape.dims());
     std::vector<int64_t> strides(input_shape.dims(), 1);
     for (int i = 0; i < input_shape.dims(); ++i) {
       // Initially set up the limits to be the full size of the input:
       // the split dimension is filled in below.
       int64_t dim = input_shape.dim_size(i);
       limits[i] = dim;
+      limits_expr[i] = input_shape.get_expression(i);
     }
 
     // Create each of the outputs.
@@ -99,7 +103,12 @@ class SplitOp : public XlaOpKernel {
       // Slice out the ith split from the split dimension.
       begin[split_dim] = i * slice_size;
       limits[split_dim] = (i + 1) * slice_size;
-      ctx->SetOutput(i, xla::Slice(input, begin, limits, strides));
+
+      begin_expr[split_dim] = i * *slice_expr;
+      limits_expr[split_dim] = (*xla::DynExpr::_(i + 1) * *slice_expr)->s();
+
+      ctx->SetOutput(i, xla::Slice(input, begin, limits, begin_expr,
+                                   limits_expr, strides));
     }
   }
 };

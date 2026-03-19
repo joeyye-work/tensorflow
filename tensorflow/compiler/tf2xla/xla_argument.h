@@ -53,9 +53,6 @@ struct XlaArgument {
     kTensorList,
   };
 
-  //To keep dynamic dim as an attribute of the argument.
-  int64_t dynamic_dim = -1;
-
   Kind kind = kInvalid;
 
   // The type of the argument. If the argument is a resource, this
@@ -119,6 +116,7 @@ struct XlaArgument {
 
   // Returns the dimension sizes for either TensorShape or xla::Shape.
   std::vector<int64_t> DimensionSizes() const;
+  std::vector<xla::DynExpr*> DimensionExpressions() const;
   absl::InlinedVector<int64_t, 4> DimensionSizesAsInlinedVector() const;
 
   // Returns the human-readable string for either TensorShape or xla::Shape.

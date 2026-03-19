@@ -19,9 +19,9 @@ class GetOuterBatchValueRewriteVisitor : public DfsHloRewriteVisitor {
     if (instr->operand_count() != 1) return absl::OkStatus();
     const HloInstruction* input = instr->operand(0);
     const Shape& in_shape = input->shape();
-    int64_t multiplier = in_shape.outer_multiplier();
+    auto expression = in_shape.expressions(0);
 
-    if (multiplier != -1) return absl::OkStatus();
+    if (expression->is_dynamic()) return absl::OkStatus();
 
     int64_t batch_size = in_shape.dimensions(0);
     auto const_instr =

@@ -361,7 +361,7 @@ message ShapeProto {
   // The layout used to back this shape.
   LayoutProto layout = 5;
 
-  int64 batch_multiplier = 7;
+  repeated ExpressionProto expressions = 7;
 
   // Important: if any field is added, be sure to modify ShapeUtil::Equal(),
   // ShapeUtil::Compatible() and Shape::Hash() appropriately to account for the
@@ -1205,4 +1205,35 @@ message OriginalArrayProto {
 
 message OriginalValueProto {
   repeated OriginalArrayProto leaves = 1;
+}
+
+message ExpressionProto {
+  oneof node_type {
+    int32 constant_value = 1;  // cons
+    int32 variable_id = 2;     // var
+    AddNode add_node = 3;      // exp + exp
+    SubNode sub_node = 4;      // exp - exp
+    MulNode mul_node = 5;      // exp * exp
+    DivNode div_node = 6;      // exp / exp
+  }
+}
+
+message AddNode {
+  ExpressionProto lhs = 1;
+  ExpressionProto rhs = 2;
+}
+
+message SubNode {
+  ExpressionProto lhs = 1;
+  ExpressionProto rhs = 2;
+}
+
+message MulNode {
+  ExpressionProto lhs = 1;
+  ExpressionProto rhs = 2;
+}
+
+message DivNode {
+  ExpressionProto lhs = 1;
+  ExpressionProto rhs = 2;
 }

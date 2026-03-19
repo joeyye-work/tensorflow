@@ -247,6 +247,8 @@ typedef struct XLA_Shape {
   int element_type;
   Int64List dimensions;
   BoolList dynamic_dimensions;
+  Int64List batch_multipliers;
+  Int64List batch_offsets;
   struct XLA_Shape* tuple_shapes;  // owned
   int ntuple_shapes;
   bool has_layout;

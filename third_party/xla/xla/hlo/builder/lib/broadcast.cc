@@ -19,20 +19,21 @@ limitations under the License.
 #include <vector>
 
 #include "absl/algorithm/container.h"
-#include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/types/span.h"
 #include "xla/hlo/builder/xla_builder.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/status_macros.h"
+#include "tsl/platform/errors.h"
+#include "tsl/platform/statusor.h"
 
 namespace xla {
 
-absl::StatusOr<XlaOp> BroadcastTo(XlaOp input,
-                                  absl::Span<int64_t const> output_dims) {
+absl::StatusOr<XlaOp> BroadcastTo(
+    XlaOp input, absl::Span<int64_t const> output_dims,
+    absl::Span<xla::DynExpr* const> output_exprs) {
   XlaBuilder* builder = input.builder();
   TF_ASSIGN_OR_RETURN(Shape input_shape, builder->GetShape(input));
   absl::Span<int64_t const> input_dims = input_shape.dimensions();
@@ -42,10 +43,10 @@ absl::StatusOr<XlaOp> BroadcastTo(XlaOp input,
   }
 
   if (input_dims.size() > output_dims.size()) {
-    return absl::InvalidArgumentError(absl::StrCat(
+    return tsl::errors::InvalidArgument(
         "Input shape (", ShapeUtil::HumanString(input_shape),
         ") must have rank less than or equal to the output shape [",
-        absl::StrJoin(output_dims, ","), "]"));
+        absl::StrJoin(output_dims, ","), "]");
   }
 
   std::vector<int64_t> broadcast_dims;
@@ -56,10 +57,10 @@ absl::StatusOr<XlaOp> BroadcastTo(XlaOp input,
     if (input_it != input_dims.rend()) {
       if (!(*output_it == 0 && *input_it == 0) &&
           !(*input_it != 0 && *output_it % *input_it == 0)) {
-        return absl::InvalidArgumentError(
-            absl::StrCat("Invalid shape broadcast from ",
-                         ShapeUtil::HumanString(input_shape), " to [",
-                         absl::StrJoin(output_dims, ","), "]"));
+        return tsl::errors::InvalidArgument(
+            "Invalid shape broadcast from ",
+            ShapeUtil::HumanString(input_shape), " to [",
+            absl::StrJoin(output_dims, ","), "]");
       }
 
       broadcast_dims.push_back(broadcast_shape.size());
@@ -79,15 +80,37 @@ absl::StatusOr<XlaOp> BroadcastTo(XlaOp input,
   }
   TF_RET_CHECK(input_it == input_dims.rend());
 
+  absl::Span<DynExpr* const> input_exprs = input_shape.expressions();
+  std::vector<DynExpr*> broadcast_exprs;
+  auto input_et = input_exprs.rbegin();
+  for (auto output_et = output_exprs.rbegin(); output_et != output_exprs.rend();
+       ++output_et) {
+    if (input_et != input_exprs.rend()) {
+      if (*(*output_et) == *(*input_et) ||
+          (*input_et)->is_constant() && (*input_et)->get_val() == 1) {
+        broadcast_exprs.push_back(*output_et);
+      } else if (!(*(*output_et) == *(*input_et))) {
+        broadcast_exprs.push_back(*input_et);
+        broadcast_exprs.push_back((**output_et / **input_et)->s());
+      }
+      ++input_et;
+    } else {
+      broadcast_exprs.push_back(*output_et);
+    }
+  }
+
   absl::c_reverse(broadcast_dims);
   int broadcast_shape_size = broadcast_shape.size();
   for (int64_t& broadcast_dim : broadcast_dims) {
     broadcast_dim = broadcast_shape_size - broadcast_dim - 1;
   }
   absl::c_reverse(broadcast_shape);
-  XlaOp output = BroadcastInDim(input, broadcast_shape, broadcast_dims);
+  absl::c_reverse(broadcast_exprs);
+
+  XlaOp output =
+      BroadcastInDim(input, broadcast_shape, broadcast_dims, broadcast_exprs);
   if (broadcast_shape != output_dims) {
-    output = Reshape(output, output_dims);
+    output = Reshape(output, output_dims, output_exprs);
   }
   return output;
 }

@@ -104,7 +104,7 @@ llvm::Value* EmitGetTupleElement(const Shape& target_shape, int64_t index,
   llvm::LoadInst* src_buffer = b->CreateLoad(element_pointee_type, element_ptr);
 
   // Mark the loaded pointer as dereferenceable if we know its shape.
-  if (!target_shape.IsOpaque()) {
+  if (!target_shape.IsOpaque() && !target_shape.has_dynamic_expr()) {
     SetDereferenceableMetadataForLoad(
         src_buffer,
         ByteSizeOf(target_shape, src_buffer->getModule()->getDataLayout()));

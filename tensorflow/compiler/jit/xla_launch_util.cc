@@ -432,19 +432,30 @@ absl::Status XlaComputationLaunchContext::PopulateOutputs(
   } else {
     for (int i = 0; i < ctx->num_outputs(); ++i) {
       xla::Shape output_host_shape = output.on_host_shape();
-      const xla::Shape& subshape = xla::ShapeUtil::GetSubshape(output_host_shape, {i});
+      const xla::Shape& subshape =
+          xla::ShapeUtil::GetSubshape(output_host_shape, {i});
       VLOG(2) << "PopulateOutputs: subshape[" << i << "]: "<< subshape;
       TensorShape shape;
       TF_RETURN_IF_ERROR(XLAShapeToTensorShape(subshape, &shape));
-      if (subshape.outer_multiplier() > 0) {
-        BatchSizeResource* bsr = nullptr;
-        ScopedStepContainer* step_container = ctx->step_container();
-        TF_RETURN_IF_ERROR(step_container->Lookup<BatchSizeResource>(
-                       ctx->resource_manager(), BatchSizeResourceName, &bsr));
-        auto bsm = bsr->GetBatchSize() * subshape.outer_multiplier() ;
-        shape.set_dim(0, bsm);
+      bool has_dynamic = false;
+
+      for(int i = 0 ; i < subshape.expressions().size(); ++i){
+        auto expr = subshape.expressions(i);
+        if (expr->is_dynamic()){
+          has_dynamic = true;
+          BatchSizeResource* bsr = nullptr;
+          ScopedStepContainer* step_container = ctx->step_container();
+          TF_RETURN_IF_ERROR(step_container->Lookup<BatchSizeResource>(
+                        ctx->resource_manager(), BatchSizeResourceName, &bsr));
+          xla::DynExpr* batch_size = xla::DynExpr::_(bsr->GetBatchSize());
+          // Just substitute Var(1) for now.
+          xla::DynExpr* subst_expr = expr->substitute(1, batch_size)->s();
+          shape.set_dim(i, subst_expr->get_val());
+          bsr->Unref();
+        }
+      }
+      if (has_dynamic) {
         output_tensor_shapes.push_back(shape);
-        bsr->Unref();
       }
       else {
         output_tensor_shapes.push_back(compilation_result->outputs[i].shape);

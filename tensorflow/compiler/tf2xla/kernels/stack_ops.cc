@@ -120,7 +120,7 @@ class StackOp : public XlaOpKernel {
 
  private:
   DataType dtype_;
-  std::string stack_name_;
+  string stack_name_;
 
   StackOp(const StackOp&) = delete;
   void operator=(const StackOp&) = delete;
@@ -152,19 +152,20 @@ class StackPushOp : public XlaOpKernel {
 
     // start_indices of the DynamicUpdateSlice are [index, 0, 0, ..., 0].
     std::vector<xla::XlaOp> start_indices(elem_shape.dims() + 1,
-                                          xla::ConstantR0<int32_t>(b, 0));
+                                          xla::ConstantR0<int32>(b, 0));
     start_indices[0] = index;
 
     TensorShape slice_shape = elem_shape;
     slice_shape.InsertDim(0, 1LL);
-    auto update = xla::Reshape(value, slice_shape.dim_sizes());
+    auto update = xla::Reshape(value, slice_shape.dim_sizes(),
+                               slice_shape.get_expressions());
 
     // TODO(phawkins): We don't check the index is in bounds --- there is no
     // error mechanism in XLA.
     OP_REQUIRES_OK(ctx,
                    resource->SetValue(xla::Tuple(
                        b, {xla::DynamicUpdateSlice(ta, update, start_indices),
-                           xla::Add(index, xla::ConstantR0<int32_t>(b, 1))})));
+                           xla::Add(index, xla::ConstantR0<int32>(b, 1))})));
 
     ctx->SetOutput(0, value);
   }
@@ -204,12 +205,12 @@ class StackPopOp : public XlaOpKernel {
     xla::XlaOp ta = xla::GetTupleElement(state, 0);
     xla::XlaOp index = xla::GetTupleElement(state, 1);
 
-    index = Sub(index, xla::ConstantR0<int32_t>(b, 1));
+    index = Sub(index, xla::ConstantR0<int32>(b, 1));
     OP_REQUIRES_OK(ctx, resource->SetValue(xla::Tuple(b, {ta, index})));
 
     // start_indices of the DynamicSlice are [index, 0, 0, ..., 0].
     std::vector<xla::XlaOp> start_indices(stack_shape.dims(),
-                                          xla::ConstantR0<int32_t>(b, 0));
+                                          xla::ConstantR0<int32>(b, 0));
     start_indices[0] = index;
 
     auto slice_shape = stack_shape.dim_sizes();
