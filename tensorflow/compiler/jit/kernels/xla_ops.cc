@@ -596,23 +596,27 @@ absl::Status CompileToLocalExecutable(
       }
 
       auto& arg = norm_args[arg_index];
-      // Only scalar integer constants can stand in for a folded batch-size
-      // value. Rewriting the first element of a larger tensor would corrupt it.
-      if (arg.kind != XlaCompiler::Argument::kConstant ||
-          arg.constant_value.NumElements() != 1) {
+      if (arg.kind != XlaCompiler::Argument::kConstant) {
+        return;
+      }
+
+      const bool is_scalar = TensorShapeUtils::IsScalar(arg.constant_value.shape());
+      const bool is_vector = TensorShapeUtils::IsVector(arg.constant_value.shape()) &&
+                             arg.constant_value.NumElements() > 0;
+      if (!is_scalar && !is_vector) {
         return;
       }
 
       if (arg.constant_value.dtype() == DT_INT32) {
         const int32 old_value = arg.constant_value.flat<int32>()(0);
-        // Heuristic: rewrite only scalar constants whose runtime value matches
-        // the observed dynamic batch size.
+        // Heuristic: rewrite only scalar constants or shape-like int vectors
+        // whose leading entry matches the observed runtime batch size.
         if (old_value == dynamic_dim_value) {
           // Deep-copy before rewrite so the compile-time patch does not mutate
           // a Tensor buffer shared with caller-visible inputs.
           Tensor scalar_copy(arg.constant_value.dtype(),
                              arg.constant_value.shape());
-          scalar_copy.flat<int32>()(0) = old_value;
+          scalar_copy.flat<int32>() = arg.constant_value.flat<int32>();
           arg.constant_value = std::move(scalar_copy);
           arg.constant_value.flat<int32>()(0) =
               static_cast<int32>(filled_batch);
@@ -623,7 +627,7 @@ absl::Status CompileToLocalExecutable(
         if (old_value == dynamic_dim_value) {
           Tensor scalar_copy(arg.constant_value.dtype(),
                              arg.constant_value.shape());
-          scalar_copy.flat<int64_t>()(0) = old_value;
+          scalar_copy.flat<int64_t>() = arg.constant_value.flat<int64_t>();
           arg.constant_value = std::move(scalar_copy);
           arg.constant_value.flat<int64_t>()(0) = filled_batch;
         }
