@@ -117,12 +117,12 @@ class InferenceContext;
 class Dimension {
  private:
   Dimension();
-  Dimension(int64_t value, int64_t dynamic_ratio = 0, DynExpr* expr = nullptr);
+  Dimension(int64_t value, int64_t dynamic_ratio = 0, DimExpr* expr = nullptr);
   ~Dimension() {}
 
   const int64_t value_;
   const int64_t dynamic_ratio_;
-  DynExpr* expr_;
+  DimExpr* expr_;
 
   friend class InferenceContext;
   friend class ShapeManager;
@@ -585,19 +585,19 @@ class InferenceContext {
 
   inline DimensionHandle UnknownDim() { return MakeDim(kUnknownDim); }
 
-  // Create a new unknown dimension (size = -1) tagged with a DynExpr.
+  // Create a new unknown dimension (size = -1) tagged with a DimExpr.
   // The expression is owned by this context's ShapeManager.
-  DimensionHandle UnknownDimWithExpr(std::unique_ptr<DynExpr> expr);
+  DimensionHandle UnknownDimWithExpr(std::unique_ptr<DimExpr> expr);
   // Return the expression pointer for a dimension, or nullptr if none.
-  DynExpr* DimExpr(DimensionHandle d) const;
-  // Creates a constant DynExpr node for the given value.
+  DimExpr* GetDimExpr(DimensionHandle d) const;
+  // Creates a constant DimExpr node for the given value.
   // The expression is owned by this context's ShapeManager.
-  DynExpr* MakeConstExpr(int64_t v);
+  DimExpr* MakeConstExpr(int64_t v);
   // Returns the Expr representation for the given dimension:
   // - If dim has an expr, returns it
   // - If dim is known, returns a new Const expr
   // - If dim is unknown with no expr, returns nullptr
-  DynExpr* ExprForDim(DimensionHandle d);
+  DimExpr* ExprForDim(DimensionHandle d);
 
   // Returns in <val> a scalar value from an input tensor <t>.  The input tensor
   // must be a 0-dimensional int32 or int64 tensor.  Caller must ensure that the
@@ -779,7 +779,7 @@ class InferenceContext {
 
     // Returns a new dimension of the given size.  The returned value
     // is owned by this class.
-    inline DimensionHandle MakeDim(DimensionOrConstant d, int64_t dynamic_ratio = 0,  DynExpr* expr = nullptr) {
+    inline DimensionHandle MakeDim(DimensionOrConstant d, int64_t dynamic_ratio = 0,  DimExpr* expr = nullptr) {
       if (d.dim.IsSet()) {
         return d.dim;
       } else {
@@ -788,9 +788,9 @@ class InferenceContext {
       }
     }
     // Takes ownership of an expression and returns a raw pointer to it.
-    DynExpr* OwnExpr(std::unique_ptr<DynExpr> expr) {
+    DimExpr* OwnExpr(std::unique_ptr<DimExpr> expr) {
       if (!expr) return nullptr;
-      DynExpr* ptr = expr.get();
+      DimExpr* ptr = expr.get();
       all_exprs_.push_back(std::move(expr));
       return ptr;
     }
@@ -798,7 +798,7 @@ class InferenceContext {
    private:
     std::vector<Shape*> all_shapes_;    // values are owned.
     std::vector<Dimension*> all_dims_;  // values are owned.
-    std::vector<std::unique_ptr<DynExpr>> all_exprs_;   // expressions are owned.
+    std::vector<std::unique_ptr<DimExpr>> all_exprs_;   // expressions are owned.
   };
  private:
 
@@ -918,7 +918,7 @@ class InferenceContext {
 // Template and inline method implementations, please ignore
 
 inline Dimension::Dimension() : value_(InferenceContext::kUnknownDim), dynamic_ratio_(0), expr_(nullptr) {}
-inline Dimension::Dimension(int64_t value, int64_t dynamic_ratio, DynExpr* expr) : value_(value), dynamic_ratio_(dynamic_ratio), expr_(expr) {
+inline Dimension::Dimension(int64_t value, int64_t dynamic_ratio, DimExpr* expr) : value_(value), dynamic_ratio_(dynamic_ratio), expr_(expr) {
   DCHECK(value >= 0 || value == InferenceContext::kUnknownDim)
       << "Dimension must be non-negative or equal to "
          "InferenceContext::kUnknownDim but got "

@@ -145,14 +145,17 @@ std::string ExprProtoToString(const ExpressionProto& e) {
   }
 }
 
-std::map<std::string, std::vector<std::unique_ptr<DynExpr>>> test_map;
+// node mapping to multiple vectors of expressions (one for each output in
+// order)
+std::map<std::string, std::vector<std::vector<std::unique_ptr<DimExpr>>>>
+    expr_map;
 
-std::unique_ptr<DynExpr> ExprFromProto(const ExpressionProto& proto) {
+std::unique_ptr<DimExpr> ExprFromProto(const ExpressionProto& proto) {
   switch (proto.node_type_case()) {
     case ExpressionProto::kConstantValue:
-      return DynExpr::Cons(proto.constant_value());
+      return DimExpr::Cons(proto.constant_value());
     case ExpressionProto::kVariableId:
-      return DynExpr::Var(proto.variable_id());
+      return DimExpr::Var(proto.variable_id());
     case ExpressionProto::kAddNode: {
       auto lhs = ExprFromProto(proto.add_node().lhs());
       auto rhs = ExprFromProto(proto.add_node().rhs());
@@ -179,6 +182,36 @@ std::unique_ptr<DynExpr> ExprFromProto(const ExpressionProto& proto) {
     default:
       return nullptr;
   }
+}
+
+static xla::DynExpr* DimExprToDynExpr(const DimExpr* e) {
+  switch (e->kind()) {
+    case DimExpr::Kind::kConstant: {
+      auto* ac = static_cast<const Constant*>(e);
+      return xla::DynExpr::_(ac->value());
+    }
+    case DimExpr::Kind::kVariable: {
+      auto* av = static_cast<const Variable*>(e);
+      return xla::DynExpr::V(1);  // Use 1 all the time for now
+    }
+    case DimExpr::Kind::kAdd: {
+      auto* ee = static_cast<const ExprAdd*>(e);
+      return *DimExprToDynExpr(ee->lhs()) + *DimExprToDynExpr(ee->rhs());
+    }
+    case DimExpr::Kind::kSub: {
+      auto* ee = static_cast<const ExprSub*>(e);
+      return *DimExprToDynExpr(ee->lhs()) - *DimExprToDynExpr(ee->rhs());
+    }
+    case DimExpr::Kind::kMul: {
+      auto* ee = static_cast<const ExprMul*>(e);
+      return *DimExprToDynExpr(ee->lhs()) * *DimExprToDynExpr(ee->rhs());
+    }
+    case DimExpr::Kind::kDiv: {
+      auto* ee = static_cast<const ExprDiv*>(e);
+      return *DimExprToDynExpr(ee->lhs()) / *DimExprToDynExpr(ee->rhs());
+    }
+  }
+  return nullptr;
 }
 
 // Runs Grappler static inference and logs any ExpressionProto found in output
@@ -218,12 +251,13 @@ void LogExpressionsViaGraphProperties(const tensorflow::Graph& graph) {
   for (const NodeDef& n : graph_def.node()) {
     if (!props.HasOutputProperties(n.name())) continue;
     const auto& outs = props.GetOutputProperties(n.name());
+    std::vector<std::vector<std::unique_ptr<DimExpr>>> list_exprs(outs.size());
     for (int out_idx = 0; out_idx < static_cast<int>(outs.size()); ++out_idx) {
       const auto& tp = outs[out_idx];
       const TensorShapeProto& shp = tp.shape();
 
       if (shp.unknown_rank()) continue;
-      std::vector<std::unique_ptr<DynExpr>> exprs;
+      std::vector<std::unique_ptr<DimExpr>> exprs;
       for (int d = 0; d < shp.dim_size(); ++d) {
         const auto& dim = shp.dim(d);
 
@@ -239,8 +273,10 @@ void LogExpressionsViaGraphProperties(const tensorflow::Graph& graph) {
 
         ++found;
       }
-      test_map[n.name()] = std::move(exprs);
+      list_exprs[out_idx] = std::move(exprs);
     }
+    expr_map[n.name()] = std::move(list_exprs);
+
   }
 
   VLOG(1) << "[EXPR][GP] === Found " << found
@@ -585,6 +621,31 @@ Node* Encapsulator::Subgraph::MakeNodeImage(const Graph* graph_in, Node* node) {
 
 Graph* Encapsulator::Subgraph::GetGraph() const { return graph_.get(); }
 
+void ExprToProto(xla::DynExpr* expr, ExpressionProto* proto) {
+  auto e = expr->s();
+  if (xla::Constant* c = dynamic_cast<xla::Constant*>(e)) {
+    proto->set_constant_value(c->get_val());
+  } else if (xla::Variable* v = dynamic_cast<xla::Variable*>(e)) {
+    proto->set_variable_id(v->get_id());
+  } else if (xla::Add* a = dynamic_cast<xla::Add*>(e)) {
+    auto* add_msg = proto->mutable_add_node();
+    ExprToProto(a->get_lhs(), add_msg->mutable_lhs());
+    ExprToProto(a->get_rhs(), add_msg->mutable_rhs());
+  } else if (xla::Mul* m = dynamic_cast<xla::Mul*>(e)) {
+    auto* mul_msg = proto->mutable_mul_node();
+    ExprToProto(m->get_lhs(), mul_msg->mutable_lhs());
+    ExprToProto(m->get_rhs(), mul_msg->mutable_rhs());
+  } else if (xla::Sub* s = dynamic_cast<xla::Sub*>(e)) {
+    auto* sub_msg = proto->mutable_sub_node();
+    ExprToProto(s->get_lhs(), sub_msg->mutable_lhs());
+    ExprToProto(s->get_rhs(), sub_msg->mutable_rhs());
+  } else if (xla::Div* d = dynamic_cast<xla::Div*>(e)) {
+    auto* div_msg = proto->mutable_div_node();
+    ExprToProto(d->get_lhs(), div_msg->mutable_lhs());
+    ExprToProto(d->get_rhs(), div_msg->mutable_rhs());
+  }
+}
+
 absl::Status Encapsulator::Subgraph::RecordArg(
     const Edge* edge,
     const absl::flat_hash_map<const Node*, Node*>& node_images,
@@ -607,26 +668,26 @@ absl::Status Encapsulator::Subgraph::RecordArg(
     AttrSlice attrs = src_node->attrs();
     auto shape_attr = attrs.FindByString("_output_shapes");
     if (shape_attr && shape_attr->has_list()) {
+      AttrValue mutable_shape_attr = *shape_attr;
       const TensorShapeProto& shape = shape_attr->list().shape(src_slot);
-      std::vector<std::unique_ptr<DynExpr>> expressions =
-          std::move(test_map[src_node->name()]);
-      for (const auto& e : expressions) {
-        if (!e->IsConstant()) {
-          builder.Attr("_is_batch", true);
-        }
+      TensorShapeProto* tsp =
+          mutable_shape_attr.mutable_list()->mutable_shape(src_slot);
+      std::vector<std::unique_ptr<DimExpr>> expressions =
+          std::move(expr_map[src_node->name()][src_slot]);
+
+      for (int i = 0; i < expressions.size(); i++) {
+        auto ee = DimExprToDynExpr(std::move(expressions[i]).get())->s();
+        ExpressionProto* eproto = tsp->add_expressions();
+        ExprToProto(ee, eproto);
       }
-      if (shape.dim_size() >= 1 && shape.dim(0).size() == -1) {
-        VLOG(1) << "Found Dynamic dimension in " << src_node->name() << ":"
-                << src_slot;
-        builder.Attr("_is_batch", true);
-      }
+        builder.Attr("_output_shapes", {*tsp});
     } else {
       // if cluster argument is the real argument.
       auto build_attr = attrs.FindByString("_is_batch");
       if (build_attr) {
         VLOG(1) << "Found Dynamic dimension in " << src_node->name() << ":"
                 << src_slot;
-        builder.Attr("_is_batch", true);
+          builder.Attr("_dynamic_dim", 0);
       }
     }
     absl::Status s = builder.Finalize(&arg_def);
