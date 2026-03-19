@@ -41,15 +41,15 @@ struct XlaAutoJitFlag {
   // `optimization_level_general` applies.
   //
   // Experimental.
-  int32_t optimization_level_single_gpu;
-  int32_t optimization_level_general;
+  int32 optimization_level_single_gpu;
+  int32 optimization_level_general;
 };
 
 // Sets the xla_auto_jit_flag based on the given flag string. Supported syntax
 // is:
 // <number>: sets general and single_gpu setting to the provided number.
 // single-gpu(<number>): sets the single_gpu setting to the provided number.
-bool SetXlaAutoJitFlagFromFlagString(const std::string& value);
+bool SetXlaAutoJitFlagFromFlagString(const string& value);
 
 // Flags associated with the XLA bridge's mark_for_compilation_pass module.
 struct MarkForCompilationPassFlags {
@@ -57,16 +57,19 @@ struct MarkForCompilationPassFlags {
 
   // Minimum number of operators in an XLA compilation. Ignored for operators
   // placed on an XLA device or operators explicitly marked for compilation.
-  int32_t tf_xla_min_cluster_size;
+  int32 tf_xla_min_cluster_size;
 
   // Maximum number of operators in an XLA compilation.
-  int32_t tf_xla_max_cluster_size;
+  int32 tf_xla_max_cluster_size;
+
+  // Enable operator name to influence clustering decision
+  bool tf_xla_annotate_cluster_id;
 
   // If non-empty, limit XLA clustering to the following TF operations.
-  std::string tf_xla_ops_to_cluster;
+  string tf_xla_ops_to_cluster;
 
   // If non-empty, remove following operations from XLA clustering excludelist.
-  std::string tf_xla_cluster_exclude_ops;
+  string tf_xla_cluster_exclude_ops;
 
   // Dump graphs during XLA compilation.
   bool tf_xla_clustering_debug;
@@ -110,7 +113,7 @@ struct MarkForCompilationPassFlags {
   bool tf_xla_disable_strict_signature_checks;
 
   // Specifies the persistance cache prefix. Default is "xla_compile_cache"
-  std::string tf_xla_persistent_cache_prefix;
+  string tf_xla_persistent_cache_prefix;
 };
 
 // Flags associated with XLA Sparse Core.
@@ -298,8 +301,6 @@ struct MlirCommonFlags {
   // TODO(pineapplejuice233): Revisit this flag once the performance impact is verified
   // with different local CPU devices settings.
   bool tf_mlir_enable_multiple_local_cpu_devices;
-  bool tf_mlir_enable_debug_info_serialization;
-  bool tf_serialize_mlir_to_compressed_bytecode;
 };
 
 // Flags for the JitRt pipeline -- see tf_jitrt_pipeline.h for details.
