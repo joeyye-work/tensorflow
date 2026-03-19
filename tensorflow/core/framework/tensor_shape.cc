@@ -877,9 +877,9 @@ string TensorShapeRep::DebugString() const {
       strings::StrAppend(&s, dim);
     }
     if (shape.get_expression(i) != nullptr) {
-      strings::StrAppend(&s, "(");
+      strings::StrAppend(&s, "<");
       strings::StrAppend(&s, ExprToString(shape.get_expression(i)));
-      strings::StrAppend(&s, ")");
+      strings::StrAppend(&s, ">");
     }
   }
   strings::StrAppend(&s, "]");

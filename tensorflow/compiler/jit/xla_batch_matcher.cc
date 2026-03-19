@@ -5,9 +5,9 @@
 namespace tensorflow {
 
 XlaBatchMatcher::XlaBatchMatcher() {
-  const std::string& xla_compile_batch_sizes =
+  const std::string xla_compile_batch_sizes =
       xla::GetDebugOptionsFromFlags().xla_compile_batch_sizes();
-  env_str_ = std::getenv(xla_compile_batch_sizes.c_str());
+  env_str_ = xla_compile_batch_sizes.c_str();
   parse_env_config();
 }
 

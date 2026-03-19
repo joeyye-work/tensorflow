@@ -210,7 +210,7 @@ absl::Status SetOutputShapeForReshape(InferenceContext* c) {
       for (int32_t i = 0; i < c->Rank(out); ++i) {
         DimensionHandle dim = c->Dim(out, i);
         if (!c->ValueKnown(dim)) {
-          if (c->DimExpr(dim) != nullptr) {
+          if (c->GetDimExpr(dim) != nullptr) {
             TF_RETURN_IF_ERROR(
                 c->Multiply(known_out_elems, dim, &known_out_elems));
             continue;
@@ -233,7 +233,7 @@ absl::Status SetOutputShapeForReshape(InferenceContext* c) {
       for (int32_t i = 0; i < c->Rank(in); ++i) {
         DimensionHandle dim = c->Dim(in, i);
         if (!c->ValueKnown(dim)) {
-          if (c->DimExpr(dim) != nullptr) {
+          if (c->GetDimExpr(dim) != nullptr) {
             TF_RETURN_IF_ERROR(
                 c->Multiply(known_in_elems, dim, &known_in_elems));
             continue;

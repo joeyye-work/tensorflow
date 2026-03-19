@@ -170,6 +170,10 @@ class ReshapeOp : public XlaOpKernel {
       shape.set_expression(
           unknown_index, missing_expr->s());
     }
+    if(shape.num_elements() != input_shape.num_elements()){
+      LOG(INFO) << "ERROR SHAPE IS " << shape;
+      LOG(INFO) << "ERROR INPUT IS " << input_shape;
+    }
     OP_REQUIRES(ctx, shape.num_elements() == input_shape.num_elements(),
                 errors::InvalidArgument("Input to reshape is a tensor with ",
                                         input_shape.num_elements(),

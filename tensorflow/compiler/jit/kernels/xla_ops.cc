@@ -381,6 +381,72 @@ GetXlaCompilerArgsAndSnapshotVariables(
   return result;
 }
 
+
+std::unique_ptr<DimExpr> ExprFromProto(const ExpressionProto& proto) {
+  switch (proto.node_type_case()) {
+    case ExpressionProto::kConstantValue:
+      return DimExpr::Cons(proto.constant_value());
+    case ExpressionProto::kVariableId:
+      return DimExpr::Var(proto.variable_id());
+    case ExpressionProto::kAddNode: {
+      auto lhs = ExprFromProto(proto.add_node().lhs());
+      auto rhs = ExprFromProto(proto.add_node().rhs());
+      // Note: These are owning pointers, but ExprAdd takes raw pointers.
+      // The caller must manage lifetime appropriately.
+      return std::make_unique<ExprAdd>(lhs.release(), rhs.release());
+    }
+    case ExpressionProto::kSubNode: {
+      auto lhs = ExprFromProto(proto.sub_node().lhs());
+      auto rhs = ExprFromProto(proto.sub_node().rhs());
+      return std::make_unique<ExprSub>(lhs.release(), rhs.release());
+    }
+    case ExpressionProto::kMulNode: {
+      auto lhs = ExprFromProto(proto.mul_node().lhs());
+      auto rhs = ExprFromProto(proto.mul_node().rhs());
+      return std::make_unique<ExprMul>(lhs.release(), rhs.release());
+    }
+    case ExpressionProto::kDivNode: {
+      auto lhs = ExprFromProto(proto.div_node().lhs());
+      auto rhs = ExprFromProto(proto.div_node().rhs());
+      return std::make_unique<ExprDiv>(lhs.release(), rhs.release());
+    }
+    case ExpressionProto::NODE_TYPE_NOT_SET:
+    default:
+      return nullptr;
+  }
+}
+
+static xla::DynExpr* DimExprToDynExpr(const DimExpr* e) {
+  switch (e->kind()) {
+    case DimExpr::Kind::kConstant: {
+      auto* ac = static_cast<const Constant*>(e);
+      return xla::DynExpr::_(ac->value());
+    }
+    case DimExpr::Kind::kVariable: {
+      auto* av = static_cast<const Variable*>(e);
+      return xla::DynExpr::V(1);  // Use 1 all the time for now
+    }
+    case DimExpr::Kind::kAdd: {
+      auto* ee = static_cast<const ExprAdd*>(e);
+      return *DimExprToDynExpr(ee->lhs()) + *DimExprToDynExpr(ee->rhs());
+    }
+    case DimExpr::Kind::kSub: {
+      auto* ee = static_cast<const ExprSub*>(e);
+      return *DimExprToDynExpr(ee->lhs()) - *DimExprToDynExpr(ee->rhs());
+    }
+    case DimExpr::Kind::kMul: {
+      auto* ee = static_cast<const ExprMul*>(e);
+      return *DimExprToDynExpr(ee->lhs()) * *DimExprToDynExpr(ee->rhs());
+    }
+    case DimExpr::Kind::kDiv: {
+      auto* ee = static_cast<const ExprDiv*>(e);
+      return *DimExprToDynExpr(ee->lhs()) / *DimExprToDynExpr(ee->rhs());
+    }
+  }
+  return nullptr;
+}
+
+
 absl::Status CompileToLocalExecutable(
     OpKernelContext* ctx, const NameAttrList& function, bool has_ref_vars,
     const XlaPlatformInfo& platform_info,
@@ -437,31 +503,73 @@ absl::Status CompileToLocalExecutable(
     std::vector<XlaCompiler::Argument> norm_args(args.begin(), args.end());
     int64_t filled_batch = 0;
     int64_t old_batch = 0;
-    XlaBatchMatcher* xla_batch_matcher = xla_device_compiler->xla_batch_matcher();
+    XlaBatchMatcher* xla_batch_matcher =
+        xla_device_compiler->xla_batch_matcher();
     if (options.flib_def != nullptr) {
       const FunctionDef* fdef = options.flib_def->Find(function.name());
       if (fdef != nullptr) {
         for (const auto& kv : fdef->arg_attr()) {
           int arg_index = kv.first;
           const auto& attr_map = kv.second.attr();
-          auto it = attr_map.find("_is_batch");
+          const std::string& node_name =
+              fdef->signature().input_arg(arg_index).name();
 
-          const AttrValue& v = it->second;
-          if (it == attr_map.end()) continue;
-
-          if (!filled_batch && xla_batch_matcher) {
+          // Special case for _dynamic_dim...
+          auto dyn_dim_attr = attr_map.find("_dynamic_dim");
+          if (dyn_dim_attr != attr_map.end()) {
             TensorShape& shp =
                 std::get<TensorShape>(norm_args[arg_index].shape);
-            old_batch = shp.dim_size(0);
-            filled_batch =
-                xla_batch_matcher->get_xla_compile_batch(shp.dim_size(0));
+            const AttrValue& v = dyn_dim_attr->second;
+            int64_t idx = v.i();
+            if (!filled_batch && xla_batch_matcher) {
+              TensorShape& shp =
+                  std::get<TensorShape>(norm_args[arg_index].shape);
+              old_batch = shp.dim_size(0);
+              filled_batch =
+                  xla_batch_matcher->get_xla_compile_batch(old_batch);
+            }
+
+            std::vector<xla::DynExpr*> dyn_exprs;
+            for (int d : shp.dim_sizes()) {
+              dyn_exprs.push_back(xla::DynExpr::_(d));
+            }
+            dyn_exprs[idx] = xla::DynExpr::V(1);
+            shp.set_expressions(dyn_exprs);
+            continue;
           }
+          auto it = attr_map.find("_output_shapes");
+          if (it == attr_map.end()) continue;
+
+          const TensorShapeProto& proto = it->second.list().shape(0);
+          const auto& exp = proto.expressions();
           TensorShape& shp = std::get<TensorShape>(norm_args[arg_index].shape);
+
+          if (!filled_batch && xla_batch_matcher) {
+            for (int idx = 0; idx < exp.size(); ++idx) {
+              // Look for dynamic expression. If found then compute padding
+              // value and exit loop.
+              auto e = DimExprToDynExpr(ExprFromProto(exp[idx]).get())->s();
+              if (e->is_dynamic()) {
+                const std::string& node_name =
+                    fdef->signature().input_arg(arg_index).name();
+                old_batch = shp.dim_size(idx);
+                filled_batch =
+                    xla_batch_matcher->get_xla_compile_batch(old_batch);
+                break;
+              }
+            }
+          }
+
           std::vector<xla::DynExpr*> dyn_exprs;
           for (int d : shp.dim_sizes()) {
             dyn_exprs.push_back(xla::DynExpr::_(d));
           }
-          dyn_exprs[0] = xla::DynExpr::V(1);
+          for (int j = 0; j < exp.size(); ++j) {
+            auto e = DimExprToDynExpr(ExprFromProto(exp[j]).get())->s();
+            if (e->is_dynamic()) {
+              dyn_exprs[j] = e;
+            }
+          }
           shp.set_expressions(dyn_exprs);
         }
       }
