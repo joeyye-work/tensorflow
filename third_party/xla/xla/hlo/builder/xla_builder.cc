@@ -4580,6 +4580,12 @@ XlaOp XlaBuilder::GetDimensionSize(XlaOp operand, int64_t dimension) {
     TF_ASSIGN_OR_RETURN(const Shape* operand_shape, GetShapePtr(operand));
     TF_ASSIGN_OR_RETURN(Shape shape, ShapeInference::InferGetDimensionSizeShape(
                                          *operand_shape, dimension));
+    DynExpr* dim_expr = operand_shape->expressions(dimension);
+    if (dim_expr != nullptr && dim_expr->is_dynamic()) {
+      XlaOp zero = ConstantR0<int32_t>(this, 0);
+      XlaOp expr_carrier = Broadcast(zero, {1}, {dim_expr});
+      return GetShapeExprValue(expr_carrier);
+    }
     // Calling GetDimensionSize on a static dimension returns a constant
     // instruction.
     if (operand_shape->is_static_dimension(dimension)) {
@@ -6204,9 +6210,9 @@ XlaOp GetDimensionSize(const XlaOp operand, int64_t dimension) {
   return operand.builder()->GetDimensionSize(operand, dimension);
 }
 
-XlaOp GetOuterBatchValue(XlaOp operand) {
+XlaOp GetShapeExprValue(XlaOp operand) {
   XlaBuilder* builder = operand.builder();
-  return CustomCall(builder, "GetOuterBatchValue", {operand},
+  return CustomCall(builder, "GetShapeExprValue", {operand},
                              ShapeUtil::MakeShape(S32, {}), "", false, {},
                              nullptr, CustomCallSchedule::SCHEDULE_NONE,
                              CustomCallApiVersion::API_VERSION_ORIGINAL);

@@ -264,7 +264,7 @@ static absl::optional<int64_t> ComputeMultiplierForUserScalar(HloInstruction* op
     return flag_unsupport;
   }
   if (out_shape.dimensions_size() == 0 &&
-      user->IsCustomCall("GetOuterBatchValue")) {
+      user->IsCustomCall("GetShapeExprValue")) {
     return operand_mul;
   }
   if (in_shape.dimensions_size() == 0 || out_shape.dimensions_size() == 0) {

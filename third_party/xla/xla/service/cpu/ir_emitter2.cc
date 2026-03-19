@@ -196,8 +196,8 @@ absl::StatusOr<IrEmitter2::KernelInfo> IrEmitter2::EmitPadHostKernel(
 }
 
 absl::StatusOr<IrEmitter2::KernelInfo>
-IrEmitter2::EmitGetOuterBatchValueHostKernel(const HloInstruction* getBatch) {
-  VLOG(2) << "Emit GetOuterBatchValue host kernel: " << getBatch->name();
+IrEmitter2::EmitGetShapeExprValueHostKernel(const HloInstruction* getBatch) {
+  VLOG(2) << "Emit GetShapeExprValue host kernel: " << getBatch->name();
 
   TF_ASSIGN_OR_RETURN(KernelPrototype kernel_prototype,
                       EmitKernelPrototype(getBatch));

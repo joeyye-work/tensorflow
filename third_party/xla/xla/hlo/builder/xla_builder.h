@@ -3109,7 +3109,7 @@ XlaOp BatchNormGrad(XlaOp operand, XlaOp scale, XlaOp batch_mean,
 // array shaped.
 XlaOp GetDimensionSize(XlaOp operand, int64_t dimension);
 
-XlaOp GetOuterBatchValue(XlaOp operand);
+XlaOp GetShapeExprValue(XlaOp operand);
 
 // Sets the size of the given dimension of the operand. The operand must be
 // array shaped.  The result will have the same shape as the operand, but the
