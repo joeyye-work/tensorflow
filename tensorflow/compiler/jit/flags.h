@@ -125,6 +125,8 @@ struct MarkForCompilationPassFlags {
   // Setting it to -1 disables marking clusters megamorphic.
   // Setting it to 0 uses the default behaviour of TensorFlow.
   int64_t tf_xla_threshold_for_megamorphic;
+
+  bool tf_xla_cluster_single_dynamic_dim;  // New flag for single dynamic dim clustering
 };
 
 // Flags associated with XLA Sparse Core.

@@ -110,10 +110,13 @@ void AppendMarkForCompilationPassFlagsInternal(std::vector<Flag>* flag_list) {
            "Maximum number of operators in an XLA compilation."),
       Flag("tf_xla_annotate_cluster_id",
            &mark_for_compilation_flags->tf_xla_annotate_cluster_id,
-           "Allow operator names to influence clustering scheume."
+           "Allow operator names to influence clustering scheme."
            "Operators whose name starting with .cluster.{id} will likely"
            "to be clustered together if the ids are the same number. "
            ".cluster.none will not be clustered with those having numbered id"),
+      Flag("tf_xla_cluster_single_dynamic_dim",
+           &mark_for_compilation_flags->tf_xla_cluster_single_dynamic_dim,
+           "Only allow clustering of a single dynamic dimension."),
       Flag("tf_xla_cluster_parallel",
            &mark_for_compilation_flags->tf_xla_cluster_parallel,
            "Split parallel compute subgraph info different clusters"),
@@ -250,6 +253,7 @@ void AllocateAndParseFlags() {
   mark_for_compilation_flags->tf_xla_max_cluster_size =
       std::numeric_limits<int32_t>::max();
   mark_for_compilation_flags->tf_xla_annotate_cluster_id = false;
+  mark_for_compilation_flags->tf_xla_cluster_single_dynamic_dim = false;
   mark_for_compilation_flags->tf_xla_cluster_parallel = false;
   mark_for_compilation_flags->tf_xla_clustering_debug = false;
   mark_for_compilation_flags->tf_xla_cpu_global_jit = false;

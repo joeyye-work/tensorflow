@@ -1996,38 +1996,50 @@ class SymbolicShapeRefiner {
     for (int out = 0; out < ic->num_outputs(); ++out) {
       ShapeHandle s = ic->output(out);
 
-      if (!ic->RankKnown(s) && node->op() == "_Arg") {
-        // Treat batched function arguments as vectors with batch dim at dim0.
-        DimensionHandle d0 = GetUnknownOutputDim(node, out, /*dim_index=*/0);
-        ShapeHandle vec = ic->MakeShape({d0});
-        ic->set_output(out, vec);
-        s = vec;
-      }
-
-      if (!ic->RankKnown(s)){
-        //if Rank is not realized yet, get it from attr.
+      if (!ic->RankKnown(s)) {
+        bool recovered_rank = false;
         auto it = node->attr().find("_output_shapes");
-        if (it != node->attr().end() && it->second.list().shape_size()>0){
+        if(it != node->attr().end() && out < it->second.list().shape_size()){
+          it = node->attr().find("shape");
+        }
+        if (it != node->attr().end() && out < it->second.list().shape_size()) {
           const TensorShapeProto& proto = it->second.list().shape(out);
+          if (!proto.unknown_rank()) {
+            std::vector<DimensionHandle> dims;
+            dims.reserve(proto.dim_size());
 
-          std::vector<DimensionHandle> dims;
-          dims.reserve(proto.dim_size());
-
-          for(int d=0; d<proto.dim_size();++d){
-            int64_t size = proto.dim(d).size();
-            if (size >=0){
-              dims.push_back(ic->MakeDim(size));
-            } else {
-              dims.push_back(GetUnknownOutputDim(node, out, d));
+            for (int d = 0; d < proto.dim_size(); ++d) {
+              int64_t size = proto.dim(d).size();
+              if (size >= 0) {
+                dims.push_back(ic->MakeDim(size));
+              } else {
+                dims.push_back(GetUnknownOutputDim(node, out, d));
+              }
             }
+            s = ic->MakeShape(dims);
+            ic->set_output(out, s);
+            recovered_rank = true;
           }
-          s = ic->MakeShape(dims);
-          ic->set_output(out,s);
-        }else {
-          VLOG(1) << "RANK still unknown." << node->name();
+        }
+
+        if (!recovered_rank && node->op() == "_Arg") {
+          DimensionHandle d0 = GetUnknownOutputDim(node, out, /*dim_id=*/0);
+          ShapeHandle vec = ic->MakeShape({d0});
+          ic->set_output(out, vec);
+          s = vec;
+          recovered_rank = true;
+        }
+
+        if (!recovered_rank) {
+          VLOG(1) << "RANK still unknown. " << node->name();
           continue;
         }
       }
+
+      if (!ic->RankKnown(s)) {
+        continue;
+      }
+
       bool changed = false;
       std::vector<DimensionHandle> dims;
       dims.reserve(ic->Rank(s));
@@ -2040,9 +2052,22 @@ class SymbolicShapeRefiner {
           continue;
         }
         // If already tagged with expr, keep it.
-        if (ic->GetDimExpr(dim) != nullptr) {
+        auto* dim_expr = ic->GetDimExpr(dim);
+        if (dim_expr != nullptr) {
           dims.push_back(dim);
           continue;
+        }
+        auto output_shapes_it = node->attr().find("_output_shapes");
+        if (output_shapes_it != node->attr().end() &&
+            out < output_shapes_it->second.list().shape_size() &&
+            d < output_shapes_it->second.list().shape(out).dim_size()) {
+          const int64_t annotated_size =
+              output_shapes_it->second.list().shape(out).dim(d).size();
+          if (annotated_size >= 0) {
+            changed = true;
+            dims.push_back(ic->MakeDim(annotated_size));
+            continue;
+          }
         }
         // Canonicalize ALL unknown dims.
         DimensionHandle canon = GetUnknownOutputDim(node, out, d);
@@ -2248,20 +2273,16 @@ class SymbolicShapeManager {
         int64_t d = dims_.GetMergedValue(dim);
         auto* out_dim = properties->mutable_shape()->add_dim();
         out_dim->set_size(d < 0 ? -1 : d);
-        // Serialize expression for unknown dims
-        if (out_dim->size() < 0) {
-          void* root = dims_.RootId(dim);
-          DimExpr* expr = nullptr;
-          if (auto it = dim_root_expr_.find(root); it != dim_root_expr_.end()) {
-            expr = it->second;
-          } else {
-            // Fallback to checking the dim handle directly
-            expr = GetExprFromDimHandle(dim);
-          }
-          if (expr != nullptr) {
-            expr->ToProto(out_dim->mutable_expr());
-            // TODO: Apply simplification?
-          }
+        void* root = dims_.RootId(dim);
+        DimExpr* expr = nullptr;
+        if (auto it = dim_root_expr_.find(root); it != dim_root_expr_.end()) {
+          expr = it->second;
+        } else {
+          expr = ExprForDim(dim);
+        }
+        if (expr != nullptr) {
+          expr->ToProto(out_dim->mutable_expr());
+          // TODO: Apply simplification?
         }
       }
     }
@@ -2350,6 +2371,25 @@ class SymbolicShapeManager {
     return d->expr_;
   }
 
+  DimExpr* ExprForDim(const DimensionHandle& d) {
+    if (!d.IsSet()) return nullptr;
+    if (DimExpr* expr = GetExprFromDimHandle(d)) {
+      return expr;
+    }
+    if (!InferenceContext::ValueKnown(d)) {
+      return nullptr;
+    }
+    const int64_t value = InferenceContext::Value(d);
+    auto it = const_exprs_.find(value);
+    if (it != const_exprs_.end()) {
+      return it->second.get();
+    }
+    auto expr = DimExpr::Cons(value);
+    DimExpr* expr_ptr = expr.get();
+    const_exprs_.emplace(value, std::move(expr));
+    return expr_ptr;
+  }
+
   absl::Status MergeDimsWithExpr(DimensionHandle d1, DimensionHandle d2) {
     if (!d1.IsSet() || !d2.IsSet()) return absl::OkStatus();
 
@@ -2360,7 +2400,7 @@ class SymbolicShapeManager {
     auto get_best = [&](void* r, DimensionHandle d) -> DimExpr* {
       auto it = dim_root_expr_.find(r);
       if (it != dim_root_expr_.end()) return it->second;
-      return GetExprFromDimHandle(d);  // may be null
+      return ExprForDim(d);  // may be null
     };
 
     DimExpr* e1 = get_best(r1, d1);
@@ -2401,6 +2441,7 @@ class SymbolicShapeManager {
     return absl::OkStatus();
   }
   DisjointSet<shape_inference::ShapeHandle> shapes_;
+  absl::flat_hash_map<int64_t, std::unique_ptr<DimExpr>> const_exprs_;
   // Map from union-find root pointer to the best expression for that set.
   absl::flat_hash_map<void*, DimExpr*> dim_root_expr_;
   DisjointSet<shape_inference::DimensionHandle> dims_;

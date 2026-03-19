@@ -162,8 +162,10 @@ class StridedSliceOp : public XlaOpKernel {
       auto zero = xla::Zero(ctx->builder(), ctx->InputXlaType("begin"));
       xla::XlaOp begin_index, end_index;
       int64_t sparse_index = shape_spec.processing_to_sparse_mapping[i];
-      bool xla_input_is_dynamic = input_xla_shape.is_dynamic_dimension(i) ||
-                                  input_xla_shape.expressions(i)->is_dynamic();
+      xla::DynExpr* input_expr = input_xla_shape.expressions(i);
+      bool xla_input_is_dynamic =
+          input_xla_shape.is_dynamic_dimension(i) ||
+          (input_expr != nullptr && input_expr->is_dynamic());
       xla::XlaOp dim_size;
       if (xla_input_is_dynamic) {
         dim_size = xla::GetDimensionSize(ctx->Input(0), i);

@@ -96,7 +96,9 @@ MatrixTriangularSolveOp::Broadcast(xla::XlaOp lhs, const TensorShape& lhs_shape,
 
   TensorShape lhs_broadcast_shape(broadcast_helper.output_batch_shape());
   lhs_broadcast_shape.AddDim(m);
+  lhs_broadcast_shape.AddExpression(xla::DynExpr::_(m));
   lhs_broadcast_shape.AddDim(m);
+  lhs_broadcast_shape.AddExpression(xla::DynExpr::_(m));
   auto lhs_output = BroadcastTo(lhs, lhs_broadcast_shape.dim_sizes(),
                                 lhs_broadcast_shape.get_expressions());
   if (!lhs_output.ok()) {
@@ -106,7 +108,9 @@ MatrixTriangularSolveOp::Broadcast(xla::XlaOp lhs, const TensorShape& lhs_shape,
 
   TensorShape rhs_broadcast_shape(broadcast_helper.output_batch_shape());
   rhs_broadcast_shape.AddDim(m);
+  rhs_broadcast_shape.AddExpression(xla::DynExpr::_(m));
   rhs_broadcast_shape.AddDim(n);
+  rhs_broadcast_shape.AddExpression(xla::DynExpr::_(n));
   auto rhs_output = BroadcastTo(rhs, rhs_broadcast_shape.dim_sizes(),
                                 rhs_broadcast_shape.get_expressions());
   if (!rhs_output.ok()) {

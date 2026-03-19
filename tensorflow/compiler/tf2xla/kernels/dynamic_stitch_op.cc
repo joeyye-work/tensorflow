@@ -174,9 +174,12 @@ class DynamicStitchOp : public XlaOpKernel {
       TensorShape new_shape;
       // first reshaped dimension is the number of indices for this input.
       new_shape.AddDim(indices[input_num].shape().dimensions(0));
+      new_shape.AddExpression(
+          xla::DynExpr::_(indices[input_num].shape().dimensions(0)));
       // Then the rest are the common extra shape.
       for (int d = indices0_shape.dims(); d < data0_shape.dims(); d++) {
         new_shape.AddDim(data0_shape.dim_size(d));
+        new_shape.AddExpression(data0_shape.get_expression(d));
       }
       // Get the data, shaped appropriately.
       auto handle = data[input_num];
