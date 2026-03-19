@@ -187,6 +187,11 @@ void AppendMarkForCompilationPassFlagsInternal(std::vector<Flag>* flag_list) {
            &mark_for_compilation_flags->tf_xla_persistent_cache_prefix,
            "Specifies the persistance cache prefix. Default is "
            "\"xla_compile_cache\""),
+     Flag("tf_xla_threshold_for_megamorphic",
+           &mark_for_compilation_flags->tf_xla_threshold_for_megamorphic,
+           "Sets the threshold for marking a cluster megamorphic. "
+           "Setting it to -1 disables marking clusters megamorphic."
+           "Setting it to 0 uses the default behaviour of TensorFlow."),
       Flag("tf_xla_sparse_core_disable_table_stacking",
            &sparse_core_flags->tf_xla_sparse_core_disable_table_stacking,
            "Disable table stacking for all the tables passed to the SparseCore"
@@ -250,6 +255,7 @@ void AllocateAndParseFlags() {
   mark_for_compilation_flags->tf_xla_cpu_global_jit = false;
   mark_for_compilation_flags->tf_xla_clustering_fuel =
       std::numeric_limits<int64_t>::max();
+  mark_for_compilation_flags->tf_xla_threshold_for_megamorphic = 0;
   mark_for_compilation_flags
       ->tf_xla_disable_deadness_safety_checks_for_debugging = false;
   mark_for_compilation_flags

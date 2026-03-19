@@ -120,6 +120,11 @@ struct MarkForCompilationPassFlags {
 
   // Specifies the persistance cache prefix. Default is "xla_compile_cache"
   string tf_xla_persistent_cache_prefix;
+
+  // Sets the threshold for marking a cluster megamorphic.
+  // Setting it to -1 disables marking clusters megamorphic.
+  // Setting it to 0 uses the default behaviour of TensorFlow.
+  int64_t tf_xla_threshold_for_megamorphic;
 };
 
 // Flags associated with XLA Sparse Core.

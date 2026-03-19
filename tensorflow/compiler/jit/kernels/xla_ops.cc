@@ -65,6 +65,7 @@ limitations under the License.
 #include "xla/tsl/concurrency/async_value_ref.h"
 #include "xla/tsl/protobuf/error_codes.pb.h"
 #include "tensorflow/core/framework/allocator.h"
+#include "tensorflow/core/framework/batch_size_resource.h"
 #include "tensorflow/core/framework/node_def_util.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/op_requires.h"
@@ -1010,10 +1011,22 @@ void XlaRunOp::Compute(OpKernelContext* ctx) {
 
   MarkForCompilationPassFlags* flags = GetMarkForCompilationPassFlags();
   if (flags->tf_xla_enable_dynamic_sizes) {
-    if (auto s = ctx->session_state()) {
-      run_options.set_batch_size(s->GetBatchSize());
+    BatchSizeResource* bsr = nullptr;
+    ScopedStepContainer* step_container = ctx->step_container();
+
+    absl::Status st = step_container->Lookup<BatchSizeResource>(
+        ctx->resource_manager(), BatchSizeResourceName, &bsr);
+
+    if (st.ok()) {
+      run_options.set_batch_size(bsr->GetBatchSize());
       VLOG(1) << "run_options.batch_size is set to: "
-              << run_options.batch_size();
+              << run_options.batch_size() << ". step_id: " << ctx->step_id();
+      bsr->Unref();
+
+    } else if (IsNotFound(st)) {
+      VLOG(1) << "Warning: Not found BatchSizeResource in step_container.";
+    } else {
+      OP_REQUIRES_OK(ctx, st);
     }
   }
 

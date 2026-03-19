@@ -15,8 +15,8 @@ limitations under the License.
 
 #include "xla/shape.h"
 
+#include <algorithm>
 #include <cstdint>
-#include <memory>
 #include <optional>
 #include <ostream>
 #include <string>
@@ -27,7 +27,6 @@ limitations under the License.
 #include "absl/container/inlined_vector.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
-#include "absl/status/status.h"
 #include "absl/types/span.h"
 #include "xla/layout.h"
 #include "xla/layout_util.h"
@@ -85,6 +84,18 @@ Shape::Shape(std::vector<Shape> tuple_shapes) {
   tuple_state().tuple_shapes = std::move(tuple_shapes);
 }
 
+/* static */ Shape Shape::MakeBufferShape(Shape element_shape) {
+  CHECK(element_shape.IsArray())
+      << "element_shape must be an array shape to create a buffer shape.";
+  Shape shape(BUFFER);
+  shape.buffer_state().buffer_shape = {std::move(element_shape)};
+  return shape;
+}
+
+Shape::Shape(const ShapeProto& shape_proto) {
+  *this = FromProto(shape_proto).value_or(Shape());
+}
+
 absl::StatusOr<Shape> Shape::FromProto(const ShapeProto& shape_proto) {
   Shape shape;
   shape.set_element_type(shape_proto.element_type());
@@ -113,19 +124,10 @@ absl::StatusOr<Shape> Shape::FromProto(const ShapeProto& shape_proto) {
     state->tuple_shapes.reserve(shape_proto.tuple_shapes_size());
     for (const ShapeProto& element_shape : shape_proto.tuple_shapes()) {
       TF_ASSIGN_OR_RETURN(Shape tuple_shape, Shape::FromProto(element_shape));
-      state->tuple_shapes.push_back(std::move(tuple_shape));
+      state->tuple_shapes.emplace_back(std::move(tuple_shape));
     }
   } else if (auto* const state = shape.if_buffer_state()) {
-    if (shape_proto.tuple_shapes_size() != 1) {
-      return absl::InvalidArgumentError(
-          "Buffer shape must have exactly one tuple shape.");
-    }
-    TF_ASSIGN_OR_RETURN(Shape buffer_shape,
-                        Shape::FromProto(shape_proto.tuple_shapes(0)));
-    if (!buffer_shape.IsArrayExcludingBuffer()) {
-      return absl::InvalidArgumentError("Buffer shape must have array shape.");
-    }
-    *state->buffer_shape = std::move(buffer_shape);
+    state->buffer_shape.emplace_back(shape_proto.tuple_shapes(0));
   }
   if (shape_proto.has_layout()) {
     TF_RET_CHECK(shape.IsArray()) << "Malformed shape proto: element_type "
@@ -134,21 +136,12 @@ absl::StatusOr<Shape> Shape::FromProto(const ShapeProto& shape_proto) {
     TF_ASSIGN_OR_RETURN(*shape.mutable_layout(),
                         Layout::FromProto(shape_proto.layout()));
   }
+  shape.set_outer_multiplier(shape_proto.batch_multiplier());
   return shape;
-}
-
-void Shape::ToProto(ShapeProto& proto) const {
-  proto.Clear();
-  SaveToEmptyProto(proto);
 }
 
 ShapeProto Shape::ToProto() const {
   ShapeProto proto;
-  SaveToEmptyProto(proto);
-  return proto;
-}
-
-void Shape::SaveToEmptyProto(ShapeProto& proto) const {
   proto.set_element_type(element_type_);
 
   if (const auto* const state = if_array_state()) {
@@ -160,29 +153,73 @@ void Shape::SaveToEmptyProto(ShapeProto& proto) const {
       proto.add_is_dynamic_dimension(dynamic);
     }
     if (state->layout.has_value()) {
-      state->layout->ToProto(*proto.mutable_layout());
+      *proto.mutable_layout() = state->layout->ToProto();
     }
   } else if (const auto* const state = if_tuple_state()) {
     proto.mutable_tuple_shapes()->Reserve(state->tuple_shapes.size());
     for (const Shape& shape : state->tuple_shapes) {
-      shape.ToProto(*proto.add_tuple_shapes());
+      *proto.add_tuple_shapes() = shape.ToProto();
     }
   } else if (const auto* const state = if_buffer_state()) {
-    state->buffer_shape->ToProto(*proto.add_tuple_shapes());
+    proto.mutable_tuple_shapes()->Reserve(1);
+    *proto.add_tuple_shapes() = state->buffer_shape[0].ToProto();
   }
+  proto.set_batch_multiplier(outer_multiplier());
+  return proto;
 }
 
-Shape::BufferState::BufferState() : buffer_shape(std::make_unique<Shape>()) {}
+const Shape::ArrayState& Shape::array_state() const {
+  const auto* const state = if_array_state();
+  CHECK(state) << "Expected an array shape. Got " << ToString()
+               << "\nThis is a programmer error. Please read "
+                  "the Shape object's array properties (e.g. dimensions) "
+                  "only when it's an array shape.";
+  return *state;
+}
 
-Shape::BufferState::BufferState(const Shape::BufferState& state)
-    : buffer_shape(std::make_unique<Shape>(*state.buffer_shape)) {}
+Shape::ArrayState& Shape::array_state() {
+  auto* const state = if_array_state();
+  CHECK(state) << "Expected an array shape. Got " << ToString()
+               << "\nThis is a programmer error. Please mutate "
+                  "the Shape object's array properties (e.g. dimensions) "
+                  "only when it's an array shape.";
+  return *state;
+}
 
-Shape::BufferState& Shape::BufferState::operator=(
-    const Shape::BufferState& state) {
-  if (this != &state) {
-    buffer_shape = std::make_unique<Shape>(*state.buffer_shape);
-  }
-  return *this;
+const Shape::TupleState& Shape::tuple_state() const {
+  const auto* const state = if_tuple_state();
+  CHECK(state) << "Expected a tuple shape. Got " << ToString()
+               << "\nThis is a programmer error. Please read "
+                  "the Shape object's tuple properties (e.g. tuple_shapes) "
+                  "only when it's a tuple shape.";
+  return *state;
+}
+
+Shape::TupleState& Shape::tuple_state() {
+  auto* const state = if_tuple_state();
+  CHECK(state) << "Expected a tuple shape. Got " << ToString()
+               << "\nThis is a programmer error. Please mutate "
+                  "the Shape object's tuple properties (e.g. tuple_shapes) "
+                  "only when it's a tuple shape.";
+  return *state;
+}
+
+const Shape::BufferState& Shape::buffer_state() const {
+  const auto* const state = if_buffer_state();
+  CHECK(state) << "Expected a buffer shape. Got " << ToString()
+               << "\nThis is a programmer error. Please read "
+                  "the Shape object's buffer properties (e.g. buffer_shapes) "
+                  "only when it's a buffer shape.";
+  return *state;
+}
+
+Shape::BufferState& Shape::buffer_state() {
+  auto* const state = if_buffer_state();
+  CHECK(state) << "Expected a buffer shape. Got " << ToString()
+               << "\nThis is a programmer error. Please mutate "
+                  "the Shape object's buffer properties (e.g. buffer_shapes) "
+                  "only when it's a buffer shape.";
+  return *state;
 }
 
 void Shape::Print(Printer* printer, bool print_layout) const {
@@ -196,8 +233,9 @@ void Shape::Print(Printer* printer, bool print_layout) const {
 std::string Shape::ToString(bool print_layout) const {
   if (print_layout) {
     return ShapeUtil::HumanStringWithLayout(*this);
+  } else {
+    return ShapeUtil::HumanString(*this);
   }
-  return ShapeUtil::HumanString(*this);
 }
 
 bool Shape::AreAllLeavesIntegers() const {
@@ -220,7 +258,7 @@ void Shape::add_dimensions(int64_t value, bool is_dynamic) {
 }
 
 void Shape::set_dynamic_dimension(int dimension, bool is_dynamic) {
-  auto& state = array_state_maybe_underneath_buffer();
+  auto& state = array_state();
   // Ensure that the dimension size is valid for the new dynamic-ness.
   CheckDimensionSize(dimension, state.dimensions[dimension], is_dynamic);
   state.dynamic_dimensions[dimension] = is_dynamic;
@@ -228,7 +266,7 @@ void Shape::set_dynamic_dimension(int dimension, bool is_dynamic) {
 
 void Shape::set_dimensions(int index, int64_t size,
                            std::optional<bool> is_dynamic) {
-  auto& state = array_state_maybe_underneath_buffer();
+  auto& state = array_state();
   const bool dynamic =
       is_dynamic.has_value() ? *is_dynamic : state.dynamic_dimensions[index];
   CheckDimensionSize(index, size, dynamic);
@@ -256,7 +294,7 @@ void Shape::CheckDimensionSize(int dim_index, int64_t size, bool is_dynamic) {
 }
 
 void Shape::UnsafeAddDimension(int64_t value, bool is_dynamic) {
-  auto& state = array_state_maybe_underneath_buffer();
+  auto& state = array_state();
   CHECK_EQ(state.dimensions.size(), state.dynamic_dimensions.size())
       << "where the shape is " << ToString();
   state.dimensions.push_back(value);
@@ -268,11 +306,10 @@ bool Shape::is_static() const {
     return absl::c_all_of(state->tuple_shapes,
                           [](const Shape& s) { return s.is_static(); });
   }
-  if (!if_array_state() && !if_buffer_state()) {
-    return true;
+  if (const auto* const state = if_array_state()) {
+    return !absl::c_any_of(state->dynamic_dimensions, [](bool b) { return b; });
   }
-  const auto& state = array_state_maybe_underneath_buffer();
-  return !absl::c_any_of(state.dynamic_dimensions, [](bool b) { return b; });
+  return true;
 }
 
 bool Shape::is_unbounded_dynamic() const {
@@ -281,12 +318,11 @@ bool Shape::is_unbounded_dynamic() const {
       return subshape.is_unbounded_dynamic();
     });
   }
-  if (!if_array_state() && !if_buffer_state()) {
-    return false;
+  if (const auto* const state = if_array_state()) {
+    return absl::c_any_of(state->dimensions,
+                          [](int64_t dim) { return dim == kUnboundedSize; });
   }
-  const auto& state = array_state_maybe_underneath_buffer();
-  return absl::c_any_of(state.dimensions,
-                        [](int64_t dim) { return dim == kUnboundedSize; });
+  return false;
 }
 
 bool Shape::is_bounded_dynamic() const {
@@ -295,20 +331,17 @@ bool Shape::is_bounded_dynamic() const {
       return subshape.is_bounded_dynamic();
     });
   }
-  if (!if_array_state() && !if_buffer_state()) {
-    return false;
-  }
-  const auto& state = array_state_maybe_underneath_buffer();
-  for (auto i = 0; i < state.dimensions.size(); ++i) {
-    if (is_bounded_dynamic_dimension(i)) {
-      return true;
+  if (const auto* const state = if_array_state()) {
+    for (auto i = 0; i < state->dimensions.size(); ++i) {
+      if (is_bounded_dynamic_dimension(i)) return true;
     }
+    return false;
   }
   return false;
 }
 
 void Shape::DeleteDimension(int64_t dim_to_delete) {
-  auto& state = array_state_maybe_underneath_buffer();
+  auto& state = array_state();
   CHECK_GE(dim_to_delete, 0);
   CHECK_LT(dim_to_delete, state.dimensions.size());
   state.dimensions.erase(state.dimensions.begin() + dim_to_delete);
@@ -320,7 +353,7 @@ void Shape::DeleteDimension(int64_t dim_to_delete) {
 }
 
 void Shape::DeleteDimensions(absl::Span<const int64_t> dims_to_delete) {
-  auto& state = array_state_maybe_underneath_buffer();
+  auto& state = array_state();
   std::vector<int64_t> sorted_dims_to_delete(dims_to_delete.begin(),
                                              dims_to_delete.end());
   absl::c_sort(sorted_dims_to_delete);
@@ -336,14 +369,21 @@ void Shape::DeleteDimensions(absl::Span<const int64_t> dims_to_delete) {
 }
 
 void Shape::CheckStateIsEmpty() const {
-  if (if_array_state() || if_buffer_state()) {
-    const auto& state = array_state_maybe_underneath_buffer();
-    CHECK(state.dimensions.empty()) << ToString();
-    CHECK(state.dynamic_dimensions.empty()) << ToString();
-    CHECK(!state.layout.has_value()) << ToString();
+  if (const auto* const state = if_array_state()) {
+    CHECK(state->dimensions.empty()) << ToString();
+    CHECK(state->dynamic_dimensions.empty()) << ToString();
+    CHECK(!state->layout.has_value()) << ToString();
   } else if (const auto* const state = if_tuple_state()) {
     CHECK(state->tuple_shapes.empty()) << ToString();
   }
+}
+
+const std::vector<Shape>& Shape::tuple_shapes() const {
+  return tuple_state().tuple_shapes;
+}
+
+const Shape& Shape::buffer_shape() const {
+  return buffer_state().buffer_shape[0];
 }
 
 void Shape::Clear() {
@@ -354,8 +394,6 @@ void Shape::Clear() {
     *state = ArrayState();
   } else if (auto* const state = if_tuple_state()) {
     *state = TupleState();
-  } else if (auto* const state = if_buffer_state()) {
-    *state = BufferState();
   }
   set_element_type(PRIMITIVE_TYPE_INVALID);
 }
@@ -412,6 +450,10 @@ void Shape::set_element_type(const PrimitiveType value) {
   }
 }
 
+const Shape& Shape::tuple_shapes(int index) const {
+  return tuple_state().tuple_shapes[index];
+}
+
 Shape* Shape::add_tuple_shapes() {
   auto& state = tuple_state();
   state.tuple_shapes.push_back(Shape());
@@ -421,20 +463,22 @@ Shape* Shape::add_tuple_shapes() {
 bool Shape::Equal::operator()(const Shape& lhs, const Shape& rhs) {
   if (lhs.IsTuple()) {
     return rhs.IsTuple() &&
-           absl::c_equal(lhs.tuple_shapes(), rhs.tuple_shapes(),
-                         [this](const Shape& l, const Shape& r) {
-                           return (*this)(l, r);
-                         });
+           absl::c_equal(
+               lhs.tuple_shapes(), rhs.tuple_shapes(),
+               [=](const Shape& l, const Shape& r) { return (*this)(l, r); });
   }
   if (lhs.IsBuffer() || rhs.IsBuffer()) {
     if (!ignore_buffer_) {
       return lhs.IsBuffer() && rhs.IsBuffer() &&
-             (*this)(lhs.buffer_shape(), rhs.buffer_shape());
+             lhs.buffer_shape() == rhs.buffer_shape();
     }
-    auto underlying_shape = [](const Shape& shape) -> const Shape& {
-      return shape.IsBuffer() ? shape.buffer_shape() : shape;
+    auto underline_shape = [](const Shape& shape) {
+      if (shape.IsBuffer()) {
+        return shape.buffer_shape();
+      }
+      return shape;
     };
-    return (*this)(underlying_shape(lhs), underlying_shape(rhs));
+    return underline_shape(lhs) == underline_shape(rhs);
   }
 
   if (!lhs.IsArray()) {
@@ -461,13 +505,17 @@ bool Shape::Equal::operator()(const Shape& lhs, const Shape& rhs) {
       VLOG(3) << "CompareShapes: lhs rank != rhs rank";
       return false;
     }
-    for (auto l = lhs.dimensions().begin(), r = rhs.dimensions().begin();
-         l < lhs.dimensions().end(); ++l, ++r) {
-      if (*l != *r) {
-        if (ignore_dynamic_dimension_ &&
-            (*l == kUnboundedSize || *r == kUnboundedSize)) {
-          continue;
-        }
+    for (int i = 0; i < lhs.dimensions().size(); ++i) {
+      if (ignore_dynamic_dimension_ &&
+          (lhs.is_unbounded_dynamic_dimension(i) ||
+           rhs.is_unbounded_dynamic_dimension(i))) {
+        continue;
+      }
+      if (i == 0 && ignore_batch_ && (lhs.outer_multiplier() > 0 || rhs.outer_multiplier() > 0)) {
+        VLOG(3) << "CompareShapes: batch dimension found. Forcely compatible";
+        continue;
+      }
+      if (lhs.dimensions(i) != rhs.dimensions(i)) {
         VLOG(3) << "CompareShapes: lhs dimensions != rhs dimensions";
         return false;
       }
@@ -511,10 +559,12 @@ bool Shape::Equal::operator()(const Shape& lhs, const Shape& rhs) {
   }
 
   if (!ignore_dynamic_dimension_) {
-    if (lhs.dynamic_dimensions() != rhs.dynamic_dimensions()) {
-      VLOG(3) << "CompareShapes: lhs and rhs have different dynamic "
-                 "dimensions.";
-      return false;
+    for (int i = 0; i < lhs.dimensions().size(); ++i) {
+      if (lhs.is_dynamic_dimension(i) != rhs.is_dynamic_dimension(i)) {
+        VLOG(3) << "CompareShapes: lhs and rhs have different dynamic "
+                   "dimensions.";
+        return false;
+      }
     }
   }
   return true;
@@ -531,6 +581,16 @@ ProgramShape::ProgramShape(const ProgramShape&) = default;
 ProgramShape::ProgramShape(ProgramShape&&) = default;
 ProgramShape& ProgramShape::operator=(const ProgramShape&) = default;
 ProgramShape& ProgramShape::operator=(ProgramShape&&) = default;
+
+ProgramShape::ProgramShape(const ProgramShapeProto& program_shape_proto) {
+  auto program_shape = FromProto(program_shape_proto);
+  if (!program_shape.ok()) {
+    LOG(ERROR) << "Failed to parse ProgramShapeProto: "
+               << program_shape_proto.DebugString();
+    return;
+  }
+  *this = std::move(*program_shape);
+}
 
 absl::StatusOr<ProgramShape> ProgramShape::FromProto(
     const ProgramShapeProto& program_shape_proto) {
