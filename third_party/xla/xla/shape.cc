@@ -134,6 +134,7 @@ absl::StatusOr<Shape> Shape::FromProto(const ShapeProto& shape_proto) {
     TF_ASSIGN_OR_RETURN(*shape.mutable_layout(),
                         Layout::FromProto(shape_proto.layout()));
   }
+  shape.set_outer_multiplier(shape_proto.batch_multiplier());
   return shape;
 }
 
@@ -170,6 +171,7 @@ void Shape::SaveToEmptyProto(ShapeProto& proto) const {
   } else if (const auto* const state = if_buffer_state()) {
     state->buffer_shape->ToProto(*proto.add_tuple_shapes());
   }
+  proto.set_batch_multiplier(outer_multiplier());
 }
 
 Shape::BufferState::BufferState() : buffer_shape(std::make_unique<Shape>()) {}
@@ -461,11 +463,17 @@ bool Shape::Equal::operator()(const Shape& lhs, const Shape& rhs) {
       VLOG(3) << "CompareShapes: lhs rank != rhs rank";
       return false;
     }
-    for (auto l = lhs.dimensions().begin(), r = rhs.dimensions().begin();
-         l < lhs.dimensions().end(); ++l, ++r) {
-      if (*l != *r) {
+    for (int i = 0; i < static_cast<int>(lhs.dimensions().size()); ++i) {
+      int64_t l = lhs.dimensions(i);
+      int64_t r = rhs.dimensions(i);
+      if (l != r) {
         if (ignore_dynamic_dimension_ &&
-            (*l == kUnboundedSize || *r == kUnboundedSize)) {
+            (l == kUnboundedSize || r == kUnboundedSize)) {
+          continue;
+        }
+        if (i == 0 && ignore_batch_ &&
+            (lhs.outer_multiplier() > 0 || rhs.outer_multiplier() > 0)) {
+          VLOG(3) << "CompareShapes: batch dimension found. Forcely compatible";
           continue;
         }
         VLOG(3) << "CompareShapes: lhs dimensions != rhs dimensions";

@@ -62,6 +62,7 @@ package(
 exports_files(
     srcs = [
         "allocator_registry.h",
+        "batch_size_resource.h",
         "collective.h",
         "control_flow.h",
         "dataset.h",
@@ -196,6 +197,7 @@ filegroup(
         "allocator.h",
         "allocator_registry.h",
         "attr_value_util.h",
+        "batch_size_resource.h",
         "bfloat16.h",
         "bounds_check.h",
         "cancellation.h",

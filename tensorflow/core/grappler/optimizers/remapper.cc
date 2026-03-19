@@ -742,6 +742,16 @@ bool IsBiasSemanticAdd(const RemapperContext& ctx,
   return false;
 }
 
+bool MaybeCopyOutputShapesAttr(const NodeDef& from, NodeDef* fused_op) {
+  const string output_shape_attr_name = "_output_shapes";
+  if (from.attr().count(output_shape_attr_name) > 0) {
+    auto shape_attrs = from.attr().at(output_shape_attr_name);
+    AddNodeAttr(output_shape_attr_name, shape_attrs, fused_op);
+    return true;
+  }
+  return false;
+}
+
 void AddInputShapesAttr(const RemapperContext& ctx, int node_index) {
   auto mutable_node = ctx.graph_view.graph()->mutable_node(node_index);
 
@@ -3395,6 +3405,7 @@ absl::Status AddFusedContractionNode(RemapperContext* ctx,
   }
 
   SetFusedOpAttributes(&fused_op, {"BiasAdd"});
+  MaybeCopyOutputShapesAttr(bias_add, &fused_op);
   utils::Mutation* mutation = ctx->graph_view.GetMutationBuilder();
   absl::Status status;
   mutation->AddNode(std::move(fused_op), &status);
@@ -3500,6 +3511,7 @@ absl::Status AddFusedContractionNode(
   }
 
   SetFusedOpAttributes(&fused_op, {"BiasAdd", activation.op()});
+  MaybeCopyOutputShapesAttr(activation, &fused_op);
 
   utils::Mutation* mutation = ctx->graph_view.GetMutationBuilder();
   absl::Status status;
@@ -3691,6 +3703,7 @@ absl::Status AddFusedContractionNode(
   }
 
   SetFusedOpAttributes(&contraction_node, {"BiasAdd", "Add"}, 2);
+  MaybeCopyOutputShapesAttr(add, &contraction_node);
 
   utils::Mutation* mutation = ctx->graph_view.GetMutationBuilder();
   absl::Status status;
@@ -3790,6 +3803,7 @@ absl::Status AddFusedContractionNode(
   }
 
   SetFusedOpAttributes(&fused_conv, {"BiasAdd", "Add", activation.op()}, 2);
+  MaybeCopyOutputShapesAttr(add, &fused_conv);
 
   utils::Mutation* mutation = ctx->graph_view.GetMutationBuilder();
   absl::Status status;
