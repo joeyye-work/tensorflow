@@ -71,6 +71,7 @@ class ReshapeOp : public XlaOpKernel {
         unknown_index = d;
         shape.AddDim(1);
         shape.AddExpression(xla::DynExpr::one);
+        ratio = 1;
       } else if (size == 0) {
         // We don't include zero-sized dimension in product, so that we can
         // still calculate number of elements for non-zero-sized dimensions and
@@ -102,15 +103,17 @@ class ReshapeOp : public XlaOpKernel {
           size_expr = new_expr->s();
 
         } else {
-          if (ratio == 1){ // Nothing has been previously split.
-            size_expr = xla::DynExpr::_(size);
-          } else if (ratio == size) {  // The factor of the previous split is
-                                       // the new dimension.
-            size_expr = xla::DynExpr::_(size);
-            ratio = 1; // reset ratio
-          } else {
-            // Should not happen.
-            size_expr = xla::DynExpr::_(-50);
+          size_expr = xla::DynExpr::_(size);
+          if (ratio != 1) {
+            // A split dynamic dimension can be materialized by multiple later
+            // known dimensions. Any unresolved remainder is kept in `ratio`
+            // and may be consumed by a subsequent `-1` dimension (if present);
+            // otherwise, it remains unapplied.
+            if (ratio % size == 0) {
+              ratio /= size;
+            } else if (size % ratio == 0) {
+              ratio = 1;
+            }
           }
         }
         shape.AddExpression(size_expr);
