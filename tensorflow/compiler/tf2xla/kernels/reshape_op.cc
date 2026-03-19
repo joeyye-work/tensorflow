@@ -107,8 +107,9 @@ class ReshapeOp : public XlaOpKernel {
           size_expr = xla::DynExpr::_(size);
           if (ratio != 1) {
             // A split dynamic dimension can be materialized by multiple later
-            // known dimensions, and any unresolved remainder belongs to a
-            // later `-1` dimension once we reach it.
+            // known dimensions. Any unresolved remainder is kept in `ratio`
+            // and may be consumed by a subsequent `-1` dimension (if present);
+            // otherwise, it remains unapplied.
             if (ratio % size == 0) {
               ratio /= size;
             } else if (size % ratio == 0) {
