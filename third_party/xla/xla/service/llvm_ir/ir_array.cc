@@ -43,6 +43,7 @@ limitations under the License.
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/tsl/platform/logging.h"
+#include "xla/tsl/platform/status.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
 
@@ -198,7 +199,7 @@ IrArray::IrArray(llvm::Value* base_ptr, llvm::Type* pointee_type, Shape shape)
     : base_ptr_(base_ptr),
       pointee_type_(pointee_type),
       shape_(std::move(shape)) {
-  CHECK_OK(ShapeUtil::ValidateShape(shape_));
+  TF_CHECK_OK(ShapeUtil::ValidateShape(shape_));
   CHECK(base_ptr_->getType()->isPointerTy());
   int depth = 0;
   element_type_ = pointee_type;
@@ -325,8 +326,8 @@ IrArray::Index IrArray::Index::SourceIndexOfSlice(
 IrArray::Index IrArray::Index::SourceIndexOfTranspose(
     const Shape& shape, const Shape& operand_shape,
     absl::Span<const int64_t> dimension_mapping) const {
-  auto operand_multidim_index =
-      PermuteInverse<std::vector<llvm::Value*>>(multidim(), dimension_mapping);
+  std::vector<llvm::Value*> operand_multidim_index =
+      PermuteInverse(multidim(), dimension_mapping);
 
   if (linear() != nullptr && LayoutUtil::HasLayout(operand_shape) &&
       LayoutUtil::HasLayout(shape) &&
@@ -344,28 +345,27 @@ IrArray::Index IrArray::Index::SourceIndexOfBitcast(
 
   const ShapeUtil::BitcastDecomposition decomposition =
       ShapeUtil::DecomposeBitcast(operand_shape, shape);
-  CHECK(decomposition.has_value());
 
   // In case the bitcast is just a reshape, we can use SourceIndexOfReshape()
   // instead. This will reuse linear() if possible, so we don't have to build a
   // new 'linear_index'.
   if (std::holds_alternative<ShapeUtil::BitcastDecompositionReshape>(
-          *decomposition)) {
+          decomposition)) {
     return SourceIndexOfReshape(shape, operand_shape, builder);
   }
 
   if (std::holds_alternative<ShapeUtil::BitcastDecompositionTranspose>(
-          *decomposition)) {
+          decomposition)) {
     const auto& decomposition_transpose =
-        std::get<ShapeUtil::BitcastDecompositionTranspose>(*decomposition);
+        std::get<ShapeUtil::BitcastDecompositionTranspose>(decomposition);
     return SourceIndexOfTranspose(shape, operand_shape,
                                   decomposition_transpose.transpose_dims);
   }
 
   CHECK(std::holds_alternative<ShapeUtil::BitcastDecompositionTrt>(
-      *decomposition));
+      decomposition));
   const auto& decomposition_trt =
-      std::get<ShapeUtil::BitcastDecompositionTrt>(*decomposition);
+      std::get<ShapeUtil::BitcastDecompositionTrt>(decomposition);
 
   Index index = *this;
   if (!decomposition_trt.IsTranspose2Identity()) {
@@ -559,8 +559,43 @@ llvm::Value* IrArray::EmitArrayElementAddress(const IrArray::Index& index,
     int64_t dimension = LayoutUtil::Major(shape_.layout(), i);
     gep_indices.push_back(actual_index[dimension]);
   }
-  return b->CreateInBoundsGEP(pointee_type_, base_ptr_, gep_indices,
-                              llvm_ir::AsStringRef(name));
+
+#define DYN_DIMS
+#ifdef DYN_DIMS
+
+  llvm::ArrayType* outerArray = llvm::dyn_cast<llvm::ArrayType>(pointee_type_);
+
+  CHECK(outerArray) << "Expected outer array type.";
+
+  llvm::Value* gep;
+
+  if (shape_.outer_multiplier() > 0) {
+
+    // Extract the inner array type: [N x T]
+    llvm::Type* innerArray = outerArray->getElementType();
+
+    CHECK(innerArray) << "Expected inner array type.";
+
+    // Create a new array type: [0 x [N x T]]
+    llvm::ArrayType* zeroOuterArray = llvm::ArrayType::get(innerArray, 0);
+
+    llvm::PointerType* newPtrTy = llvm::PointerType::getUnqual(zeroOuterArray);
+    llvm::Value* castedPtr = b->CreateBitCast(base_ptr_, newPtrTy);
+
+    gep =
+        b->CreateInBoundsGEP(zeroOuterArray,
+                            castedPtr,
+                            gep_indices, llvm_ir::AsStringRef(name));
+  } else {
+    gep = b->CreateInBoundsGEP(pointee_type_, base_ptr_, gep_indices,
+                               llvm_ir::AsStringRef(name));
+  }
+#else
+  auto gep = b->CreateInBoundsGEP(pointee_type_, base_ptr_, gep_indices,
+                                  llvm_ir::AsStringRef(name));
+#endif
+
+  return gep;
 }
 
 llvm::Value* IrArray::EmitLinearArrayElementAddress(

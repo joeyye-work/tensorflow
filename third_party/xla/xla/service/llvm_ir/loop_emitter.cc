@@ -28,11 +28,13 @@ limitations under the License.
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Value.h"
 #include "xla/layout_util.h"
 #include "xla/service/llvm_ir/ir_array.h"
 #include "xla/service/llvm_ir/llvm_loop.h"
+#include "xla/service/llvm_ir/llvm_util.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/tsl/platform/errors.h"
@@ -182,6 +184,33 @@ std::vector<IrArray::Index> LoopEmitter::EmitIndexAndSetExitBasicBlock(
   }
 
   ForLoopNest loop_nest(loop_name, b_);
+
+  llvm::LLVMContext& ctx = b_->getContext();
+  llvm::IntegerType* i64Type = llvm::IntegerType::getInt64Ty(ctx);
+
+  llvm::PointerType* ptr = llvm::PointerType::getUnqual(ctx);
+  llvm::StructType* callFrameTy = llvm::StructType::create(
+      "XLA_CPU_KernelArg", ptr, ptr, i64Type, ptr, i64Type);
+
+  std::vector<llvm::Value*> dynamic_dims;
+  for (auto dim : shape_.dimensions()) {
+    dynamic_dims.push_back(llvm::ConstantInt::get(i64Type, dim));
+  }
+
+  bool dynamic = false;
+  for (int i = 0; i < shape_.dimensions_size(); i++) {
+    int64_t multiplier = (i == 0) ? shape_.outer_multiplier() : -1;
+    if (multiplier > 0) {
+      dynamic_dims[i] = xla::llvm_ir::GetBatchDimByName(b_, multiplier);
+      shape_.set_dynamic_dimension(i, true);
+      dynamic = true;
+    }
+  }
+
+  if (dynamic) {
+    // Assign dynamic batch
+    dynamic_dims_ = dynamic_dims;
+  }
 
   IrArray::Index array_index = dynamic_dims_.empty()
                                    ? EmitStaticIndex(&loop_nest, index_type)

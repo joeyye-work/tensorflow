@@ -114,6 +114,9 @@ void AppendMarkForCompilationPassFlagsInternal(std::vector<Flag>* flag_list) {
            "Operators whose name starting with .cluster.{id} will likely"
            "to be clustered together if the ids are the same number. "
            ".cluster.none will not be clustered with those having numbered id"),
+      Flag("tf_xla_cluster_parallel",
+           &mark_for_compilation_flags->tf_xla_cluster_parallel,
+           "Split parallel compute subgraph info different clusters"),
       Flag(
           "tf_xla_ops_to_cluster",
           &mark_for_compilation_flags->tf_xla_ops_to_cluster,
@@ -161,6 +164,9 @@ void AppendMarkForCompilationPassFlagsInternal(std::vector<Flag>* flag_list) {
            &mark_for_compilation_flags->tf_xla_deterministic_cluster_names,
            "Causes the function names assigned by auto clustering to be "
            "deterministic from run to run."),
+      Flag("tf_xla_enable_dynamic_sizes",
+           &mark_for_compilation_flags->tf_xla_enable_dynamic_sizes,
+           "Enable dynamic sizes support."),
       Flag("tf_xla_persistent_cache_directory",
            &mark_for_compilation_flags->tf_xla_persistent_cache_directory,
            "If non-empty, JIT-compiled executables are saved to and loaded "
@@ -239,6 +245,7 @@ void AllocateAndParseFlags() {
   mark_for_compilation_flags->tf_xla_max_cluster_size =
       std::numeric_limits<int32>::max();
   mark_for_compilation_flags->tf_xla_annotate_cluster_id = false;
+  mark_for_compilation_flags->tf_xla_cluster_parallel = false;
   mark_for_compilation_flags->tf_xla_clustering_debug = false;
   mark_for_compilation_flags->tf_xla_cpu_global_jit = false;
   mark_for_compilation_flags->tf_xla_clustering_fuel =
@@ -248,6 +255,7 @@ void AllocateAndParseFlags() {
   mark_for_compilation_flags
       ->tf_xla_disable_resource_variable_safety_checks_for_debugging = false;
   mark_for_compilation_flags->tf_xla_deterministic_cluster_names = false;
+  mark_for_compilation_flags->tf_xla_enable_dynamic_sizes = false;
   mark_for_compilation_flags->tf_xla_persistent_cache_directory = "";
   mark_for_compilation_flags->tf_xla_persistent_cache_device_types = "";
   mark_for_compilation_flags->tf_xla_persistent_cache_read_only = false;
