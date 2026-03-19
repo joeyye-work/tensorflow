@@ -608,28 +608,29 @@ absl::Status CompileToLocalExecutable(
       }
 
       if (arg.constant_value.dtype() == DT_INT32) {
-        const int32 old_value = arg.constant_value.flat<int32>()(0);
+        auto flat = arg.constant_value.flat<int32>();
         // Heuristic: rewrite only scalar constants or shape-like int vectors
-        // whose leading entry matches the observed runtime batch size.
-        if (old_value == dynamic_dim_value) {
-          // Deep-copy before rewrite so the compile-time patch does not mutate
-          // a Tensor buffer shared with caller-visible inputs.
-          Tensor scalar_copy(arg.constant_value.dtype(),
-                             arg.constant_value.shape());
-          scalar_copy.flat<int32>() = arg.constant_value.flat<int32>();
-          arg.constant_value = std::move(scalar_copy);
-          arg.constant_value.flat<int32>()(0) =
-              static_cast<int32>(filled_batch);
+        // with a unique entry matching the observed runtime batch size.
+        for (int i = 0; i < arg.constant_value.NumElements(); ++i) {
+          if (flat(i) == dynamic_dim_value) {
+            LOG(INFO) << "XlaCompileOp int32 constant arg " << arg_index
+                      << " index " << i
+                      << " matches dynamic_dim_value=" << dynamic_dim_value;
+            arg.runtime_batch_constant_index = i;
+            break;
+          }
         }
       } else if (arg.constant_value.dtype() == DT_INT64) {
-        const int64_t old_value = arg.constant_value.flat<int64_t>()(0);
-        // Same heuristic for int64 scalar constants.
-        if (old_value == dynamic_dim_value) {
-          Tensor scalar_copy(arg.constant_value.dtype(),
-                             arg.constant_value.shape());
-          scalar_copy.flat<int64_t>() = arg.constant_value.flat<int64_t>();
-          arg.constant_value = std::move(scalar_copy);
-          arg.constant_value.flat<int64_t>()(0) = filled_batch;
+        auto flat = arg.constant_value.flat<int64_t>();
+        // Same heuristic for int64 scalar constants or shape-like vectors.
+        for (int i = 0; i < arg.constant_value.NumElements(); ++i) {
+          if (flat(i) == dynamic_dim_value) {
+            LOG(INFO) << "XlaCompileOp int64 constant arg " << arg_index
+                      << " index " << i
+                      << " matches dynamic_dim_value=" << dynamic_dim_value;
+            arg.runtime_batch_constant_index = i;
+            break;
+          }
         }
       }
     };

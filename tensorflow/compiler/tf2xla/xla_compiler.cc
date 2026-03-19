@@ -94,6 +94,75 @@ constexpr char kSingleOpComponent[] = "TF2XLA_XLA_COMPILER_COMPILE_SINGLE_OP";
 constexpr char kCompileFunctionComponent[] =
     "TF2XLA_XLA_COMPILER_COMPILE_FUNCTION";
 
+xla::DynExpr* ExprProtoToDynExpr(const ExpressionProto& proto) {
+  switch (proto.node_type_case()) {
+    case ExpressionProto::kConstantValue:
+      return xla::DynExpr::_(proto.constant_value());
+    case ExpressionProto::kVariableId:
+      return xla::DynExpr::V(1);
+    case ExpressionProto::kAddNode:
+      return *ExprProtoToDynExpr(proto.add_node().lhs()) +
+             *ExprProtoToDynExpr(proto.add_node().rhs());
+    case ExpressionProto::kSubNode:
+      return *ExprProtoToDynExpr(proto.sub_node().lhs()) -
+             *ExprProtoToDynExpr(proto.sub_node().rhs());
+    case ExpressionProto::kMulNode:
+      return *ExprProtoToDynExpr(proto.mul_node().lhs()) *
+             *ExprProtoToDynExpr(proto.mul_node().rhs());
+    case ExpressionProto::kDivNode:
+      return *ExprProtoToDynExpr(proto.div_node().lhs()) /
+             *ExprProtoToDynExpr(proto.div_node().rhs());
+    case ExpressionProto::NODE_TYPE_NOT_SET:
+      return nullptr;
+  }
+}
+
+absl::StatusOr<xla::XlaOp> BuildConstantWithRuntimeBatchSlot(
+    const XlaCompiler::Argument& arg, xla::XlaBuilder* builder) {
+  TF_RET_CHECK(arg.runtime_batch_constant_index >= 0);
+  TF_RET_CHECK(arg.constant_value.dtype() == DT_INT32 ||
+               arg.constant_value.dtype() == DT_INT64);
+  TF_RET_CHECK(TensorShapeUtils::IsScalar(arg.constant_value.shape()) ||
+               TensorShapeUtils::IsVector(arg.constant_value.shape()));
+
+  const int64_t marked_index = arg.runtime_batch_constant_index;
+  TF_RET_CHECK(marked_index < arg.constant_value.NumElements());
+
+  std::vector<xla::XlaOp> elems;
+  elems.reserve(arg.constant_value.NumElements());
+  xla::XlaOp zero = xla::ConstantR0<int32_t>(builder, 0);
+  xla::XlaOp expr_carrier =
+      xla::Broadcast(zero, {1}, {xla::DynExpr::V(1)});
+  xla::XlaOp runtime_batch = xla::GetShapeExprValue(expr_carrier);
+
+  if (arg.constant_value.dtype() == DT_INT32) {
+    auto flat = arg.constant_value.flat<int32>();
+    for (int j = 0; j < arg.constant_value.NumElements(); ++j) {
+      elems.push_back(j == marked_index
+                          ? runtime_batch
+                          : xla::ConstantR0<int32_t>(builder, flat(j)));
+    }
+  } else {
+    auto flat = arg.constant_value.flat<int64_t>();
+    runtime_batch = xla::ConvertElementType(runtime_batch, xla::S64);
+    for (int j = 0; j < arg.constant_value.NumElements(); ++j) {
+      elems.push_back(j == marked_index
+                          ? runtime_batch
+                          : xla::ConstantR0<int64_t>(builder, flat(j)));
+    }
+  }
+
+  if (TensorShapeUtils::IsScalar(arg.constant_value.shape())) {
+    return elems[0];
+  }
+
+  std::vector<xla::XlaOp> reshaped_elems;
+  reshaped_elems.reserve(elems.size());
+  for (xla::XlaOp elem : elems) {
+    reshaped_elems.push_back(xla::Reshape(elem, {1}));
+  }
+  return xla::ConcatInDim(builder, reshaped_elems, 0);
+}
 // Checks that arguments `args` match types `types`.
 absl::Status CheckSignature(const DataTypeVector& types,
                             absl::Span<const XlaCompiler::Argument> args) {
@@ -1118,7 +1187,19 @@ absl::Status XlaCompiler::BuildArguments(
         break;
       }
       case XlaCompiler::Argument::kConstant:
-        arg_expression = XlaExpression::Constant(arg.constant_value);
+        if (arg.runtime_batch_constant_index >= 0 &&
+            (arg.constant_value.dtype() == DT_INT32 ||
+             arg.constant_value.dtype() == DT_INT64) &&
+            (TensorShapeUtils::IsScalar(arg.constant_value.shape()) ||
+             TensorShapeUtils::IsVector(arg.constant_value.shape()))) {
+          TF_ASSIGN_OR_RETURN(
+              xla::XlaOp value,
+              BuildConstantWithRuntimeBatchSlot(arg, builder));
+          arg_expression =
+              XlaExpression::XlaOp(value, arg.constant_value.dtype());
+        } else {
+          arg_expression = XlaExpression::Constant(arg.constant_value);
+        }
         break;
       case XlaCompiler::Argument::kInvalid:
         return errors::Internal(
