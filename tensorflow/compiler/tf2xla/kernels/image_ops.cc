@@ -59,7 +59,7 @@ std::array<xla::XlaOp, 3> RGBToHSV(XlaOpKernelContext* ctx, xla::XlaBuilder* b,
   auto minimum = xla::Min(xla::Min(red, green), blue);
   auto range = xla::Sub(value, minimum);
 
-  auto zeros = xla::Broadcast(zero, shape.dim_sizes());
+  auto zeros = xla::Broadcast(zero, shape.dim_sizes(), shape.get_expressions());
   auto saturation =
       xla::Select(xla::Gt(value, zero), xla::Div(range, value), zeros);
 

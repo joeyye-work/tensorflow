@@ -37,7 +37,8 @@ class BroadcastToOp : public XlaOpKernel {
                    context->ConstantInputAsShape(
                        1, &output_shape, xla::ValueInferenceMode::kUpperBound));
     auto output_status_or =
-        BroadcastTo(context->Input(0), output_shape.dim_sizes());
+        BroadcastTo(context->Input(0), output_shape.dim_sizes(),
+                    output_shape.get_expressions());
     OP_REQUIRES_OK(context, output_status_or.status());
     auto output = output_status_or.value();
     std::vector<bool> dynamic_dims;

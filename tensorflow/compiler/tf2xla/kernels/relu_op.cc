@@ -40,8 +40,28 @@ XlaOp Relu6(XlaOp x) {
 namespace tensorflow {
 namespace {
 
-REGISTER_XLA_OP(Name("Relu"), MlirXlaOpKernel);
-REGISTER_XLA_OP(Name("Relu6"), MlirXlaOpKernel);
+class ReluOp : public XlaOpKernel {
+ public:
+  explicit ReluOp(OpKernelConstruction* ctx) : XlaOpKernel(ctx) {}
+  // Computes the max of the scalar input x and 0.
+  void Compile(XlaOpKernelContext* ctx) override {
+    ctx->SetOutput(0, xla::Relu(ctx->Input(0)));
+  }
+};
+
+class Relu6Op : public XlaOpKernel {
+ public:
+  explicit Relu6Op(OpKernelConstruction* ctx) : XlaOpKernel(ctx) {}
+  // Computes the max of the scalar input x and 0.
+  void Compile(XlaOpKernelContext* ctx) override {
+    ctx->SetOutput(0, xla::Relu6(ctx->Input(0)));
+  }
+};
+
+REGISTER_XLA_OP(Name("Relu"), ReluOp);
+// REGISTER_XLA_OP(Name("Relu"), MlirXlaOpKernel);
+// REGISTER_XLA_OP(Name("Relu6"), MlirXlaOpKernel);
+REGISTER_XLA_OP(Name("Relu6"), Relu6Op);
 
 class LeakyReluOp : public XlaOpKernel {
  public:
@@ -70,9 +90,11 @@ class Relu6GradOp : public XlaOpKernel {
     xla::XlaBuilder* b = ctx->builder();
     const TensorShape shape = ctx->InputShape(0);
     const auto zero =
-        xla::Broadcast(XlaHelpers::Zero(b, input_type(0)), shape.dim_sizes());
-    const auto six = xla::Broadcast(
-        XlaHelpers::IntegerLiteral(b, input_type(0), 6), shape.dim_sizes());
+        xla::Broadcast(XlaHelpers::Zero(b, input_type(0)), shape.dim_sizes(),
+                       shape.get_expressions());
+    const auto six =
+        xla::Broadcast(XlaHelpers::IntegerLiteral(b, input_type(0), 6),
+                       shape.dim_sizes(), shape.get_expressions());
     auto out = xla::Select(
         xla::And(xla::Lt(ctx->Input(1), six), xla::Gt(ctx->Input(1), zero)),
         ctx->Input(0), zero);
