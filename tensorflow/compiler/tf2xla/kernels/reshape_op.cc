@@ -165,9 +165,12 @@ class ReshapeOp : public XlaOpKernel {
               input, xla::Zero(ctx->builder(), input_xla_shape->element_type()),
               0, 0, padded_input_num - input_num_elements);
           input_shape.set_dim(0, padded_input_num);
-          input_shape.set_expression(
-              0, xla::DynExpr::_(
-                     padded_input_num));  // Issue here as it depends on ceil
+          // This expression only approximates the padded size: the true value
+          // uses ceil(input_num_elements / product) * product, which we do not
+          // model symbolically here.
+          xla::DynExpr* padded_input_num_expr =
+              (*(*input_num_elements_expr / *product_expr) * *product_expr)->s();
+          input_shape.set_expression(0, padded_input_num_expr);
         }
       }
       shape.set_dim(unknown_index, missing);
@@ -192,14 +195,14 @@ class ReshapeOp : public XlaOpKernel {
 
     std::vector<xla::XlaOp> output_dim_sizes;
     std::vector<bool> dims_are_dynamic;
-    std::vector<xla::DynExpr*> expressions;
+    std::vector<xla::DynExpr*> output_dim_exprs;
     const auto& dims = shape.dims();
     dims_are_dynamic.reserve(dims);
     output_dim_sizes.reserve(dims);
     for (int64_t i = 0; i < dims; ++i) {
       output_dim_sizes.push_back(
           xla::Reshape(xla::Slice(ctx->Input(1), {i}, {i + 1}, {1}), {}));
-      expressions.push_back(xla::DynExpr::_(-10));
+      output_dim_exprs.push_back(xla::DynExpr::_(-111));
     }
     OP_REQUIRES_OK(
         ctx, ctx->ResolveInputDynamismIntoPredVector(1, &dims_are_dynamic));
@@ -207,7 +210,7 @@ class ReshapeOp : public XlaOpKernel {
       // No unknown index.
       ctx->SetOutput(
           0, xla::DynamicReshape(input, output_dim_sizes, shape.dim_sizes(),
-                                 dims_are_dynamic, expressions));
+                                 dims_are_dynamic, output_dim_exprs));
       return;
     }
     auto common_factors =
@@ -218,26 +221,30 @@ class ReshapeOp : public XlaOpKernel {
       auto start = common_factors[i];
       auto end = common_factors[i + 1];
       bool input_is_dynamic = false;
-      xla::DynExpr* expression = xla::DynExpr::_(-20);
       // product of all input dims in this group. E.g., in
       // reshape(Tensor([2, 3, 3]), [3, -1, 3]) product of the group
       // containing -1 will be 6.
       xla::XlaOp product = xla::One(ctx->builder(), xla::S32);
+      xla::DynExpr* product_expr = xla::DynExpr::one;
       for (int64_t dim = start.first; dim < end.first; ++dim) {
         if (input_xla_shape->is_dynamic_dimension(dim)) {
           input_is_dynamic = true;
         }
         product = xla::Mul(product, xla::GetDimensionSize(input, dim));
+        product_expr = (*product_expr * *input_shape.get_expression(dim))->s();
       }
       bool unknown_dim_in_group = false;
       // The real size for the -1 dimension in a reshape. E.g., in
       // reshape(Tensor([2, 3, 3]), [3, -1, 3]) this will be 2.
       xla::XlaOp unknown_dim_size = product;
+      xla::DynExpr* unknown_dim_expr = product_expr;
       for (int64_t dim = start.second; dim < end.second; ++dim) {
         if (dim == unknown_index) {
           unknown_dim_in_group = true;
         } else {
           unknown_dim_size = xla::Div(unknown_dim_size, output_dim_sizes[dim]);
+          unknown_dim_expr =
+              (*unknown_dim_expr / *output_dim_exprs[dim])->s();
         }
       }
 
@@ -245,13 +252,13 @@ class ReshapeOp : public XlaOpKernel {
         // If input dim is dynamic, output dim at the -1 position must be
         // dynamic. Similarly, if input dim is static, output dim has to be
         // static at the -1 dimension.
-        expressions[unknown_index] = expression;
+        output_dim_exprs[unknown_index] = unknown_dim_expr;
         dims_are_dynamic[unknown_index] = input_is_dynamic;
         output_dim_sizes[unknown_index] = unknown_dim_size;
 
         ctx->SetOutput(
             0, xla::DynamicReshape(input, output_dim_sizes, shape.dim_sizes(),
-                                   dims_are_dynamic, expressions));
+                                   dims_are_dynamic, output_dim_exprs));
         VLOG(2) << "Reshape from " << ctx->InputXlaShape(0)->ToString()
                 << " to " << xla::VectorString(shape.dim_sizes())
                 << ", dynamic_dims=" << xla::VectorString(dims_are_dynamic);

@@ -346,6 +346,8 @@ absl::Status ValidateStridedSliceOp(
     bool shrink_i = (dense_spec.shrink_axis_mask & (1 << i));
     if (dim_i == -1) {
       processing_shape->AddDim(shrink_i ? 1 : -1);
+      processing_shape->AddExpression(shrink_i ? xla::DynExpr::_(1)
+                                               : xla::DynExpr::_(-1));
       continue;
     }
 
@@ -415,13 +417,15 @@ absl::Status ValidateStridedSliceOp(
               "slice index ", begin_i, " of dimension ", i, " out of bounds.");
         }
       } else {
-        begin_i = canonical(begin_i, 0);
-        end_i = canonical(end_i, 1);
+        const int64_t begin_raw = begin_i;
+        const int64_t end_raw = end_i;
+        begin_i = canonical(begin_raw, 0);
+        end_i = canonical(end_raw, 1);
         if (begin_expr) {
-          (*begin_expr)[i] = canonical_expr(begin_i, 0)->s();
+          (*begin_expr)[i] = canonical_expr(begin_raw, 0)->s();
         }
         if (end_expr) {
-          (*end_expr)[i] = canonical_expr(end_i, 1)->s();
+          (*end_expr)[i] = canonical_expr(end_raw, 1)->s();
         }
       }
       // Update optimization values
