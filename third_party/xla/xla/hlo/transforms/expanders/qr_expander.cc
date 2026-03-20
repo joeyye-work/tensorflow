@@ -58,6 +58,15 @@ std::vector<int64_t> ConcatVectors(absl::Span<const int64_t> xs,
   return output;
 }
 
+std::vector<DynExpr*> ConcatEVectors(absl::Span<DynExpr* const> xs,
+                                     absl::Span<DynExpr* const> ys) {
+  std::vector<DynExpr*> output;
+  output.reserve(xs.size() + ys.size());
+  std::copy(xs.begin(), xs.end(), std::back_inserter(output));
+  std::copy(ys.begin(), ys.end(), std::back_inserter(output));
+  return output;
+}
+
 // Computes sqrt(x^2 + y^2 + ...), avoiding overflow/underflow.
 // e.g. for 3 arguments:
 // def norm(x, y, z):
@@ -220,11 +229,15 @@ absl::StatusOr<QrDecomposition> QrExpander::QrBlock(
 
   const int64_t m = ShapeUtil::GetDimension(a_shape, -2);
   const int64_t n = ShapeUtil::GetDimension(a_shape, -1);
+  DynExpr* m_exp = ShapeUtil::GetExpression(a_shape, -2);
+  DynExpr* n_exp = ShapeUtil::GetExpression(a_shape, -1);
 
   const int64_t num_batch_dims = num_dims - 2;
   std::vector<int64_t> batch_dims(num_batch_dims);
+  std::vector<DynExpr*> batch_exprs(num_batch_dims);
   for (int i = 0; i < num_batch_dims; ++i) {
     batch_dims[i] = ShapeUtil::GetDimension(a_shape, i);
+    batch_exprs[i] = ShapeUtil::GetExpression(a_shape, i);
   }
 
   std::vector<int64_t> batch_dim_indices(num_batch_dims);
@@ -248,9 +261,12 @@ absl::StatusOr<QrDecomposition> QrExpander::QrBlock(
         minor_dim + 1);
 
     std::vector<int64_t> shape = batch_dims;
+    std::vector<DynExpr*> exprs = batch_exprs;
     shape.push_back(1);
     shape.push_back(m);
-    auto v_broadcast = Reshape(v, shape);
+    exprs.push_back(DynExpr::one);
+    exprs.push_back(m_exp);
+    auto v_broadcast = Reshape(v, shape, exprs);
     // a[:, j+1:] -= np.conj(tau) * (v[:, np.newaxis] @
     //     (np.conj(v[np.newaxis, :]) @ a[:, j+1:]))
     // We use masking rather than a loop-variant shape to handle the j+1:
@@ -263,7 +279,8 @@ absl::StatusOr<QrDecomposition> QrExpander::QrBlock(
 
     // a[j, j] = beta
     // a[j+1:,j] = v[j+1:]
-    auto iota = Reshape(Iota(a.builder(), S32, m), {m, 1});
+    auto iota =
+        Reshape(Iota(a.builder(), S32, m), {m, 1}, {m_exp, DynExpr::one});
     auto predecessor_mask = ConvertElementType(Lt(iota, j), type);
     auto mask = Broadcast(ConvertElementType(Eq(iota, j), type),
                           std::vector<int64_t>(batch_dims.size(), 1));
@@ -279,7 +296,8 @@ absl::StatusOr<QrDecomposition> QrExpander::QrBlock(
     std::vector<int64_t> dim_ids(num_dims);
     std::iota(dim_ids.begin(), dim_ids.end(), 0);
     new_x = BroadcastInDim(new_x, ConcatVectors(batch_dims, {m, n}),
-                           /*broadcast_dimensions=*/dim_ids);
+                           /*broadcast_dimensions=*/dim_ids,
+                           ConcatEVectors(batch_exprs, {m_exp, n_exp}));
     a = Select(Eq(iota_mn, j), new_x, a);
 
     // taus[j] = tau

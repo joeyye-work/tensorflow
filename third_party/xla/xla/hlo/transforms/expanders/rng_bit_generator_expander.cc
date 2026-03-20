@@ -66,7 +66,7 @@ RngBitGeneratorExpander::GetGeneratorComputation(const Shape& data_shape,
 
   XlaBuilder builder("rng");
   XlaOp state_param = Parameter(&builder, 0, state_shape, "state");
-  XlaOp key_op = Reshape(Slice(state_param, {0}, {1}, {1}), {});
+  XlaOp key_op = Reshape(Slice(state_param, {0}, {1}, {1}), {}, {});
   RngOutput output;
   switch (algorithm) {
     case RandomAlgorithm::RNG_THREE_FRY:
@@ -83,8 +83,8 @@ RngBitGeneratorExpander::GetGeneratorComputation(const Shape& data_shape,
                            RandomAlgorithm_Name(algorithm));
   }
 
-  XlaOp final_state =
-      ConcatInDim(&builder, {Reshape(key_op, {1}), output.state}, 0);
+  XlaOp final_state = ConcatInDim(
+      &builder, {Reshape(key_op, {1}, {DynExpr::one}), output.state}, 0);
   Tuple(&builder, {final_state, output.value});
   TF_ASSIGN_OR_RETURN(XlaComputation xla_computation, builder.Build());
   TF_ASSIGN_OR_RETURN(HloComputation * new_computation,

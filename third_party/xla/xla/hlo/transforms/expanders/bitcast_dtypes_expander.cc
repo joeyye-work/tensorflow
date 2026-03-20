@@ -16,7 +16,6 @@ limitations under the License.
 #include "xla/hlo/transforms/expanders/bitcast_dtypes_expander.h"
 
 #include <cstdint>
-#include <memory>
 #include <string>
 #include <vector>
 
@@ -31,14 +30,14 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_opcode.h"
-#include "xla/hlo/ir/hlo_original_value.h"
 #include "xla/primitive_util.h"
-#include "xla/service/call_inliner.h"
 #include "xla/service/hlo_creation_utils.h"
+#include "xla/service/hlo_module_config.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
-#include "xla/tsl/platform/statusor.h"
 #include "xla/xla_data.pb.h"
+#include "tsl/platform/logging.h"
+#include "tsl/platform/statusor.h"
 
 namespace xla {
 
@@ -81,10 +80,13 @@ absl::StatusOr<HloInstruction*> BitcastDtypesExpander::ExpandInstruction(
       broadcasted_input_shape.push_back(input_bit_width / output_bit_width);
       reshaped_input_shape.push_back(1);
       int64_t output_bit_width_mask = (int64_t{1} << output_bit_width) - 1;
-
-      TF_ASSIGN_OR_RETURN(input,
-                          BroadcastTo(Reshape(input, reshaped_input_shape),
-                                      broadcasted_input_shape));
+      std::vector<DynExpr*> reshaped_input_exprs(
+          from_shape.expressions().begin(), from_shape.expressions().end());
+      reshaped_input_exprs.push_back(DynExpr::_(1));
+      TF_ASSIGN_OR_RETURN(
+          input, BroadcastTo(
+                     Reshape(input, reshaped_input_shape, reshaped_input_exprs),
+                     broadcasted_input_shape));
       input = BitcastConvertType(input, input_logical_type);
       TF_ASSIGN_OR_RETURN(Shape input_shape, b.GetShape(input));
       XlaOp iota = Iota(&b, input_shape, input_shape.dimensions().size() - 1);
@@ -115,19 +117,8 @@ absl::StatusOr<HloInstruction*> BitcastDtypesExpander::ExpandInstruction(
         computation, XlaComputationToHloComputation(xla_computation, module));
   }
 
-  HloInstruction* call =
-      instruction->parent()->AddInstruction(HloInstruction::CreateCall(
-          instruction->shape(), instruction->operands(), computation));
-  call->set_original_value(
-      std::make_shared<OriginalValue>(OriginalValue::SyntheticCall()));
-  HloInstruction* root = call->to_apply()->root_instruction();
-  // TODO(b/260601110): In theory, we shouldn't need to do it, but in practice
-  // this creates reshape/broadcast patterns that can be pretty bad if not
-  // inlined. Since each function only has a single call-site anyway, this isn't
-  // a big deal.
-  CallInliner call_inliner;
-  TF_ASSIGN_OR_RETURN(auto inline_map, call_inliner.Inline(call));
-  return inline_map[root];
+  return instruction->parent()->AddInstruction(HloInstruction::CreateCall(
+      instruction->shape(), instruction->operands(), computation));
 }
 
 bool BitcastDtypesExpander::InstructionMatchesPattern(
