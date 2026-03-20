@@ -28,6 +28,15 @@ namespace tensorflow {
 // a list of PartialTensorShape objects.
 extern const char kXlaInferredShapesAttrName[];
 
+// Attribute marking Grappler-inferred output TensorShapeProtos. Attribute
+// value is a list of TensorShapeProto objects and may include ExpressionProto
+// annotations when available.
+extern const char kXlaInferredOutputTensorShapesAttrName[];
+
+// Attribute carrying inferred output TensorShapeProtos on encapsulated _Arg
+// nodes for XlaCompileOp argument reconstruction.
+extern const char kXlaInferredOutputShapesAttrName[];
+
 // Infers output shapes for all nodes in graph `g`. The output shapes will be
 // stored in node attribute `kXlaInferredShapesAttrName`.
 //
@@ -95,21 +104,21 @@ struct XlaClusterInfo {
   // without losing aggregate initialization, which allows us to get rid of
   // the constructor definitions again.
   XlaClusterInfo() {}
-  XlaClusterInfo(const std::string& cluster_name,
+  XlaClusterInfo(const string& cluster_name,
                  const NameAttrList& func_name_attrs, Node* node,
-                 const std::map<std::string, int>& host_compute_core)
+                 const std::map<string, int>& host_compute_core)
       : cluster_name(cluster_name),
         func_name_attrs(func_name_attrs),
         node(node),
         host_compute_core(host_compute_core) {}
   // XLA cluster name. It might be different from `func_name`.
-  const std::string cluster_name;
+  const string cluster_name;
   // Name and attributes of XLA computation function.
   const NameAttrList func_name_attrs;
   // The XLA computation node in the graph.
   Node* node;
   // A mapping from outside compilation cluster name to its device assignment.
-  const std::map<std::string, int> host_compute_core;
+  const std::map<string, int> host_compute_core;
 };
 
 // Finds dependencies between outside compilation clusters, including both data
@@ -117,9 +126,9 @@ struct XlaClusterInfo {
 // outside compilation cluster to a set of names of outside compilation clusters
 // that it depends on.
 absl::StatusOr<
-    std::unique_ptr<absl::flat_hash_map<std::string, std::vector<std::string>>>>
+    std::unique_ptr<absl::flat_hash_map<string, std::vector<string>>>>
 OutsideCompilationClusterDependencies(
-    const Graph* g, const std::string& outside_compilation_attr_name);
+    const Graph* g, const string& outside_compilation_attr_name);
 
 // Preprocesses edges within the same XLA cluster. It will perform the following
 // operations in order:
@@ -135,7 +144,7 @@ OutsideCompilationClusterDependencies(
 // 2.  For data edges between different outside compilations, remove the edge
 //     and create a Placeholder node as dst node's input.
 absl::Status PreprocessEdgesBetweenOutsideCompilations(
-    Graph* g, const std::string& outside_compilation_attr_name);
+    Graph* g, const string& outside_compilation_attr_name);
 
 // Postprocesses edges within the same XLA cluster. This function reverts what
 // `PreprocessEdgesBetweenOutsideCompilations` did. It will perform the
@@ -149,7 +158,7 @@ absl::Status PreprocessEdgesBetweenOutsideCompilations(
 // `PreprocessEdgesBetweenOutsideCompilations` step 1b are not handled here.
 // They are handled in `RewriteOutsideCompilationSubgraphFn`.
 absl::Status PostprocessEdgesBetweenOutsideCompilations(
-    Graph* g, const std::string& outside_compilation_attr_name);
+    Graph* g, const string& outside_compilation_attr_name);
 }  // namespace tensorflow
 
 #endif  // TENSORFLOW_COMPILER_JIT_ENCAPSULATE_UTIL_H_
