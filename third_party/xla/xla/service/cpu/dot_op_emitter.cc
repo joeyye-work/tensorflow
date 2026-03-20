@@ -160,6 +160,27 @@ bool CanEmitTiledLlvmIrGemm(
   return true;
 }
 
+bool HasDynamicMatmulDims(const DotInfo& dot_info) {
+  const Shape& lhs_shape = dot_info.lhs_shape;
+  const Shape& rhs_shape = dot_info.rhs_shape;
+  const DotDimensionNumbers& dim_nums = dot_info.dim_nums;
+
+  DynExpr* m_expr = lhs_shape.dimensions().size() <= 1
+                        ? DynExpr::one
+                        : lhs_shape.expressions(
+                              1LL - dim_nums.lhs_contracting_dimensions(0));
+  DynExpr* k_expr =
+      lhs_shape.expressions(dim_nums.lhs_contracting_dimensions(0));
+  DynExpr* n_expr = rhs_shape.dimensions().size() <= 1
+                        ? DynExpr::one
+                        : rhs_shape.expressions(
+                              1LL - dim_nums.rhs_contracting_dimensions(0));
+
+  return (m_expr != nullptr && m_expr->is_dynamic()) ||
+         (k_expr != nullptr && k_expr->is_dynamic()) ||
+         (n_expr != nullptr && n_expr->is_dynamic());
+}
+
 // Returns dot implementation strategy for non-batch dot operations.
 DotImplementationStrategy GetNonBatchDotImplementationStrategy(
     const HloModuleConfig& config, const DotInfo& dot_info,
@@ -167,14 +188,15 @@ DotImplementationStrategy GetNonBatchDotImplementationStrategy(
     bool allow_runtime_calls) {
   PrimitiveType element_type = dot_info.result_shape.element_type();
 
-  // Force Eigen all the time.
-  return DotImplementationStrategy::kEigen;
-
   // Batched dot either handled by a runtime call or expanded into a sequence
   // of non-batch dot operations.
   DCHECK(dot_info.dim_nums.lhs_batch_dimensions_size() == 0 &&
          dot_info.dim_nums.rhs_batch_dimensions_size() == 0)
       << "Dot operations must be non-batch";
+
+  if (HasDynamicMatmulDims(dot_info)) {
+    return DotImplementationStrategy::kEigen;
+  }
 
   // Any Matrix-Vector product of floating point or integral type, or
   // a transpose-dot fusion of the same can be lowered to a tiled LLVM
@@ -955,18 +977,28 @@ absl::Status DotOpEmitter::EmitCallToBatchRuntime() {
 
   if (!mat_mult_dims.lhs_column_major) {
     std::swap(mat_mult_dims.m, mat_mult_dims.n);
+    std::swap(mat_mult_dims.m_expr, mat_mult_dims.n_expr);
     std::swap(lhs, rhs);
     std::swap(transpose_lhs, transpose_rhs);
   }
+
+  llvm::Value* m_val = xla::llvm_ir::EmitExpression(b_, mat_mult_dims.m_expr);
+  llvm::Value* n_val = xla::llvm_ir::EmitExpression(b_, mat_mult_dims.n_expr);
+  llvm::Value* k_val = xla::llvm_ir::EmitExpression(b_, mat_mult_dims.k_expr);
+  DynExpr* batch_size_expr = lhs_shape.expressions(0);
+  if (batch_size_expr == nullptr) {
+    batch_size_expr = DynExpr::_(lhs_shape.dimensions(0));
+  }
+  llvm::Value* batch_size_val =
+      xla::llvm_ir::EmitExpression(b_, batch_size_expr);
 
   VLOG(1) << "Batch dot emitted with runtime:" << fn_name;
 
   b_->CreateCall(
       matmul_func,
       {executable_run_options_value_, target_array_.GetBasePointer(),
-       lhs->GetBasePointer(), rhs->GetBasePointer(),
-       b_->getInt64(mat_mult_dims.m), b_->getInt64(mat_mult_dims.n),
-       b_->getInt64(mat_mult_dims.k), b_->getInt64(lhs_shape.dimensions(0)),
+       lhs->GetBasePointer(), rhs->GetBasePointer(), m_val, n_val, k_val,
+       batch_size_val,
        b_->getInt32(static_cast<uint32_t>(transpose_lhs)),
        b_->getInt32(static_cast<uint32_t>(transpose_rhs))});
   return absl::OkStatus();
