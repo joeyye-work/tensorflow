@@ -511,6 +511,14 @@ std::vector<int64_t> XlaCompiler::Argument::DimensionSizes() const {
   }
 }
 
+std::vector<xla::DynExpr*> XlaCompiler::Argument::DimensionExpressions() const {
+  if (absl::holds_alternative<TensorShape>(shape)) {
+    return std::get<TensorShape>(shape).get_expressions();
+  } else {
+    return xla::SpanToVector(std::get<xla::Shape>(shape).expressions());
+  }
+}
+
 absl::InlinedVector<int64_t, 4>
 XlaCompiler::Argument::DimensionSizesAsInlinedVector() const {
   if (absl::holds_alternative<TensorShape>(shape)) {
@@ -839,7 +847,9 @@ absl::Status XlaCompiler::CompileFunction(
                                      std::vector<TensorShape>{tensor_shape});
       }
     } else {
+      auto* val_ptr = std::get_if<TensorShape>(&args[i].shape);
       TensorShape tensor_shape = std::get<TensorShape>(args[i].shape);
+      AttrSlice n_attrs = fbody->arg_nodes[i]->attrs();
       fbody->arg_nodes[i]->ClearAttr("_output_shapes");
       fbody->arg_nodes[i]->AddAttr("_output_shapes",
                                    std::vector<TensorShape>{tensor_shape});
@@ -1083,6 +1093,7 @@ absl::Status XlaCompiler::BuildArguments(
         TF_RET_CHECK(absl::holds_alternative<TensorShape>(arg.shape));
         // TODO(phawkins): this code assumes that resource arguments do not
         // alias.
+      auto* val_ptr = std::get_if<TensorShape>(&arg.shape);
         XlaResource* resource =
             context->AddResource(std::make_unique<XlaResource>(
                 arg.resource_kind, i, arg.name, arg.type,
@@ -1203,6 +1214,10 @@ absl::Status XlaCompiler::BuildArguments(
       xla::XlaScopedShardingAssignment assign_sharding(
           builder, it == arg_shardings.end() ? std::optional<xla::OpSharding>()
                                              : it->second);
+      auto& arg = args[input_to_args->at(i)];
+      xla::OpMetadata arg_metadata;
+      arg_metadata.set_op_name(arg.node_name);
+      builder->SetOneShotOpMetadata(arg_metadata);
       if (is_entry_computation) {
         // Add an entry to is_same_across_replicas for every leaf buffer.
         std::vector<bool> is_same_across_replicas(
@@ -1222,10 +1237,9 @@ absl::Status XlaCompiler::BuildArguments(
 
   // Fill in the handles in non-constant arguments, and reshape parameters
   // back to their correct shapes.
-  VLOG(2) << "XLA computation inputs:";
   for (std::vector<int>::size_type i = 0; i < input_to_args->size(); ++i) {
     const XlaCompiler::Argument& arg = args[input_to_args->at(i)];
-    VLOG(2) << "  XLA arg " << i
+    VLOG(2) << " XLA arg " << i
             << " shape: " << xla::ShapeUtil::HumanString(arg_shapes[i])
             << " name: " << arg.name << " TF arg " << input_to_args->at(i)
             << " node name: " << arg.node_name
@@ -1251,7 +1265,9 @@ absl::Status XlaCompiler::BuildArguments(
         // return values of functions, and then reshape unconditionally.
         if (is_entry_computation) {
           arg_expression = XlaExpression::XlaOp(
-              xla::Reshape(arg_handles[i], arg.DimensionSizes()), arg.type);
+              xla::Reshape(arg_handles[i], arg.DimensionSizes(),
+                           arg.DimensionExpressions()),
+              arg.type);
         } else {
           arg_expression = XlaExpression::XlaOp(arg_handles[i], arg.type);
           if (arg.value_bound) {
