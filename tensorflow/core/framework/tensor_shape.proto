@@ -22,6 +22,10 @@ message TensorShapeProto {
 
     // Optional name of the tensor dimension.
     string name = 2;
+    //Only keep one symbolic expr.
+    //Symbolic expression for this dimension when size == -1.
+    //Allows tracking relationships between unknown dimensions.
+    ExpressionProto expr = 3;
   };
 
   // Dimensions of the tensor, such as {"input", 30}, {"output", 40}
@@ -43,4 +47,38 @@ message TensorShapeProto {
   //
   // If true, "dim.size()" must be 0.
   bool unknown_rank = 3;
+
+  repeated ExpressionProto expressions = 4;
+
 };
+
+message ExpressionProto {
+  oneof node_type {
+    int32 constant_value = 1;  // cons
+    int32 variable_id = 2;     // var
+    AddNode add_node = 3;      // exp + exp
+    SubNode sub_node = 4;      // exp - exp
+    MulNode mul_node = 5;      // exp * exp
+    DivNode div_node = 6;      // exp / exp
+  }
+}
+
+message AddNode {
+  ExpressionProto lhs = 1;
+  ExpressionProto rhs = 2;
+}
+
+message SubNode {
+  ExpressionProto lhs = 1;
+  ExpressionProto rhs = 2;
+}
+
+message MulNode {
+  ExpressionProto lhs = 1;
+  ExpressionProto rhs = 2;
+}
+
+message DivNode {
+  ExpressionProto lhs = 1;
+  ExpressionProto rhs = 2;
+}
