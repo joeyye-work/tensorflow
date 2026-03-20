@@ -340,6 +340,7 @@ class SqueezeOp : public XlaOpKernel {
     absl::flat_hash_set<int32_t> wrapped_squeeze_dims;
     wrapped_squeeze_dims.reserve(squeeze_dims_.size());
     std::vector<int64_t> new_shape;
+    std::vector<xla::DynExpr*> new_exprs;
     // Validate squeeze dims against the input.
     for (int32_t dim : squeeze_dims_) {
       OP_REQUIRES(
@@ -367,6 +368,7 @@ class SqueezeOp : public XlaOpKernel {
         } else {
           // This dimension is not being squeezed.
           new_shape.push_back(existing_dim);
+          new_exprs.push_back(shape.expressions(i));
         }
       } else {
         OP_REQUIRES(
@@ -377,11 +379,12 @@ class SqueezeOp : public XlaOpKernel {
         // Copy over all non-1-length dimensions.
         if (existing_dim != 1) {
           new_shape.push_back(existing_dim);
+          new_exprs.push_back(shape.expressions(i));
         }
       }
     }
 
-    ctx->SetOutput(0, xla::Reshape(ctx->Input(0), new_shape));
+    ctx->SetOutput(0, xla::Reshape(ctx->Input(0), new_shape, new_exprs));
   }
 
  private:
