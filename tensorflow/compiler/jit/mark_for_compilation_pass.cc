@@ -136,8 +136,6 @@ class MarkForCompilationPassImpl {
     int annotate_cluster_id;
 
     bool enable_cluster_parallel;
-
-    bool cluster_single_dynamic_dim;  // New flag to control single dynamic dim clustering
   };
 
   MarkForCompilationPassImpl(DebugOptions debug_options, Graph* graph,
@@ -918,8 +916,6 @@ absl::StatusOr<bool> MarkForCompilationPassImpl::Initialize() {
   }
   if (debug_options_.enable_dynamic_sizes) {
     LogExpressionsViaGraphProperties(*graph_);
-  }
-  if (debug_options_.cluster_single_dynamic_dim) {
     TF_RETURN_IF_ERROR(AssignDimVars());
   }
   if (debug_options_.enable_cluster_parallel) {
@@ -2108,7 +2104,7 @@ absl::StatusOr<bool> MarkForCompilationPassImpl::TryToContractEdge(
         from, to, "the two nodes do not have same annotated ids");
   }
 
-  if (debug_options_.cluster_single_dynamic_dim) {
+  if (debug_options_.enable_dynamic_sizes) {
     if (from->dim_vars().size() > 1 || to->dim_vars().size() > 1) {
       std::string from_str = "from_vars: ";
       for (auto id : from->dim_vars()) {
@@ -2531,8 +2527,6 @@ absl::Status MarkForCompilationPass::Run(
   debug_options.dump_graphs = flags->tf_xla_clustering_debug;
   debug_options.annotate_cluster_id = flags->tf_xla_annotate_cluster_id;
   debug_options.enable_cluster_parallel = flags->tf_xla_cluster_parallel;
-  debug_options.cluster_single_dynamic_dim =
-      flags->tf_xla_cluster_single_dynamic_dim;  // Updated option name
 
   return MarkForCompilation(options, debug_options);
 }
