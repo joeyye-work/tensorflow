@@ -281,8 +281,11 @@ IrArray::Index IrArray::Index::SourceIndexOfReshape(
       // linear index by each dimension size.
       for (int64_t i = common_factors[k + 1].first - 1;
            i >= common_factors[k].first; --i) {
+        xla::DynExpr* input_expr = input_shape.expressions(i);
+        bool is_dynamic = input_expr != nullptr && input_expr->is_dynamic();
         llvm::Value* divisor =
-            GetConstantWithIndexType(input_shape.dimensions(i));
+            is_dynamic ? llvm_ir::EmitExpression(builder, input_expr)
+                       : GetConstantWithIndexType(input_shape.dimensions(i));
         if (input_shape.dimensions(i) == 1) {
           source_multidim_index[i] = GetConstantWithIndexType(0);
         } else if (i == common_factors[k].first) {
@@ -559,8 +562,25 @@ llvm::Value* IrArray::EmitArrayElementAddress(const IrArray::Index& index,
     int64_t dimension = LayoutUtil::Major(shape_.layout(), i);
     gep_indices.push_back(actual_index[dimension]);
   }
-  return b->CreateInBoundsGEP(pointee_type_, base_ptr_, gep_indices,
-                              llvm_ir::AsStringRef(name));
+
+  // Do not make a dynamic "GEP" if only the first dimension is dynamic since
+  // it's always indiced with 0 (i.e. the dynamic dimension has no impact on the
+  // address computation).
+  auto expressions = shape_.expressions();
+  bool dynamic_first_dim =
+      expressions[0]->is_dynamic() &&
+      std::all_of(expressions.begin() + 1, expressions.end(),
+                  [](DynExpr* e) { return e->is_constant(); });
+  if (!dynamic_first_dim && shape_.has_dynamic_expr()) {
+    llvm::Type* element_type =
+        PrimitiveTypeToIrType(shape_.element_type(), b->getContext());
+    return llvm_ir::createDynamicGEP(
+        b, base_ptr_, gep_indices, shape_.dimensions(), expressions,
+        element_type, llvm_ir::AsStringRef(name));
+  } else {
+    return b->CreateInBoundsGEP(pointee_type_, base_ptr_, gep_indices,
+                                llvm_ir::AsStringRef(name));
+  }
 }
 
 llvm::Value* IrArray::EmitLinearArrayElementAddress(
