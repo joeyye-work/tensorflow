@@ -214,6 +214,10 @@ class ExprDiv final : public DimExpr {
 DimExpr* SimplifyExpr(DimExpr* expr,
                       std::vector<std::unique_ptr<DimExpr>>* arena);
 
+// Returns whether TensorShape should preserve symbolic expressions. The
+// Shape-expression support follows the `tf_xla_enable_dynamic_sizes` flag.
+bool TensorShapeExpressionsEnabled();
+
 }  // namespace tensorflow
 
 #endif  // TENSORFLOW_CORE_FRAMEWORK_TENSOR_SHAPE_EXPR_H_

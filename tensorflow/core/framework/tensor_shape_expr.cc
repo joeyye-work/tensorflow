@@ -1,6 +1,30 @@
 #include "tensorflow/core/framework/tensor_shape_expr.h"
 
+#include <vector>
+
+#include "xla/parse_flags_from_env.h"
+#include "xla/tsl/util/command_line_flags.h"
+
 namespace tensorflow {
+
+namespace {
+
+bool ParseTensorShapeExpressionsEnabled() {
+  bool tf_xla_enable_dynamic_sizes = false;
+  std::vector<tsl::Flag> flag_list = {
+      tsl::Flag("tf_xla_enable_dynamic_sizes", &tf_xla_enable_dynamic_sizes,
+                "Legacy XLA flag for enabling XLA dynamic sizes."),
+  };
+  xla::ParseFlagsFromEnvAndIgnoreUnknown("TF_XLA_FLAGS", flag_list);
+  return tf_xla_enable_dynamic_sizes;
+}
+
+}  // namespace
+
+bool TensorShapeExpressionsEnabled() {
+  static const bool enabled = ParseTensorShapeExpressionsEnabled();
+  return enabled;
+}
 
 std::unique_ptr<DimExpr> DimExpr::Cons(int64_t val) {
   return std::make_unique<Constant>(val);

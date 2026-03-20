@@ -24,6 +24,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_join.h"
+#include "tensorflow/compiler/jit/flags.h"
 #include "xla/service/shape_inference.h"
 #include "xla/shape.h"
 #include "xla/xla_data.pb.h"
@@ -1144,11 +1145,14 @@ xla::Shape GetShape(shape_inference::ShapeHandle shape_handle,
   std::vector<int64_t> dims;
   std::vector<bool> dynamic_dims;
   std::vector<xla::DynExpr*> expressions;
+  MarkForCompilationPassFlags* flags = GetMarkForCompilationPassFlags();
   for (int i = 0, rank = c->Rank(shape_handle); i < rank; ++i) {
     bool is_dynamic = !c->ValueKnown(c->Dim(shape_handle, i));
     int dynamic_multiplier = c->DynamicRatio(c->Dim(shape_handle, i));
     dynamic_dims.push_back(is_dynamic);
-    expressions.push_back(dynamic_multiplier * *xla::DynExpr::V(1));
+    if (flags->tf_xla_enable_dynamic_sizes) {
+      expressions.push_back(dynamic_multiplier * *xla::DynExpr::V(1));
+    }
     dims.push_back(is_dynamic ? xla::Shape::kUnboundedSize
                               : c->Value(c->Dim(shape_handle, i)));
   }
@@ -1157,7 +1161,9 @@ xla::Shape GetShape(shape_inference::ShapeHandle shape_handle,
       xla::PrimitiveType::S64, dims,
       absl::InlinedVector<bool, 4>(dynamic_dims.begin(), dynamic_dims.end()));
 
-  sh.set_expressions(expressions);
+  if (flags->tf_xla_enable_dynamic_sizes) {
+    sh.set_expressions(expressions);
+  }
   return sh;
 }
 

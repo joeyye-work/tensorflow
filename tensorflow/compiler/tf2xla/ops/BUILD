@@ -16,6 +16,7 @@ cc_library(
     name = "xla_ops",
     srcs = ["xla_ops.cc"],
     deps = [
+        "//tensorflow/compiler/jit:flags",
         "//tensorflow/core:framework",
         "//tensorflow/core:lib",
         "//tensorflow/core:protos_all_cc",

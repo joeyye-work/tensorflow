@@ -513,7 +513,7 @@ std::vector<int64_t> XlaCompiler::Argument::DimensionSizes() const {
 
 std::vector<xla::DynExpr*> XlaCompiler::Argument::DimensionExpressions() const {
   if (absl::holds_alternative<TensorShape>(shape)) {
-    return std::get<TensorShape>(shape).get_expressions();
+    return std::get<TensorShape>(shape).get_filled_expressions();
   } else {
     return xla::SpanToVector(std::get<xla::Shape>(shape).expressions());
   }

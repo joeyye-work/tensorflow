@@ -21,6 +21,7 @@ limitations under the License.
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "tensorflow/compiler/jit/flags.h"
 #include "tensorflow/compiler/tf2xla/shape_util.h"
 #include "tensorflow/compiler/tf2xla/type_util.h"
 #include "tensorflow/compiler/tf2xla/xla_argument.h"
@@ -131,9 +132,12 @@ absl::StatusOr<xla::XlaOp> ReshapeWithCorrectRepresentationAndSharding(
         hlo_sharding, fast_mem, shape_determination_fns, &to_shape));
   }
   if (xla::ShapeUtil::Compatible(original_shape, to_shape)) {
+    MarkForCompilationPassFlags* flags = GetMarkForCompilationPassFlags();
     for (int64_t i = 0; i < original_shape.dimensions().size(); ++i) {
       to_shape.set_dynamic_dimension(i, original_shape.is_dynamic_dimension(i));
-      to_shape.set_expression(i, original_shape.expressions(i));
+      if (flags->tf_xla_enable_dynamic_sizes) {
+        to_shape.set_expression(i, original_shape.expressions(i));
+      }
     }
   }
   return xla::Reshape(to_shape, original);

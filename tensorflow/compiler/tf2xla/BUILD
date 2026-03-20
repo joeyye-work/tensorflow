@@ -851,6 +851,7 @@ cc_library(
         ":common",
         ":xla_argument",
         ":xla_helpers",
+        "//tensorflow/compiler/jit:flags",
         "//tensorflow/core:framework",
         "//tensorflow/core:lib",
         "//tensorflow/core:protos_all_cc",
@@ -878,6 +879,7 @@ cc_library(
     ],
     visibility = [":friends"],
     deps = [
+        "//tensorflow/compiler/jit:flags",
         "//tensorflow/core:core_cpu_internal",
         "//tensorflow/core:framework",
         "//tensorflow/core:lib",

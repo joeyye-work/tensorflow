@@ -655,8 +655,9 @@ absl::Status CompileToLocalExecutable(
     if (filled_batch) {
       for (int i = 0; i < norm_args.size(); ++i) {
         TensorShape& shp = std::get<TensorShape>(norm_args[i].shape);
-        for (int j = 0; j < shp.get_expressions().size(); ++j) {
-          auto e = shp.get_expression(j);
+        auto filled_exprs = shp.get_filled_expressions();
+        for (int j = 0; j < filled_exprs.size(); ++j) {
+          auto e = filled_exprs[j];
           if (e->is_dynamic()) {
             int64_t old = shp.dim_size(j);
             old_vars.push_back({i, j, old});

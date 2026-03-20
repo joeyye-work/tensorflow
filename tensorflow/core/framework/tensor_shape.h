@@ -17,6 +17,7 @@ limitations under the License.
 #define TENSORFLOW_CORE_FRAMEWORK_TENSOR_SHAPE_H_
 
 #include <string>
+#include <vector>
 
 #include "unsupported/Eigen/CXX11/Tensor"  // from @eigen_archive
 #include "tensorflow/core/framework/types.pb.h"
@@ -80,6 +81,14 @@ class TensorShapeRep {
 
   // Set the array of dynamic multipliers.
   void set_expressions(std::vector<xla::DynExpr*> exprs);
+
+  // Get the array of dynamic multipliers, filling missing entries from the
+  // concrete dimension sizes when callers need a dense expression view.
+  std::vector<xla::DynExpr*> get_filled_expressions() const;
+
+  // Return the multiplier for a specific dynamic dimension, falling back to
+  // the concrete dimension size when callers need a dense expression view.
+  xla::DynExpr* get_filled_expression(int64_t dimension) const;
 
   // Get the array of dynamic multipliers.
   std::vector<xla::DynExpr*> get_expressions() const {

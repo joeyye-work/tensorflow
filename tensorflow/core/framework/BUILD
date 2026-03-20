@@ -706,6 +706,7 @@ cc_library(
     ],
     deps = [
         ":bounds_check",
+        ":tensor_shape_expr",
         ":tensor_shape_proto_cc",
         ":types_proto_cc",
         "//tensorflow/core/lib/core:errors",
@@ -739,6 +740,9 @@ cc_library(
     ],
     deps = [
         ":tensor_shape_proto_cc",
+        "//tensorflow/core:lib",
+        "@local_xla//xla:parse_flags_from_env",
+        "@local_xla//xla/tsl/util:command_line_flags",
     ],
     alwayslink = 1,
 )

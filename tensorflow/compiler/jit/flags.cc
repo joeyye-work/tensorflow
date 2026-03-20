@@ -425,7 +425,8 @@ void AllocateAndParseFlags() {
             "and creates TPUReshardVariables ops.")});
 
   AppendMarkForCompilationPassFlagsInternal(flag_list);
-  xla::ParseFlagsFromEnvAndDieIfUnknown("TF_XLA_FLAGS", *flag_list);
+     xla::ParseFlagsFromEnvAndDieIfUnknown("TF_XLA_FLAGS", *flag_list,
+                                                                                                    /*reset_envvar=*/true);
 
   mlir_flags = new MlirCommonFlags;
   if (!enable_mlir_bridge_is_explicit) {
