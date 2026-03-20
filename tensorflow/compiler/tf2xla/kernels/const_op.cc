@@ -38,7 +38,7 @@ template <typename DstT,
                                   std::is_same<DstT, bfloat16>::value>::type* =
               nullptr>
 DstT CastTo(int32_t src) {
-  return absl::bit_cast<DstT>(static_cast<uint16_t>(src));
+  return absl::bit_cast<DstT>(static_cast<uint16>(src));
 }
 
 // Returns scalar constant with the value in the tensor, if the given proto has
@@ -123,7 +123,8 @@ class ConstOp : public XlaOpKernel {
     if (shape.num_elements() > 1) {
       xla::XlaOp value = GetScalarConst(proto_, b);
       if (value.valid()) {
-        ctx->SetOutput(0, xla::Broadcast(value, shape.dim_sizes()));
+        ctx->SetOutput(0, xla::Broadcast(value, shape.dim_sizes(),
+                                         shape.get_expressions()));
         return;
       }
     }

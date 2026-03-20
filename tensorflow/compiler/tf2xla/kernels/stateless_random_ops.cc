@@ -49,8 +49,9 @@ xla::BitGeneratorTy GetBitGeneratorForDevice(
       device_type_string == DEVICE_CPU_XLA_JIT) {
     return [=](xla::XlaOp key, xla::XlaOp state, const xla::Shape& shape) {
       std::tie(state, key) = xla::ScramblePhiloxKey(key);
-      xla::XlaOp philox_state =
-          xla::ConcatInDim(key.builder(), {xla::Reshape(key, {1}), state}, 0);
+      xla::XlaOp philox_state = xla::ConcatInDim(
+          key.builder(),
+          {xla::Reshape(key, {1}, {xla::DynExpr::one}), state}, 0);
       xla::XlaOp result = xla::RngBitGenerator(xla::RandomAlgorithm::RNG_PHILOX,
                                                philox_state, shape);
       return xla::RngOutput{/*value=*/xla::GetTupleElement(result, 1),
@@ -76,7 +77,7 @@ xla::XlaOp MaybeConvertF32ToBF16(xla::XlaOp input, DataType dtype) {
     // `BitcastConvertType(ConvertElementType(u32, U16), BF16)`, to avoid the
     // unclear `ConvertElementType(f32, BF16)` behavior.
     xla::XlaOp output = xla::BitcastConvertType(input, xla::U32) &
-                        xla::ConstantR0<uint32_t>(builder, 0xFFFF0000);
+                        xla::ConstantR0<uint32>(builder, 0xFFFF0000);
     return xla::ConvertElementType(xla::BitcastConvertType(output, xla::F32),
                                    xla::BF16);
   } else {
@@ -184,7 +185,7 @@ class StatelessRandomUniformOp : public XlaOpKernel {
 
  private:
   DataType dtype_;
-  std::string device_type_string_;
+  string device_type_string_;
 
   StatelessRandomUniformOp(const StatelessRandomUniformOp&) = delete;
   void operator=(const StatelessRandomUniformOp&) = delete;
@@ -240,7 +241,7 @@ class StatelessRandomUniformIntOp : public XlaOpKernel {
 
  private:
   DataType dtype_;
-  std::string device_type_string_;
+  string device_type_string_;
 
   StatelessRandomUniformIntOp(const StatelessRandomUniformIntOp&) = delete;
   void operator=(const StatelessRandomUniformIntOp&) = delete;
@@ -283,7 +284,7 @@ class StatelessRandomUniformFullIntOp : public XlaOpKernel {
 
  private:
   DataType dtype_;
-  std::string device_type_string_;
+  string device_type_string_;
 
   StatelessRandomUniformFullIntOp(const StatelessRandomUniformFullIntOp&) =
       delete;
@@ -336,7 +337,7 @@ class StatelessRandomNormalOp : public XlaOpKernel {
 
  private:
   DataType dtype_;
-  std::string device_type_string_;
+  string device_type_string_;
 
   StatelessRandomNormalOp(const StatelessRandomNormalOp&) = delete;
   void operator=(const StatelessRandomNormalOp&) = delete;
@@ -384,7 +385,7 @@ class StatelessTruncatedNormalOp : public XlaOpKernel {
 
  private:
   DataType dtype_;
-  std::string device_type_string_;
+  string device_type_string_;
 
   StatelessTruncatedNormalOp(const StatelessTruncatedNormalOp&) = delete;
   void operator=(const StatelessTruncatedNormalOp&) = delete;
@@ -421,19 +422,23 @@ class StatelessParameterizedTruncatedNormalOp : public XlaOpKernel {
     xla::Shape xla_shape;
     OP_REQUIRES_OK(ctx, TensorShapeToXLAShape(rng_dtype, shape, &xla_shape));
 
-    auto bcasted_means = BroadcastTo(ctx->Input(2), shape.dim_sizes());
+    auto bcasted_means =
+        BroadcastTo(ctx->Input(2), shape.dim_sizes(), shape.get_expressions());
     OP_REQUIRES_OK(ctx, bcasted_means.status());
     auto means = bcasted_means.value();
 
-    auto bcasted_stddevs = BroadcastTo(ctx->Input(3), shape.dim_sizes());
+    auto bcasted_stddevs =
+        BroadcastTo(ctx->Input(3), shape.dim_sizes(), shape.get_expressions());
     OP_REQUIRES_OK(ctx, bcasted_stddevs.status());
     auto stddevs = bcasted_stddevs.value();
 
-    auto bcasted_minvals = BroadcastTo(ctx->Input(4), shape.dim_sizes());
+    auto bcasted_minvals =
+        BroadcastTo(ctx->Input(4), shape.dim_sizes(), shape.get_expressions());
     OP_REQUIRES_OK(ctx, bcasted_minvals.status());
     auto minvals = bcasted_minvals.value();
 
-    auto bcasted_maxvals = BroadcastTo(ctx->Input(5), shape.dim_sizes());
+    auto bcasted_maxvals =
+        BroadcastTo(ctx->Input(5), shape.dim_sizes(), shape.get_expressions());
     OP_REQUIRES_OK(ctx, bcasted_maxvals.status());
     auto maxvals = bcasted_maxvals.value();
 
@@ -449,7 +454,7 @@ class StatelessParameterizedTruncatedNormalOp : public XlaOpKernel {
 
  private:
   DataType dtype_;
-  std::string device_type_string_;
+  string device_type_string_;
 
   StatelessParameterizedTruncatedNormalOp(
       const StatelessParameterizedTruncatedNormalOp&) = delete;

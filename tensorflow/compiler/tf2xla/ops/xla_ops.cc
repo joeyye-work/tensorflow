@@ -222,7 +222,7 @@ static absl::Status XlaDotShapeFunction(shape_inference::InferenceContext* c) {
     return shape_inference::UnknownShape(c);
   }
 
-  std::string dimension_numbers_string;
+  string dimension_numbers_string;
   TF_RETURN_IF_ERROR(
       c->GetAttr("dimension_numbers", &dimension_numbers_string));
 
@@ -1027,7 +1027,7 @@ REGISTER_OP("XlaEinsum")
     .Attr("equation: string")
     .Attr("T: {complex64, bfloat16, float}")
     .SetShapeFn([](shape_inference::InferenceContext* context) {
-      std::string equation;
+      string equation;
       TF_RETURN_IF_ERROR(context->GetAttr("equation", &equation));
       // XlaEinsum supports only two-input einsum equations.
       if (!absl::StrContains(equation, ",")) {
@@ -1057,9 +1057,9 @@ REGISTER_OP("XlaSpmdFullToShardShape")
       if (!c->RankKnown(input_handle)) {
         return shape_inference::UnknownShape(c);
       }
-      std::string sharding_attr;
+      string sharding_attr;
       TF_RETURN_IF_ERROR(c->GetAttr("manual_sharding", &sharding_attr));
-      int32_t single_dim;
+      int32 single_dim;
       TF_RETURN_IF_ERROR(c->GetAttr("dim", &single_dim));
       xla::OpSharding sharding;
       sharding.ParseFromString(sharding_attr);
@@ -1143,16 +1143,22 @@ xla::Shape GetShape(shape_inference::ShapeHandle shape_handle,
   }
   std::vector<int64_t> dims;
   std::vector<bool> dynamic_dims;
+  std::vector<xla::DynExpr*> expressions;
   for (int i = 0, rank = c->Rank(shape_handle); i < rank; ++i) {
     bool is_dynamic = !c->ValueKnown(c->Dim(shape_handle, i));
+    int dynamic_multiplier = c->DynamicRatio(c->Dim(shape_handle, i));
     dynamic_dims.push_back(is_dynamic);
+    expressions.push_back(dynamic_multiplier * *xla::DynExpr::V(1));
     dims.push_back(is_dynamic ? xla::Shape::kUnboundedSize
                               : c->Value(c->Dim(shape_handle, i)));
   }
-  return xla::Shape(
+  xla::Shape sh(
       // Type matters only for indices. S64 is the widest possible type.
       xla::PrimitiveType::S64, dims,
       absl::InlinedVector<bool, 4>(dynamic_dims.begin(), dynamic_dims.end()));
+
+  sh.set_expressions(expressions);
+  return sh;
 }
 
 REGISTER_OP("XlaGather")

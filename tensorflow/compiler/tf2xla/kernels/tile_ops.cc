@@ -67,11 +67,17 @@ class TileOp : public XlaOpKernel {
                             xla::ValueInferenceMode::kUpperBound));
 
     std::vector<int64_t> output_dims(input_shape.dims());
+    std::vector<xla::DynExpr*> output_exprs(input_shape.dims());
+
+    auto expr_sizes = input_shape.get_expressions();
+
     for (int64_t i = 0; i < input_shape.dims(); ++i) {
       OP_REQUIRES(ctx, multiples_bounds[i] >= 0,
                   errors::InvalidArgument("Expected multiples[", i,
                                           "] >= 0, but got ", output_dims[i]));
       output_dims[i] = input_shape.dim_size(i) * multiples_bounds[i];
+      output_exprs[i] =
+          (*expr_sizes[i] * *xla::DynExpr::_(multiples_bounds[i]))->s();
     }
 
     std::vector<bool> multiples_are_dynamic;
@@ -91,8 +97,8 @@ class TileOp : public XlaOpKernel {
         return;
       }
     }
-
-    auto result_or = BroadcastTo(ctx->Input("input"), output_dims);
+    auto result_or =
+        BroadcastTo(ctx->Input("input"), output_dims, output_exprs);
 
     OP_REQUIRES_OK(ctx, result_or.status());
     auto result = result_or.value();

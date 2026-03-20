@@ -97,13 +97,21 @@ class SliceOp : public XlaOpKernel {
         }
       }
 
+      std::vector<xla::DynExpr*> begin_exprs;
+      for (int d : begin){
+        begin_exprs.push_back(xla::DynExpr::_(d));
+      }
       std::vector<int64_t> limits;
+      std::vector<xla::DynExpr*> exprs;
       limits.reserve(begin.size());
+      exprs.reserve(begin.size());
       for (int i = 0; i < begin.size(); ++i) {
         limits.push_back(begin[i] + wrapped_size[i]);
+        exprs.push_back(xla::DynExpr::_(begin[i] + wrapped_size[i]));
       }
       std::vector<int64_t> strides(begin.size(), 1);
-      auto slice = xla::Slice(ctx->Input(0), begin, limits, strides);
+      auto slice =
+          xla::Slice(ctx->Input(0), begin, limits, begin_exprs, exprs, strides);
       // Check for slice on dynamic dimensions.
       std::vector<bool> size_is_dynamic;
       OP_REQUIRES_OK(
@@ -114,8 +122,10 @@ class SliceOp : public XlaOpKernel {
           if (size[i] != -1) {
             // If there is a dynamic dimension, properly set dimension size of
             // the slice.
-            auto dynamic_size =
-                xla::Reshape(xla::Slice(ctx->Input(2), {i}, {i + 1}, {1}), {});
+            auto dynamic_size = xla::Reshape(
+                xla::Slice(ctx->Input(2), {i}, {i + 1}, {xla::DynExpr::_(i)},
+                           {xla::DynExpr::_(i + 1)}, {1}),
+                {});
 
             slice = xla::SetDimensionSize(slice, dynamic_size, i);
           }
@@ -180,8 +190,8 @@ class SliceOp : public XlaOpKernel {
               xla::Reshape(xla::Slice(ctx->Input(2), {i}, {i + 1}, {1}), {});
           if (constant_size_is_minus_one && size[i] == -1) {
             // size = input_.dim_size(i) - begin[i]
-            dynamic_size = xla::ConstantR0<int32_t>(ctx->builder(),
-                                                    input_shape.dim_size(i)) -
+            dynamic_size = xla::ConstantR0<int32>(ctx->builder(),
+                                                  input_shape.dim_size(i)) -
                            begin_indices[i];
           }
           auto constant_size = ctx->value_inference().AnalyzeConstant(
@@ -192,7 +202,7 @@ class SliceOp : public XlaOpKernel {
             // triggered when some dimensions's slice sizes are constant while
             // some are dynamic.
             sliced = xla::SliceInDim(
-                sliced, 0, constant_size->Get<int32_t>({}).value(), 1, i);
+                sliced, 0, constant_size->Get<int32>({}).value(), 1, i);
           } else {
             // We gave a generous bound (same as input) to the output, try reset
             // the bound if a tighter one can be found.

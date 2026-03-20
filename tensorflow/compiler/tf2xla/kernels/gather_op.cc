@@ -88,7 +88,8 @@ absl::Status XlaGather(const xla::XlaOp& input, const TensorShape& input_shape,
     out_shape.AppendShape(input_shape_post_axis);
 
     *gather_output =
-        xla::Broadcast(XlaHelpers::Zero(builder, dtype), out_shape.dim_sizes());
+        xla::Broadcast(XlaHelpers::Zero(builder, dtype), out_shape.dim_sizes(),
+                       out_shape.get_expressions());
     return absl::OkStatus();
   }
 
@@ -275,7 +276,7 @@ class GatherOp : public XlaOpKernel {
 
   // The number of batch dimensions, as passed in the batch_dims attribute.
   // It must be less than or equal to rank(indices).
-  int32_t batch_dims_ = 0;
+  int32 batch_dims_ = 0;
 };
 
 REGISTER_XLA_OP(Name("Gather"), MlirXlaOpKernel);

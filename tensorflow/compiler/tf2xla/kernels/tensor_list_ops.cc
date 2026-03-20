@@ -70,7 +70,7 @@ absl::StatusOr<std::vector<std::vector<xla::XlaOp>>> GetTensorListDynamicDims(
     dynamic_dims.push_back(ctx->Input(1));
   } else {
     dynamic_dims.push_back(
-        xla::ConstantR0<int32_t>(ctx->builder(), num_elements));
+        xla::ConstantR0<int32>(ctx->builder(), num_elements));
   }
   for (int64_t dim = 0; dim < element_shape.dimensions().size(); ++dim) {
     if (dims_are_dynamic[dim]) {
@@ -80,7 +80,7 @@ absl::StatusOr<std::vector<std::vector<xla::XlaOp>>> GetTensorListDynamicDims(
       dynamic_dims.push_back(dynamic_dim_size);
     } else {
       dynamic_dims.push_back(
-          xla::ConstantR0<int32_t>(ctx->builder(), dynamic_sizes[dim]));
+          xla::ConstantR0<int32>(ctx->builder(), dynamic_sizes[dim]));
     }
   }
   list_dynamic_dims.push_back(std::move(dynamic_dims));
@@ -131,7 +131,8 @@ absl::Status TryGetElementShapeFromInput(XlaOpKernelContext* ctx,
     return absl::OkStatus();
   }
 
-  *shape = xla::ShapeUtil::MakeShape(dtype, partial_shape.dim_sizes());
+  *shape = xla::ShapeUtil::MakeShape(dtype, partial_shape.dim_sizes(),
+                                     partial_shape.get_expressions());
   *got_shape = true;
   return absl::OkStatus();
 }
@@ -191,7 +192,7 @@ class TensorListReserveOp : public XlaOpKernel {
       OP_REQUIRES_OK(
           ctx,
           SetTensorListPushIndex(
-              new_list, xla::ConstantR0<int32_t>(ctx->builder(), num_elements),
+              new_list, xla::ConstantR0<int32>(ctx->builder(), num_elements),
               &result));
       ctx->SetTensorListOutput(0, result);
       return;
@@ -324,13 +325,13 @@ class TensorListElementShapeOp : public XlaOpKernel {
         ctx->SetOutput(0, xla::ConstantR1<int64_t>(b, list_shape.dimensions()));
         break;
       case DT_INT32: {
-        std::vector<int32_t> size;
+        std::vector<int32> size;
         const auto& dimensions = list_shape.dimensions();
         size.reserve(dimensions.size());
         for (int64_t s : dimensions) {
           size.push_back(s);
         }
-        ctx->SetOutput(0, xla::ConstantR1<int32_t>(b, size));
+        ctx->SetOutput(0, xla::ConstantR1<int32>(b, size));
         break;
       }
       default:
@@ -503,6 +504,8 @@ class TensorListConcatOp : public XlaOpKernel {
     xla::Shape element_shape = std::move(shape_or).value();
     std::vector<int64_t> element_dims =
         xla::SpanToVector(element_shape.dimensions());
+    std::vector<xla::DynExpr*> element_exprs =
+        xla::SpanToVector(element_shape.expressions());
     OP_REQUIRES(
         ctx, element_dims.size() > 1,
         errors::Unimplemented("TensorList of scalars is not supported"));
@@ -510,12 +513,15 @@ class TensorListConcatOp : public XlaOpKernel {
     int64_t tensor_lengths = element_dims[1];
 
     std::vector<int64_t> new_dims = {num_elements * tensor_lengths};
+    std::vector<xla::DynExpr*> new_exprs = {
+        xla::DynExpr::_(num_elements * tensor_lengths)};
 
     for (int i = 2; i < element_dims.size(); i++) {
       new_dims.push_back(element_dims[i]);
+      new_exprs.push_back(element_exprs[i]);
     }
 
-    xla::XlaOp out = xla::Reshape(buffer, new_dims);
+    xla::XlaOp out = xla::Reshape(buffer, new_dims, new_exprs);
     ctx->SetOutput(0, out);
 
     // Second output is a tensor of lengths of returned tensors.
@@ -550,6 +556,8 @@ class TensorListSplitOp : public XlaOpKernel {
     xla::Shape element_shape = std::move(shape_or).value();
     std::vector<int64_t> element_dims =
         xla::SpanToVector(element_shape.dimensions());
+    std::vector<xla::DynExpr*> element_exprs =
+        xla::SpanToVector(element_shape.expressions());
     OP_REQUIRES(
         ctx, !element_dims.empty(),
         errors::Unimplemented("Element dimensions have to be non-empty"));
@@ -569,11 +577,13 @@ class TensorListSplitOp : public XlaOpKernel {
         ctx, element_dims[0] % length == 0,
         errors::Unimplemented("Buffer size has to be a multiple of length"));
     std::vector<int64_t> new_dims = {element_dims[0] / length, length};
+    std::vector<xla::DynExpr*> new_exprs = {*element_exprs[0] / length,
+                                            xla::DynExpr::_(length)};
     for (int i = 1; i < element_dims.size(); i++) {
       new_dims.push_back(element_dims[i]);
     }
 
-    xla::XlaOp reshaped = xla::Reshape(input_tensor, new_dims);
+    xla::XlaOp reshaped = xla::Reshape(input_tensor, new_dims, new_exprs);
 
     xla::XlaOp result;
     OP_REQUIRES_OK(ctx, ExecuteTensorListFromTensor(length, reshaped, &result));

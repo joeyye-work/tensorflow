@@ -57,7 +57,7 @@ static inline bool IsLeftAligned(int diag_index, bool left_align_superdiagonal,
 void ReadAlignment(OpKernelConstruction* context,
                    bool* left_align_superdiagonal,
                    bool* left_align_subdiagonal) {
-  std::string align;
+  string align;
   OP_REQUIRES_OK(context, context->GetAttr("align", &align));
 
   *left_align_superdiagonal = align == "LEFT_LEFT" || align == "LEFT_RIGHT";
@@ -234,7 +234,8 @@ xla::XlaOp SetMatrixDiag(const xla::XlaOp input, const xla::XlaOp diag,
 
     // Broadcast and mask.
     xla::XlaOp diag_broadcast = xla::BroadcastInDim(
-        diag_slice, input_shape.dim_sizes(), broadcast_dimensions);
+        diag_slice, input_shape.dim_sizes(), broadcast_dimensions,
+        input_shape.get_expressions());
     const auto mask = xla::GetDiagonalMask(output, diag_index);
     output = xla::Select(mask, diag_broadcast, output);
   }
@@ -327,8 +328,11 @@ class MatrixDiagOp : public XlaOpKernel {
     TensorShape output_shape = diag_shape;
     output_shape.RemoveLastDims((num_diags == 1) ? 1 : 2);
     output_shape.AddDim(num_rows);
+    output_shape.AddExpression(xla::DynExpr::_(num_rows));
     output_shape.AddDim(num_cols);
-    xla::XlaOp output = xla::Broadcast(padding_value, output_shape.dim_sizes());
+    output_shape.AddExpression(xla::DynExpr::_(num_cols));
+    xla::XlaOp output = xla::Broadcast(padding_value, output_shape.dim_sizes(),
+                                       output_shape.get_expressions());
     xla::XlaOp diag = context->Input(0);
     context->SetOutput(
         0, SetMatrixDiag(output, diag, output_shape, diag_rank, num_diags,
@@ -404,11 +408,15 @@ class MatrixDiagPartOp : public XlaOpKernel {
     TensorShape output_shape = input_shape;
     output_shape.RemoveLastDims(2);
     const int num_diags = upper_diag_index - lower_diag_index + 1;
-    if (num_diags > 1) output_shape.AddDim(num_diags);
+    if (num_diags > 1) {
+      output_shape.AddDim(num_diags);
+      output_shape.AddExpression(xla::DynExpr::_(num_diags));
+    }
     const int32_t max_diag_len =
         std::min(num_rows + std::min(upper_diag_index, int64_t{0}),
                  num_cols - std::max(lower_diag_index, int64_t{0}));
     output_shape.AddDim(max_diag_len);
+    output_shape.AddExpression(xla::DynExpr::_(max_diag_len));
 
     // Computes output.
     xla::XlaOp input = context->Input(0);
@@ -447,7 +455,8 @@ class MatrixDiagPartOp : public XlaOpKernel {
     }
     auto concat =
         xla::ConcatInDim(context->builder(), diag_list, input_rank - 2);
-    context->SetOutput(0, xla::Reshape(concat, output_shape.dim_sizes()));
+    context->SetOutput(0, xla::Reshape(concat, output_shape.dim_sizes(),
+                                       output_shape.get_expressions()));
   }
 
  private:
@@ -519,11 +528,15 @@ class MatrixSetDiagOp : public XlaOpKernel {
 
     TensorShape expected_diag_shape = input_shape;
     expected_diag_shape.RemoveLastDims(2);
-    if (num_diags > 1) expected_diag_shape.AddDim(num_diags);
+    if (num_diags > 1) {
+      expected_diag_shape.AddDim(num_diags);
+      expected_diag_shape.AddExpression(xla::DynExpr::_(num_diags));
+    }
     const int32_t max_diag_len =
         std::min(num_rows + std::min(upper_diag_index, int64_t{0}),
                  num_cols - std::max(lower_diag_index, int64_t{0}));
     expected_diag_shape.AddDim(max_diag_len);
+    expected_diag_shape.AddExpression(xla::DynExpr::_(max_diag_len));
     OP_REQUIRES(
         context, expected_diag_shape == diag_shape,
         errors::InvalidArgument(
