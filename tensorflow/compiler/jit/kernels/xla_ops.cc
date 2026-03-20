@@ -563,9 +563,17 @@ absl::Status CompileToLocalExecutable(
               auto e = DimExprToDynExpr(ExprFromProto(exp[idx]).get())->s();
               if (e->is_dynamic()) {
                 int64_t var_value = e->solve(shp.dim_size(idx));
-                LOG(INFO) << "Solve symbolic variable from " << shp.dim_size(idx)
-                          << " to "
-                          << var_value;
+                if (var_value <= 0) {
+                  LOG(WARNING)
+                      << "Failed to solve dynamic dimension for argument "
+                      << arg_index << " dim " << idx << " with size "
+                      << shp.dim_size(idx)
+                      << "; falling back to original dimension size.";
+                  var_value = shp.dim_size(idx);
+                } else {
+                  VLOG(1) << "Solved dynamic dimension from "
+                          << shp.dim_size(idx) << " to " << var_value;
+                }
                 record_dynamic_dim_value(var_value);
                 filled_batch =
                     xla_batch_matcher->get_xla_compile_batch(var_value);
