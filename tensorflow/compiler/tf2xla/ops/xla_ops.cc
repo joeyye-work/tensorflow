@@ -1143,16 +1143,22 @@ xla::Shape GetShape(shape_inference::ShapeHandle shape_handle,
   }
   std::vector<int64_t> dims;
   std::vector<bool> dynamic_dims;
+  std::vector<xla::DynExpr*> expressions;
   for (int i = 0, rank = c->Rank(shape_handle); i < rank; ++i) {
     bool is_dynamic = !c->ValueKnown(c->Dim(shape_handle, i));
+    int dynamic_multiplier = c->DynamicRatio(c->Dim(shape_handle, i));
     dynamic_dims.push_back(is_dynamic);
+    expressions.push_back(dynamic_multiplier * *xla::DynExpr::V(1));
     dims.push_back(is_dynamic ? xla::Shape::kUnboundedSize
                               : c->Value(c->Dim(shape_handle, i)));
   }
-  return xla::Shape(
+  xla::Shape sh(
       // Type matters only for indices. S64 is the widest possible type.
       xla::PrimitiveType::S64, dims,
       absl::InlinedVector<bool, 4>(dynamic_dims.begin(), dynamic_dims.end()));
+
+  sh.set_expressions(expressions);
+  return sh;
 }
 
 REGISTER_OP("XlaGather")

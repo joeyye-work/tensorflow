@@ -88,7 +88,8 @@ absl::Status XlaGather(const xla::XlaOp& input, const TensorShape& input_shape,
     out_shape.AppendShape(input_shape_post_axis);
 
     *gather_output =
-        xla::Broadcast(XlaHelpers::Zero(builder, dtype), out_shape.dim_sizes());
+        xla::Broadcast(XlaHelpers::Zero(builder, dtype), out_shape.dim_sizes(),
+                       out_shape.get_expressions());
     return absl::OkStatus();
   }
 

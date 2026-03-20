@@ -1740,6 +1740,7 @@ tf_cuda_library(
         "@local_xla//xla/tsl/framework:cancellation",
         "@local_xla//xla/tsl/util:command_line_flags",
         "@local_xla//xla/tsl/util:device_name_utils",
+        "@local_xla//xla:shape_util",
     ] + if_cuda([
         "@local_config_cuda//cuda:cudnn_header",
     ]) + if_static(

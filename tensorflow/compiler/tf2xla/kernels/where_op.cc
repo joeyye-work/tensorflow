@@ -165,7 +165,13 @@ absl::StatusOr<XlaOp> CompileWhereWithSort(XlaOpKernelContext* ctx) {
       xla::ShapeUtil::MakeShape(xla::S32, input_shape.dimensions());
 
   int64_t flattened_size = xla::Product(iota_shape.dimensions());
-  XlaOp reshaped_condition = xla::Reshape(condition, {flattened_size});
+  xla::DynExpr* flattened_expr = xla::DynExpr::one;
+  for (auto e : iota_shape.expressions()){
+    flattened_expr = *flattened_expr * *e;
+  }
+  flattened_expr = flattened_expr->s();
+  XlaOp reshaped_condition =
+      xla::Reshape(condition, {flattened_size}, {flattened_expr});
   XlaOp zeros = xla::ZerosLike(reshaped_condition);
   XlaOp compared = xla::Ne(reshaped_condition, zeros);
 
@@ -175,7 +181,7 @@ absl::StatusOr<XlaOp> CompileWhereWithSort(XlaOpKernelContext* ctx) {
   // indices of each element.
   for (int64_t axis = 0; axis < iota_shape.dimensions_size(); ++axis) {
     XlaOp iota = xla::Iota(ctx->builder(), iota_shape, axis);
-    XlaOp reshaped = xla::Reshape(iota, {flattened_size});
+    XlaOp reshaped = xla::Reshape(iota, {flattened_size}, {flattened_expr});
     to_sort.push_back(reshaped);
     types_to_sort.push_back(xla::S32);
   }
@@ -186,7 +192,8 @@ absl::StatusOr<XlaOp> CompileWhereWithSort(XlaOpKernelContext* ctx) {
   std::vector<XlaOp> to_concat;
   for (int64_t i = 0; i < iota_shape.dimensions_size(); ++i) {
     XlaOp index_single_dim = xla::GetTupleElement(sorted, i + 1);
-    to_concat.push_back(xla::Reshape(index_single_dim, {flattened_size, 1}));
+    to_concat.push_back(xla::Reshape(index_single_dim, {flattened_size, 1},
+                                     {flattened_expr, xla::DynExpr::one}));
   }
 
   XlaOp result = xla::ConcatInDim(ctx->builder(), to_concat, 1);
@@ -214,7 +221,13 @@ absl::StatusOr<XlaOp> CompileWhereWithPrefixSum(XlaOpKernelContext* ctx) {
   TF_ASSIGN_OR_RETURN(xla::Shape input_shape, b->GetShape(condition));
 
   int64_t flattened_size = xla::Product(input_shape.dimensions());
-  XlaOp reshaped_condition = xla::Reshape(condition, {flattened_size});
+  xla::DynExpr* flattened_expr = xla::DynExpr::one;
+  for (auto e : input_shape.expressions()) {
+    flattened_expr = *flattened_expr * *e;
+  }
+  flattened_expr = flattened_expr->s();
+  XlaOp reshaped_condition =
+      xla::Reshape(condition, {flattened_size}, {flattened_expr});
   XlaOp zeros = xla::ZerosLike(reshaped_condition);
   XlaOp preds =
       xla::ConvertElementType(xla::Ne(reshaped_condition, zeros), S32);
@@ -253,7 +266,8 @@ absl::StatusOr<XlaOp> CompileWhereWithPrefixSum(XlaOpKernelContext* ctx) {
   XlaOp out_idxs = xla::Select(xla::Ne(prefix_sum, prefix_sum_shifted),
                                /*on_true=*/prefix_sum - xla::One(b, S32),
                                /*on_false=*/oob_idx);
-  out_idxs = xla::Reshape(out_idxs, {flattened_size, 1});
+  out_idxs = xla::Reshape(out_idxs, {flattened_size, 1},
+                          {flattened_expr, xla::DynExpr::one});
 
   // tf.where returns an array of multidimensional indices where the condition
   // is true.  For example:
@@ -280,7 +294,8 @@ absl::StatusOr<XlaOp> CompileWhereWithPrefixSum(XlaOpKernelContext* ctx) {
   iotas_to_concat.reserve(iota_shape.dimensions_size());
   for (int64_t axis = 0; axis < iota_shape.dimensions_size(); ++axis) {
     iotas_to_concat.push_back(
-        xla::Reshape(xla::Iota(b, iota_shape, axis), {flattened_size, 1}));
+        xla::Reshape(xla::Iota(b, iota_shape, axis), {flattened_size, 1},
+                     {flattened_expr, xla::DynExpr::one}));
   }
   XlaOp iotas = xla::ConcatInDim(b, iotas_to_concat, /*dimension=*/1);
 

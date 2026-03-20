@@ -209,7 +209,8 @@ XlaOp SetMatrixDiagonal(XlaOp matrix, XlaOp diag, int k) {
     }
 
     return Select(GetDiagonalMask(matrix, k),
-                  BroadcastInDim(diag, shape.dimensions(), broadcast_dims),
+                  BroadcastInDim(diag, shape.dimensions(), broadcast_dims,
+                                 shape.expressions()),
                   matrix);
   });
 }
@@ -341,18 +342,22 @@ xla::XlaOp EinsumInverseDiagonal(XlaOp x, absl::Span<const int64_t> config) {
     }
     TF_ASSIGN_OR_RETURN(Shape x_shape, builder->GetShape(x));
     std::vector<int64_t> broadcast_sizes;
+    std::vector<DynExpr*> broadcast_exprs;
     int64_t x_dim = 0;
     for (auto label = config.begin(); label != config.end(); ++label) {
       auto first_label = absl::c_find(config, *label);
       if (first_label == label) {
         broadcast_sizes.push_back(x_shape.dimensions(x_dim));
+        broadcast_exprs.push_back(x_shape.expressions(x_dim));
         ++x_dim;
       } else {
         broadcast_sizes.push_back(
             broadcast_sizes[first_label - config.begin()]);
+        broadcast_exprs.push_back(
+            broadcast_exprs[first_label - config.begin()]);
       }
     }
-    x = BroadcastInDim(x, broadcast_sizes, labels->at(2));
+    x = BroadcastInDim(x, broadcast_sizes, labels->at(2), broadcast_exprs);
     return EinsumDiagonalMask(x, config);
   });
 }
@@ -568,16 +573,20 @@ xla::XlaOp Einsum(xla::XlaOp x, absl::Span<const int64_t> x_config,
 
     int64_t dot_dim = 0;
     std::vector<int64_t> new_dims;
+    std::vector<DynExpr*> new_exprs;
     new_dims.reserve(output_rank);
+    new_exprs.reserve(output_rank);
     TF_ASSIGN_OR_RETURN(Shape dot_shape, builder->GetShape(dot));
     for (auto d : output_config) {
       if (is_output_only(d)) {
         new_dims.push_back(1);
+        new_exprs.push_back(DynExpr::one);
       } else {
         new_dims.push_back(dot_shape.dimensions(dot_dim));
+        new_exprs.push_back(dot_shape.expressions(dot_dim));
       }
     }
-    return Reshape(dot, new_dims);
+    return Reshape(dot, new_dims, new_exprs);
   });
 }
 

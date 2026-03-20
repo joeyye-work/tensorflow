@@ -31,8 +31,9 @@ limitations under the License.
 
 namespace xla {
 
-absl::StatusOr<XlaOp> BroadcastTo(XlaOp input,
-                                  absl::Span<int64_t const> output_dims) {
+absl::StatusOr<XlaOp> BroadcastTo(
+    XlaOp input, absl::Span<int64_t const> output_dims,
+    absl::Span<xla::DynExpr* const> output_exprs) {
   XlaBuilder* builder = input.builder();
   TF_ASSIGN_OR_RETURN(Shape input_shape, builder->GetShape(input));
   absl::Span<int64_t const> input_dims = input_shape.dimensions();
@@ -79,15 +80,37 @@ absl::StatusOr<XlaOp> BroadcastTo(XlaOp input,
   }
   TF_RET_CHECK(input_it == input_dims.rend());
 
+  absl::Span<DynExpr* const> input_exprs = input_shape.expressions();
+  std::vector<DynExpr*> broadcast_exprs;
+  auto input_et = input_exprs.rbegin();
+  for (auto output_et = output_exprs.rbegin(); output_et != output_exprs.rend();
+       ++output_et) {
+    if (input_et != input_exprs.rend()) {
+      if (*(*output_et) == *(*input_et) ||
+          (*input_et)->is_constant() && (*input_et)->get_val() == 1) {
+        broadcast_exprs.push_back(*output_et);
+      } else if (!(*(*output_et) == *(*input_et))) {
+        broadcast_exprs.push_back(*input_et);
+        broadcast_exprs.push_back((**output_et / **input_et)->s());
+      }
+      ++input_et;
+    } else {
+      broadcast_exprs.push_back(*output_et);
+    }
+  }
+
   absl::c_reverse(broadcast_dims);
   int broadcast_shape_size = broadcast_shape.size();
   for (int64_t& broadcast_dim : broadcast_dims) {
     broadcast_dim = broadcast_shape_size - broadcast_dim - 1;
   }
   absl::c_reverse(broadcast_shape);
-  XlaOp output = BroadcastInDim(input, broadcast_shape, broadcast_dims);
+  absl::c_reverse(broadcast_exprs);
+
+  XlaOp output =
+      BroadcastInDim(input, broadcast_shape, broadcast_dims, broadcast_exprs);
   if (broadcast_shape != output_dims) {
-    output = Reshape(output, output_dims);
+    output = Reshape(output, output_dims, output_exprs);
   }
   return output;
 }

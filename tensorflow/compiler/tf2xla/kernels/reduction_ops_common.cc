@@ -106,16 +106,19 @@ void XlaReductionOp::Compile(XlaOpKernelContext* ctx) {
   }
 
   std::vector<int64_t> final_shape;
+  std::vector<xla::DynExpr*> final_exprs;
   for (int i = 0; i < data_shape.dims(); ++i) {
     if (!bitmap[i]) {
       // If we are not reducing along dimension i.
       int64_t dim = data_shape.dim_size(i);
       final_shape.push_back(dim);
+      final_exprs.push_back(data_shape.get_expression(i));
     } else if (keep_dims_) {
       // We are reducing along dimension i, but we want to keep the
       // same number of dimensions, so we set the dimension of i to
       // '1'.
       final_shape.push_back(1);
+      final_exprs.push_back(xla::DynExpr::one);
     }
   }
 
@@ -139,7 +142,8 @@ void XlaReductionOp::Compile(XlaOpKernelContext* ctx) {
 
   auto reduce = xla::Reduce(data, initial, reduction_computation, xla_axes);
   auto finalized = BuildFinalizer(b, data, reduce, xla_axes);
-  auto result = keep_dims_ ? xla::Reshape(finalized, final_shape) : finalized;
+  auto result = keep_dims_ ? xla::Reshape(finalized, final_shape, final_exprs)
+                           : finalized;
   ctx->SetOutput(0, result);
 }
 

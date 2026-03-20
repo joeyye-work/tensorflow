@@ -83,9 +83,12 @@ class UniqueOpBase : public XlaOpKernel {
   //
   // This is implemented as an hlo while loop.
   xla::XlaOp RollingSelectR1(XlaOpKernelContext* ctx, xla::XlaOp data,
-                             xla::XlaOp mask, int64_t size) {
+                             xla::XlaOp mask, int64_t size,
+                             xla::DynExpr* expr) {
     xla::XlaComputation cond, body;
-    const xla::Shape r1_shape = xla::ShapeUtil::MakeShape(xla::S32, {size});
+    xla::Shape r1_shape = xla::ShapeUtil::MakeShape(xla::S32, {size});
+    r1_shape.set_expression(0, expr);
+
     const xla::Shape counter_shape = xla::ShapeUtil::MakeScalarShape(xla::S32);
     const xla::Shape& single_element_shape = counter_shape;
 
@@ -136,7 +139,7 @@ class UniqueOpBase : public XlaOpKernel {
     }
 
     auto zero = xla::Zero(ctx->builder(), xla::S32);
-    auto zero_broadcast = xla::Broadcast(zero, {size});
+    auto zero_broadcast = xla::Broadcast(zero, {size}, {expr});
     auto init = xla::Tuple(ctx->builder(), {zero, data, mask, zero_broadcast});
     return xla::GetTupleElement(xla::While(cond, body, init), 3);
   }
@@ -153,13 +156,19 @@ class UniqueOpBase : public XlaOpKernel {
     auto aux = MoveAxis(input, axis, 0, input_shape);
     auto aux_shape = ctx->builder()->GetShape(aux).value();
     int64_t leading_size = aux_shape.dimensions(0);
+    auto leading_expr = aux_shape.expressions(0);
     int64_t product = 1;
+    auto product_expr = xla::DynExpr::one;
     for (int64_t i = 1; i < aux_shape.dimensions().size(); ++i) {
       product *= aux_shape.dimensions(i);
+      product_expr = *(product_expr) * *(aux_shape.expressions(i));
     }
-    aux = xla::Reshape(aux, {leading_size, product});
+    product_expr = product_expr->s();
+    aux = xla::Reshape(aux, {leading_size, product},
+                       {leading_expr, product_expr});
     if (leading_size == 0) {
-      auto result_data = xla::Reshape(aux, aux_shape.dimensions());
+      auto result_data =
+          xla::Reshape(aux, aux_shape.dimensions(), aux_shape.expressions());
       result_data = MoveAxis(result_data, 0, axis, aux_shape);
       ctx->SetOutput(0, result_data);
       ctx->SetOutput(1, xla::Iota(ctx->builder(), xla::S32, leading_size));
@@ -171,10 +180,13 @@ class UniqueOpBase : public XlaOpKernel {
     sort_types.reserve(product + 1);
     for (int64_t i = 0; i < product; ++i) {
       xla::XlaOp slice = xla::SliceInDim(aux, i, i + 1, 1, 1);
-      sort_keys.push_back(xla::Reshape(slice, {leading_size}));
+      sort_keys.push_back(xla::Reshape(slice, {leading_size}, {leading_expr}));
       sort_types.push_back(input_shape.element_type());
     }
-    auto iota = xla::Iota(ctx->builder(), xla::S32, leading_size);
+    xla::Shape iota_shape =
+        xla::ShapeUtil::MakeShape(xla::S32, {leading_size}, {leading_expr});
+    iota_shape.set_expression(0, leading_expr);
+    auto iota = xla::Iota(ctx->builder(), iota_shape, 0);
     sort_keys.push_back(iota);
     sort_types.push_back(xla::S32);
 
@@ -202,16 +214,18 @@ class UniqueOpBase : public XlaOpKernel {
     gather_dim_numbers.add_collapsed_slice_dims(0);
     auto permuted = xla::Gather(aux, perm, gather_dim_numbers, {1, product});
     // Tail is everything except for first element.
-    auto tail = xla::SliceInDim(permuted, 1, leading_size, 1, 0);
+    auto tail = xla::SliceInDim(permuted, 1, leading_size,
+                                xla::DynExpr::one, leading_expr, 1, 0);
     // Init is everything except for last element.
-    auto init = xla::SliceInDim(permuted, 0, leading_size - 1, 1, 0);
+    auto init = xla::SliceInDim(permuted, 0, leading_size - 1,
+                                xla::DynExpr::zero, *leading_expr - 1, 1, 0);
     auto ne = xla::Compare(tail, init, xla::ComparisonDirection::kNe);
     auto reduce =
         xla::Reduce(ne, xla::ConstantR0(ctx->builder(), false),
                     CreateScalarOrComputation(xla::PRED, ctx->builder()), {1});
     auto mask = xla::ConvertElementType(reduce, xla::S32);
     mask = xla::PadInDim(mask, xla::One(ctx->builder(), xla::S32), 0, 1, 0);
-    auto iperm = RollingSelectR1(ctx, perm, mask, leading_size);
+    auto iperm = RollingSelectR1(ctx, perm, mask, leading_size, leading_expr);
 
     auto sort_by_iperm =
         xla::Sort({iperm, mask, perm},
@@ -232,12 +246,15 @@ class UniqueOpBase : public XlaOpKernel {
         /*is_stable=*/true);
     auto mask_permute = xla::GetTupleElement(mask_sort, 1);
     permuted = xla::Gather(aux, mask_permute, gather_dim_numbers, {1, product});
-    auto result_data = xla::Reshape(permuted, aux_shape.dimensions());
+    auto result_data =
+        xla::Reshape(permuted, aux_shape.dimensions(), aux_shape.expressions());
     result_data = MoveAxis(result_data, 0, axis, aux_shape);
     result_data = xla::SetDimensionSize(result_data, dynamic_size, axis);
     ctx->SetOutput(0, result_data);
     auto imask = CumSumR1(ctx, mask, leading_size);
-    imask = xla::Sub(imask, xla::One(ctx->builder(), xla::S32), {});
+    auto one = xla::One(ctx->builder(), xla::S32);
+    auto one_broadcast = xla::Broadcast(one, {leading_size}, {leading_expr});
+    imask = xla::Sub(imask, one_broadcast, {});
     auto idx = xla::GetTupleElement(
         xla::Sort({perm_sort, imask},
                   xla::CreateScalarLtComputation({xla::S32, xla::S32},
