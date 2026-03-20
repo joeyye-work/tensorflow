@@ -114,9 +114,6 @@ void AppendMarkForCompilationPassFlagsInternal(std::vector<Flag>* flag_list) {
            "Operators whose name starting with .cluster.{id} will likely"
            "to be clustered together if the ids are the same number. "
            ".cluster.none will not be clustered with those having numbered id"),
-      Flag("tf_xla_cluster_single_dynamic_dim",
-           &mark_for_compilation_flags->tf_xla_cluster_single_dynamic_dim,
-           "Only allow clustering of a single dynamic dimension."),
       Flag("tf_xla_cluster_parallel",
            &mark_for_compilation_flags->tf_xla_cluster_parallel,
            "Split parallel compute subgraph info different clusters"),
