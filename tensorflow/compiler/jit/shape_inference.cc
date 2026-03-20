@@ -49,10 +49,17 @@ absl::Status ShapeHandleToTensorShape(
   if (!context->RankKnown(handle)) return absl::OkStatus();
 
   std::vector<int64_t> dims(context->Rank(handle));
+  std::vector<xla::DynExpr*> dyn_exprs(context->Rank(handle));
   for (int32_t i = 0, end = dims.size(); i < end; ++i) {
     dims[i] = context->Value(context->Dim(handle, i));
+    auto ratio = context->DynamicRatio(context->Dim(handle, i));
+    dyn_exprs[i] = ratio > 0 ? (ratio * *xla::DynExpr::V(1))->s()
+                             : xla::DynExpr::_(dims[i]);  // For now
   }
-  return PartialTensorShape::MakePartialShape(dims.data(), dims.size(), shape);
+  auto status =
+      PartialTensorShape::MakePartialShape(dims.data(), dims.size(), shape);
+  shape->set_expressions(dyn_exprs);
+  return status;
 }
 
 absl::Status PropagateShapes(

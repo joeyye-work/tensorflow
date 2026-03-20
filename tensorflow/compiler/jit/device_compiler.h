@@ -36,6 +36,7 @@ limitations under the License.
 #include "tensorflow/compiler/jit/flags.h"
 #include "tensorflow/compiler/jit/tf_graph_to_hlo_compiler.h"
 #include "tensorflow/compiler/jit/xla_compile_util.h"
+#include "tensorflow/compiler/jit/xla_batch_matcher.h"
 #include "tensorflow/compiler/tf2xla/xla_compiler.h"
 #include "tensorflow/core/framework/metrics.h"
 #include "tensorflow/core/framework/op_kernel.h"
@@ -125,7 +126,8 @@ class DeviceCompiler : public ResourceBase {
   DeviceCompilerClient<ExecutableType, ClientType>* compiler_client() {
     return compiler_client_.get();
   }
-
+  XlaBatchMatcher* xla_batch_matcher() { return xla_batch_matcher_.get(); }
+  
   string DebugString() const override;
 
  private:
@@ -177,6 +179,9 @@ class DeviceCompiler : public ResourceBase {
   // Pool of threads for asynchronous compilations.
   std::unique_ptr<thread::ThreadPool> async_compiler_threads_;
 
+  // Specified dynamic batch padding values.
+  std::unique_ptr<XlaBatchMatcher> xla_batch_matcher_;
+
   mutex cluster_mutexes_mu_;
   absl::flat_hash_map<DeviceCompilationClusterSignature, std::unique_ptr<mutex>,
                       DeviceCompilationClusterSignature::Hash>
@@ -225,6 +230,11 @@ DeviceCompiler<ExecutableType, ClientType>::DeviceCompiler(
   async_compiler_threads_ = std::make_unique<tensorflow::thread::ThreadPool>(
       tensorflow::Env::Default(), "async_compiler_threads",
       kNumAsyncDeviceCompilerThreads);
+
+  MarkForCompilationPassFlags* flags = GetMarkForCompilationPassFlags();
+  if (flags->tf_xla_enable_dynamic_sizes) {
+    xla_batch_matcher_ = std::make_unique<XlaBatchMatcher>();
+  }
 }
 
 template <typename ExecutableType, typename ClientType>

@@ -56,6 +56,7 @@ cc_library(
         "//tensorflow/compiler/jit:tf_graph_to_hlo_compiler",
         "//tensorflow/compiler/jit:tf_to_hlo_compiler",
         "//tensorflow/compiler/jit:xla_compile_util",
+        "//tensorflow/compiler/jit:xla_batch_matcher",
         "//tensorflow/core:protos_all_cc",
         "//tensorflow/core/platform:refcount",
         "@com_google_absl//absl/base:core_headers",

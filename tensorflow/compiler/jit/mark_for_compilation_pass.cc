@@ -23,12 +23,14 @@ limitations under the License.
 #include <map>
 #include <memory>
 #include <optional>
+#include <regex>
 #include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <queue>
 
 #include "absl/base/call_once.h"
 #include "absl/container/flat_hash_map.h"
@@ -39,6 +41,7 @@ limitations under the License.
 #include "tensorflow/compiler/jit/deadness_analysis.h"
 #include "tensorflow/compiler/jit/defs.h"
 #include "tensorflow/compiler/jit/device_util.h"
+#include "tensorflow/compiler/jit/encapsulate_util.h"
 #include "tensorflow/compiler/jit/flags.h"
 #include "tensorflow/compiler/jit/resource_operation_safety_analysis.h"
 #include "tensorflow/compiler/jit/xla_cluster_util.h"
@@ -68,6 +71,9 @@ limitations under the License.
 #include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/public/version.h"
 #include "tensorflow/core/util/dump_graph.h"
+#include "tensorflow/core/framework/tensor_shape.pb.h"
+#include "tensorflow/core/grappler/costs/graph_properties.h"
+#include "tensorflow/core/grappler/grappler_item.h"
 
 namespace tensorflow {
 
@@ -109,6 +115,8 @@ class MarkForCompilationPassImpl {
     // stable from run to rum.
     bool deterministic_cluster_names;
 
+    bool enable_dynamic_sizes;
+
     int max_cluster_size;
     int min_cluster_size;
 
@@ -123,6 +131,11 @@ class MarkForCompilationPassImpl {
     std::atomic<int64_t>* fuel;
 
     bool dump_graphs;
+
+    // Enable models to influcence clustering with operator names
+    int annotate_cluster_id;
+
+    bool enable_cluster_parallel;
   };
 
   MarkForCompilationPassImpl(DebugOptions debug_options, Graph* graph,
@@ -245,7 +258,17 @@ class MarkForCompilationPassImpl {
                           " others #", cycles_graph_node_id(), ">");
     }
 
+    int annotated_id() const { return annotated_id_; }
+    void set_annotated_id(int id) { annotated_id_ = id; }
+    int chain_id() const {return chain_id_;}
+    void set_chain_id(int id) {chain_id_ = id;}
+    void add_dim_var(int dim_var) { dim_vars_.insert(dim_var); }
+    const std::set<int>& dim_vars() const { return dim_vars_; }
+
    private:
+    int annotated_id_ = -1;
+    std::set<int> dim_vars_;
+    int chain_id_ = -1;
     int cluster_size_ = 1;
     int cycles_graph_node_id_;
     int effective_cluster_size_;
@@ -316,6 +339,17 @@ class MarkForCompilationPassImpl {
   bool IsCompilationCandidate(Node* n) const {
     return compilation_candidates_.find(n) != compilation_candidates_.end();
   }
+
+  absl::Status AssignAnnotatedClusterIDs();
+  absl::Status AssignDimVars();
+  void collectInputNodes(std::set<Node*> &path_nodes);
+  void collectMergeNodes(const std::vector<Node*>& nodeSet,
+                         std::set<Node*> &merger_nodes);
+  void collectPathNodes(Node* start, std::set<Node*> &path_nodes,
+                        std::set<Node*>& merger_nodes);
+  std::map<Node*, std::vector<Node*>> collectParallelNode(
+      const std::vector<Node*>& nodeSet);
+  absl::Status AssignParallelChains();
 
   // Tries to contract the edge from cluster `from` to cluster `to`.  Returns
   // true if successful.
@@ -651,6 +685,194 @@ absl::Status IgnoreResourceOpForSafetyAnalysis(
   }
   return absl::OkStatus();
 }
+// node mapping to multiple vectors of expressions (one for each output in
+// order)
+static std::map<std::string, std::vector<std::vector<std::unique_ptr<DimExpr>>>>
+    expr_map;
+// Helper to convert ExpressionProto to a readable string.
+std::string ExprProtoToString(const ExpressionProto& e) {
+  switch (e.node_type_case()) {
+    case ExpressionProto::kConstantValue:
+      return std::to_string(e.constant_value());
+    case ExpressionProto::kVariableId:
+      return absl::StrCat("Var(", e.variable_id(), ")");
+    case ExpressionProto::kAddNode:
+      return absl::StrCat("(", ExprProtoToString(e.add_node().lhs()), " + ",
+                         ExprProtoToString(e.add_node().rhs()), ")");
+    case ExpressionProto::kSubNode:
+      return absl::StrCat("(", ExprProtoToString(e.sub_node().lhs()), " - ",
+                         ExprProtoToString(e.sub_node().rhs()), ")");
+    case ExpressionProto::kMulNode:
+      return absl::StrCat("(", ExprProtoToString(e.mul_node().lhs()), " * ",
+                         ExprProtoToString(e.mul_node().rhs()), ")");
+    case ExpressionProto::kDivNode:
+      return absl::StrCat("(", ExprProtoToString(e.div_node().lhs()), " / ",
+                         ExprProtoToString(e.div_node().rhs()), ")");
+    default:
+      return "<none>";
+  }
+}
+
+std::unique_ptr<DimExpr> ExprFromProto(const ExpressionProto& proto) {
+  switch (proto.node_type_case()) {
+    case ExpressionProto::kConstantValue:
+      return DimExpr::Cons(proto.constant_value());
+    case ExpressionProto::kVariableId:
+      return DimExpr::Var(proto.variable_id());
+    case ExpressionProto::kAddNode: {
+      auto lhs = ExprFromProto(proto.add_node().lhs());
+      auto rhs = ExprFromProto(proto.add_node().rhs());
+      // Note: These are owning pointers, but ExprAdd takes raw pointers.
+      // The caller must manage lifetime appropriately.
+      return std::make_unique<ExprAdd>(lhs.release(), rhs.release());
+    }
+    case ExpressionProto::kSubNode: {
+      auto lhs = ExprFromProto(proto.sub_node().lhs());
+      auto rhs = ExprFromProto(proto.sub_node().rhs());
+      return std::make_unique<ExprSub>(lhs.release(), rhs.release());
+    }
+    case ExpressionProto::kMulNode: {
+      auto lhs = ExprFromProto(proto.mul_node().lhs());
+      auto rhs = ExprFromProto(proto.mul_node().rhs());
+      return std::make_unique<ExprMul>(lhs.release(), rhs.release());
+    }
+    case ExpressionProto::kDivNode: {
+      auto lhs = ExprFromProto(proto.div_node().lhs());
+      auto rhs = ExprFromProto(proto.div_node().rhs());
+      return std::make_unique<ExprDiv>(lhs.release(), rhs.release());
+    }
+    case ExpressionProto::NODE_TYPE_NOT_SET:
+    default:
+      return nullptr;
+  }
+}
+
+static xla::DynExpr* DimExprToDynExpr(const DimExpr* e) {
+  switch (e->kind()) {
+    case DimExpr::Kind::kConstant: {
+      auto* ac = static_cast<const Constant*>(e);
+      return xla::DynExpr::_(ac->value());
+    }
+    case DimExpr::Kind::kVariable: {
+      auto* av = static_cast<const Variable*>(e);
+      return xla::DynExpr::V(av->id());  // Use 1 all the time for now
+    }
+    case DimExpr::Kind::kAdd: {
+      auto* ee = static_cast<const ExprAdd*>(e);
+      return *DimExprToDynExpr(ee->lhs()) + *DimExprToDynExpr(ee->rhs());
+    }
+    case DimExpr::Kind::kSub: {
+      auto* ee = static_cast<const ExprSub*>(e);
+      return *DimExprToDynExpr(ee->lhs()) - *DimExprToDynExpr(ee->rhs());
+    }
+    case DimExpr::Kind::kMul: {
+      auto* ee = static_cast<const ExprMul*>(e);
+      return *DimExprToDynExpr(ee->lhs()) * *DimExprToDynExpr(ee->rhs());
+    }
+    case DimExpr::Kind::kDiv: {
+      auto* ee = static_cast<const ExprDiv*>(e);
+      return *DimExprToDynExpr(ee->lhs()) / *DimExprToDynExpr(ee->rhs());
+    }
+  }
+  return nullptr;
+}
+
+// Runs Grappler static inference and logs any ExpressionProto found in output
+// tensor shapes (from GraphProperties, not from _output_shapes attrs).
+void LogExpressionsViaGraphProperties(tensorflow::Graph& graph) {
+  using tensorflow::ExpressionProto;
+  using tensorflow::GraphDef;
+  using tensorflow::NodeDef;
+  using tensorflow::TensorShapeProto;
+  using tensorflow::grappler::GraphProperties;
+  using tensorflow::grappler::GrapplerItem;
+
+  GraphDef graph_def;
+  graph.ToGraphDef(&graph_def);
+  auto node_name_index = graph.BuildNodeNameIndex();
+
+  GrapplerItem item;
+  item.id = "mark_for_compilation_pass_expr_dump";
+  item.graph = graph_def;
+
+  GraphProperties props(item);
+
+  absl::Status st = props.InferStatically(
+      /*assume_valid_feeds=*/false,
+      /*aggressive_shape_inference=*/false,
+      /*include_input_tensor_values=*/false,
+      /*include_output_tensor_values=*/false);
+
+  if (!st.ok()) {
+    LOG(ERROR) << "[EXPR][GP] InferStatically failed: " << st.message();
+    return;
+  }
+
+  int found = 0;
+  VLOG(1) << "[EXPR][GP] === GraphProperties output expr dump ===";
+
+  auto convert_graph_properties_shape = [](const TensorShapeProto& gp_shape) {
+    TensorShapeProto out;
+    out.set_unknown_rank(gp_shape.unknown_rank());
+    for (const auto& dim : gp_shape.dim()) {
+      out.add_dim()->set_size(dim.size());
+      ExpressionProto* expr = out.add_expressions();
+      if (dim.expr().node_type_case() != ExpressionProto::NODE_TYPE_NOT_SET) {
+        *expr = dim.expr();
+      } else {
+        expr->set_constant_value(dim.size());
+      }
+    }
+    return out;
+  };
+
+  for (const NodeDef& n : graph_def.node()) {
+    if (!props.HasOutputProperties(n.name())) continue;
+    const auto& outs = props.GetOutputProperties(n.name());
+    std::vector<TensorShapeProto> inferred_output_shapes;
+    inferred_output_shapes.reserve(outs.size());
+    std::vector<std::vector<std::unique_ptr<DimExpr>>> list_exprs(outs.size());
+    for (int out_idx = 0; out_idx < static_cast<int>(outs.size()); ++out_idx) {
+      const auto& tp = outs[out_idx];
+      const TensorShapeProto& shp = tp.shape();
+      inferred_output_shapes.push_back(convert_graph_properties_shape(shp));
+
+      std::vector<std::unique_ptr<DimExpr>> exprs;
+      for (int d = 0; d < shp.dim_size(); ++d) {
+        const auto& dim = shp.dim(d);
+
+        const ExpressionProto& expr = dim.expr();
+        if (expr.node_type_case() == ExpressionProto::NODE_TYPE_NOT_SET)
+          continue;
+
+        VLOG(1) << "Node " << n.name() << " has expression "
+                << ExprProtoToString(expr);
+
+        auto ex = ExprFromProto(expr);
+        exprs.push_back(std::move(ex));
+
+        ++found;
+      }
+      if (shp.dim_size() == 0 && shp.unknown_rank()) {
+        // Add two dummy variables to represent the unknown rank
+        exprs.push_back(std::make_unique<Variable>(-888));
+        exprs.push_back(std::make_unique<Variable>(-889));
+      }
+
+      list_exprs[out_idx] = std::move(exprs);
+    }
+    expr_map[n.name()] = std::move(list_exprs);
+    auto node_it = node_name_index.find(n.name());
+    if (node_it != node_name_index.end()) {
+      node_it->second->AddAttr(kXlaInferredOutputTensorShapesAttrName,
+                               inferred_output_shapes);
+    }
+
+  }
+
+  VLOG(1) << "[EXPR][GP] === Found " << found
+          << " expressions via GraphProperties ===";
+}
 
 absl::StatusOr<bool> MarkForCompilationPassImpl::Initialize() {
   TF_RET_CHECK(!initialized_ && !edges_contracted_ && !clusters_created_);
@@ -686,6 +908,19 @@ absl::StatusOr<bool> MarkForCompilationPassImpl::Initialize() {
   // representative names the node in the 'cycles' graph that represents the
   // cluster.
   TF_RETURN_IF_ERROR(BuildInitialClusterSet());
+
+  // Source model may be annotated with preferred clusters. This function
+  // just interpreter the annotations and assign preferred IDs
+  if (debug_options_.annotate_cluster_id) {
+    TF_RETURN_IF_ERROR(AssignAnnotatedClusterIDs());
+  }
+  if (debug_options_.enable_dynamic_sizes) {
+    LogExpressionsViaGraphProperties(*graph_);
+    TF_RETURN_IF_ERROR(AssignDimVars());
+  }
+  if (debug_options_.enable_cluster_parallel) {
+    TF_RETURN_IF_ERROR(AssignParallelChains());
+  }
   return true;
 }
 
@@ -893,7 +1128,12 @@ absl::Status MarkForCompilationPassImpl::RunEdgeContractionLoop() {
                       ForEachEdgeInPostOrder([&](Cluster* from, Cluster* to) {
                         return TryToContractEdge(from, to);
                       }));
+  /* Clustering conditions for dynamic shapes may break the assumption of
+   * fixed point at phase 2, so this check may fail.
+   * Now just disable this check, and we can re-enable it after we have more
+   * confidence in the code.
   TF_RET_CHECK(!changed);
+   */
 
   return absl::OkStatus();
 }
@@ -1028,6 +1268,7 @@ absl::Status MarkForCompilationPassImpl::CreateClusters() {
     // trouble.
 
     if (cluster->effective_cluster_size() >= debug_options_.min_cluster_size ||
+        cluster->chain_id() != -1 ||
         cluster->has_functional_control_flow() ||
         cluster->is_xla_compile_attr_true()) {
       string& name = cluster_names[cluster->cycles_graph_node_id()];
@@ -1548,14 +1789,303 @@ bool MarkForCompilationPassImpl::CompilationDisallowedByXlaCompileAttr(
   return false;
 }
 
+absl::Status MarkForCompilationPassImpl::AssignAnnotatedClusterIDs(void) {
+  VLOG(1) << "Run AssignAnnotatedClusterIDs";
+
+  for (Node* node : graph_->nodes()) {
+    Cluster * cluster = GetClusterForNode(node);
+    auto name = node->name();
+    if (cluster) {
+      std::string pat = "^\\.cluster\\.(\\d+|none)";
+      std::regex idPattern(pat);
+      std::smatch matched;
+      if (std::regex_search(name, matched, idPattern)) {
+	auto m = matched.str(1);
+	if (m == "none") {
+          // Prefer not to cluster
+	  VLOG(1) << name << " : Default annotated cluster id -1";
+	  cluster->set_annotated_id(-1);
+	}
+	else {
+	  try {
+	    int id = std::stoi(m);
+	    cluster->set_annotated_id(id);
+	    VLOG(1) << name << " : Set annotated cluster id " << m;
+	  }
+	  catch (...) {
+            VLOG(1) << name << " : Invalid cluster id: " << m;
+	  }
+	}
+      }
+      else {
+        VLOG(1) << "Not matched: " << name << " pattern is " << pat;
+      }
+    }
+    else {
+      VLOG(1) << name << ": Not initially clustered";
+    }
+  }
+  return absl::OkStatus();
+}
+
+absl::Status MarkForCompilationPassImpl::AssignDimVars(void) {
+  for (Node* node : graph_->nodes()) {
+    auto node_name = node->name();
+    Cluster * cluster = GetClusterForNode(node);
+    if (!cluster) continue;
+    for (const tensorflow::Edge* edge : node->in_edges()) {
+      if (edge->IsControlEdge()) {
+          // Skip control edges if you are only interested in data edges
+          continue;
+      }
+
+      const tensorflow::Node* input = edge->src(); // Source node of the edge
+      auto it = expr_map.find(input->name());
+      if (it == expr_map.end()) {
+        VLOG(2) << "No expression found for node " << input->name();
+        continue;
+      }
+
+      auto output_index = edge->src_output(); // Output index of the source node
+      if (output_index >= (it->second).size()) {
+        LOG(INFO) << "Warning: Output index " << output_index << " is out of bounds for node " << input->name();
+        continue;
+      }
+      for (auto& pDim: (it->second)[output_index]) {
+        DimExpr * d= pDim.get();
+        xla::DynExpr * dyn = DimExprToDynExpr(d);
+        auto new_ids = dyn->get_all_ids();
+        for (auto id : new_ids) {
+          cluster->add_dim_var(id);
+          VLOG(2) << "Add dim var " << id << " to cluster of node "<< node_name;
+        }
+      }
+    }
+    // create a for loop for each dim vars in cluster and print each dim var
+    if (VLOG_IS_ON(2)) {
+      if (cluster->dim_vars().empty()) {
+        VLOG(2) << "Cluster of node " << node_name << " has no dim vars.";
+      }
+      else {
+        std::string id_str;
+        for (auto id : cluster->dim_vars()) {
+          id_str += "Dim var " + std::to_string(id) + ", ";
+        }
+        VLOG(2) << "Cluster of node " << node_name << " has dim vars:\n" << id_str;
+      }
+    }
+  }
+  return absl::OkStatus();
+}
+
 bool MarkForCompilationPassImpl::LogNotContractableAndReturnFalse(
     Cluster* from, Cluster* to, absl::string_view reason) {
   VLOG(3) << EdgeContractionFailureMsg(from, to, reason);
   return false;
 }
 
+void MarkForCompilationPassImpl::collectInputNodes(std::set<Node*> &path_nodes) {
+  std::unordered_map<Node*, int> out_degree_count;
+
+  // 4. Initialize the queue and add nodes from path_nodes
+  std::queue<Node*> queue;
+  for (auto node : path_nodes) {
+    queue.push(node);
+  }
+
+  // 5. BFS search
+  while (!queue.empty()) {
+    auto u = queue.front();
+    queue.pop();
+
+    // Traverse all predecessor nodes
+    for (const Edge* e : u->in_edges()) {
+      Node* p = e->src();
+      if (path_nodes.find(p) != path_nodes.end() ||
+          !IsCompilationCandidate(p)) {
+        continue;
+      }
+      if (out_degree_count.count(p) == 0) {
+        // Initialize the out-degree count for the node
+        out_degree_count[p] = p->out_edges().size();
+      }
+      // Decrease the out-degree count for the predecessor node
+      out_degree_count[p] -= 1;
+
+      // If the predecessor node's out-degree count is 0 and not in path_nodes,
+      // add it to path_nodes and queue
+      if (out_degree_count[p] == 0) {
+        path_nodes.insert(p);
+        queue.push(p);
+        VLOG(3) << p->DebugString();
+      }
+    }
+  }
+}
+
+void MarkForCompilationPassImpl::collectMergeNodes(
+    const std::vector<Node*>& nodeSet, std::set<Node*> &merger_nodes) {
+  // 1. Collect the number of nodeSet that can reach each node
+  std::map<Node*, std::set<Node*>> reach_map;
+  for (Node* start : nodeSet) {
+    std::set<Node*> visited;
+    std::vector<Node*> stack = {start};
+    while (!stack.empty()) {
+      Node* cur = stack.back();
+      stack.pop_back();
+      if (visited.count(cur)) continue;
+      visited.insert(cur);
+      for (const Edge* e : cur->out_edges()) {
+        Node* next = e->dst();
+        if (!visited.count(next))
+          stack.push_back(next);
+      }
+    }
+    reach_map[start] = std::move(visited);
+  }
+
+  // 2. Determine the merger node
+  std::map<Node*, int> node_reach_count;
+  std::set<Node*> all_nodes;
+  for (const auto& kv : reach_map) {
+    for (Node* n : kv.second) {
+      node_reach_count[n]++;
+      all_nodes.insert(n);
+    }
+  }
+  for (Node* n : all_nodes) {
+    // Condition 1: Reached by multiple sources
+    if (node_reach_count[n] >= 2) merger_nodes.insert(n);
+    // Condition 2: No output edges
+    if (n->out_edges().empty()) merger_nodes.insert(n);
+  }
+}
+
+void MarkForCompilationPassImpl::collectPathNodes(
+    Node* start, std::set<Node*> &path_nodes, std::set<Node*>& merger_nodes) {
+  std::vector<Node*> stack = {start};
+  std::set<Node*> visited;
+
+  while (!stack.empty()) {
+    Node* cur = stack.back();
+    stack.pop_back();
+    if (visited.count(cur) || !IsCompilationCandidate(cur)) {
+      continue;
+    }
+    visited.insert(cur);
+
+    // Stop search met the merger node
+    if (merger_nodes.count(cur)) {
+      if (cur->out_edges().empty()) path_nodes.insert(cur);
+      continue;
+    }
+    path_nodes.insert(cur);
+
+    for (const Edge* e : cur->out_edges()) {
+      Node* next = e->dst();
+      if (!visited.count(next)) {
+        stack.push_back(next);
+      }
+    }
+  }
+}
+
+// collectParallelNode
+// Search the serial merger nodes based on the parallel matmul starting points
+// Search along the output edge to get the boundary from start to all merger points
+// Search along the input edge to get the entire parallel computation graph
+std::map<Node*, std::vector<Node*>>
+MarkForCompilationPassImpl::collectParallelNode(
+    const std::vector<Node*>& nodeSet) {
+  std::set<Node*> merger_nodes;
+  collectMergeNodes(nodeSet, merger_nodes);
+
+  // Collect path nodes
+  std::map<Node*, std::vector<Node*>> result;
+  for (Node* start : nodeSet) {
+    VLOG(4) << "Search parallel graph form node: " << start->DebugString();
+    std::set<Node*> path_nodes;
+
+    // Search along output edge form start to merger nodes
+    collectPathNodes(start, path_nodes, merger_nodes);
+
+    VLOG(4) << "Collect path nodes:";
+    for (auto node : path_nodes) {
+      VLOG(4) << node->type_string();
+    }
+
+    VLOG(4) << "Collect input nodes:";
+    // search along input edge
+    collectInputNodes(path_nodes);
+
+    result[start] = std::vector<Node*>(path_nodes.begin(), path_nodes.end());
+  }
+  return result;
+}
+
+// Collect parallel matmuls as input nodes into nodeSet
+// Use collectParallelNode to get the parallel subgraph
+// Mark parallel nodes change ID
+absl::Status MarkForCompilationPassImpl::AssignParallelChains() {
+  VLOG(4) << "Run AssignParallelChains";
+  // Record the matmuls that can be paralleled
+  std::vector<std::vector<Node*>> parallel_matmuls;
+  int minParallelMatmulNum = 2;
+  int next_chain_id = 0;
+  // Collect matmul nodes with shared input to parallel_matmuls
+  for (Node* node : graph_->nodes()) {
+    if (node->out_edges().size() < 2) continue;
+    std::vector<Node*> matmul_nodes;
+    for (const Edge* e : node->out_edges()) {
+      if (e->IsControlEdge()) continue;
+      Node* succ = e->dst();
+      VLOG(4) << "Find matmul node: " << succ->type_string() << " : " << succ->DebugString();
+      if (succ->type_string() == "MatMul")
+        matmul_nodes.push_back(succ);
+    }
+    if (matmul_nodes.size() >= minParallelMatmulNum)
+      parallel_matmuls.push_back(matmul_nodes);
+  }
+
+  for (auto matmul_nodes : parallel_matmuls) {
+    VLOG(4) << "Process matmul nodes: Total " << matmul_nodes.size()
+            << " sub matmuls";
+    bool visited = false;
+    for (auto matmul : matmul_nodes) {
+      VLOG(4) << matmul->name();
+      Cluster* cluster = GetClusterForNode(matmul);
+      if (!cluster || cluster->chain_id() != -1) {
+        visited = true;
+        break;
+      }
+    }
+    if (visited) {
+      VLOG(4) << "stop collect: has visited matmul";
+      continue;
+    }
+
+    std::map<Node*, std::vector<Node*>> subgraphMap =
+        collectParallelNode(matmul_nodes);
+    for (auto it : subgraphMap) {
+      auto nodeSet = it.second;
+      VLOG(4) << "One of Parallel sub-graph is: ";
+      for (auto node : nodeSet) {
+        VLOG(4) << node->DebugString();
+        Cluster* cluster = GetClusterForNode(node);
+        cluster->set_chain_id(next_chain_id);
+      }
+      next_chain_id++;
+    }
+  }
+  return absl::OkStatus();
+}
+
 absl::StatusOr<bool> MarkForCompilationPassImpl::TryToContractEdge(
     Cluster* from, Cluster* to) {
+  if (from->chain_id() != to->chain_id()) {
+    return LogNotContractableAndReturnFalse(
+        from, to, "nodes are in different parallel chains");
+  }
   DCHECK(from->deadness_predicate().has_value() ==
          to->deadness_predicate().has_value());
   if (from->deadness_predicate() != to->deadness_predicate()) {
@@ -1567,6 +2097,38 @@ absl::StatusOr<bool> MarkForCompilationPassImpl::TryToContractEdge(
             " and ",
             deadness_analysis_->DebugString(*to->deadness_predicate())));
     return false;
+  }
+
+  if (debug_options_.annotate_cluster_id && from->annotated_id() != to->annotated_id()) {
+    return LogNotContractableAndReturnFalse(
+        from, to, "the two nodes do not have same annotated ids");
+  }
+
+  if (debug_options_.enable_dynamic_sizes) {
+    if (from->dim_vars().size() > 1 || to->dim_vars().size() > 1) {
+      std::string from_str = "from_vars: ";
+      for (auto id : from->dim_vars()) {
+        from_str += std::to_string(id) + ", ";
+      }
+      std::string to_str = "to_vars: ";
+      for (auto id : to->dim_vars()) {
+        to_str += std::to_string(id) + ", ";
+      }
+      return LogNotContractableAndReturnFalse(
+        from, to, absl::StrCat("the two nodes have multiple dynamic dimensions: ",
+        from_str, " and ", to_str));
+    }
+    if (from->dim_vars().size() == 1 && to->dim_vars().size() == 1 &&
+        from->dim_vars() != to->dim_vars()) {
+      return LogNotContractableAndReturnFalse(
+        from, to,
+        absl::StrCat("the two nodes have different dynamic dimensions: ",
+                     from->dim_vars().size() == 1
+                       ? std::to_string(*from->dim_vars().begin()) : "none",
+                     " and ",
+                     to->dim_vars().size() == 1
+                       ? std::to_string(*to->dim_vars().begin()) : "none"));
+    }
   }
 
   TF_ASSIGN_OR_RETURN(bool devices_compatible,
@@ -1639,7 +2201,6 @@ absl::Status MarkForCompilationPassImpl::Run() {
     // MarkForCompilationPassImpl is not set up to run the subsequent phases.
     return absl::OkStatus();
   }
-
   TF_RETURN_IF_ERROR(RunEdgeContractionLoop());
   TF_RETURN_IF_ERROR(DeclusterNodes());
   TF_RETURN_IF_ERROR(CreateClusters());
@@ -1958,10 +2519,14 @@ absl::Status MarkForCompilationPass::Run(
   debug_options.ignore_xla_compile_attr = false;
   debug_options.deterministic_cluster_names =
       flags->tf_xla_deterministic_cluster_names;
+  debug_options.enable_dynamic_sizes =
+      flags->tf_xla_enable_dynamic_sizes;
   debug_options.max_cluster_size = flags->tf_xla_max_cluster_size;
   debug_options.min_cluster_size = flags->tf_xla_min_cluster_size;
   debug_options.fuel = GetPointerToFuel(flags->tf_xla_clustering_fuel);
   debug_options.dump_graphs = flags->tf_xla_clustering_debug;
+  debug_options.annotate_cluster_id = flags->tf_xla_annotate_cluster_id;
+  debug_options.enable_cluster_parallel = flags->tf_xla_cluster_parallel;
 
   return MarkForCompilation(options, debug_options);
 }
@@ -1977,10 +2542,12 @@ absl::Status MarkForCompilationPass::RunForTest(
       flags->tf_xla_disable_resource_variable_safety_checks_for_debugging;
   debug_options.ignore_xla_compile_attr = true;
   debug_options.deterministic_cluster_names = deterministic_cluster_names;
+  debug_options.enable_dynamic_sizes = false;
   debug_options.max_cluster_size = flags->tf_xla_max_cluster_size;
   debug_options.min_cluster_size = flags->tf_xla_min_cluster_size;
   debug_options.fuel = GetPointerToFuel(flags->tf_xla_clustering_fuel);
   debug_options.dump_graphs = flags->tf_xla_clustering_debug;
+  debug_options.annotate_cluster_id = flags->tf_xla_annotate_cluster_id;
 
   return MarkForCompilation(options, debug_options);
 }

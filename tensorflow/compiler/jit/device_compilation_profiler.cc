@@ -21,6 +21,7 @@ limitations under the License.
 #include <utility>
 
 #include "absl/strings/str_cat.h"
+#include "tensorflow/compiler/jit/flags.h"
 #include "tensorflow/compiler/jit/xla_activity.pb.h"
 #include "tensorflow/compiler/jit/xla_activity_listener.h"
 #include "tensorflow/core/framework/attr_value.pb.h"
@@ -32,8 +33,29 @@ limitations under the License.
 namespace tensorflow {
 namespace {
 bool ShouldBeMegamorphic(int64_t compile_count, int64_t execution_count) {
-  const int64_t kCompileThreshold = 10;
+  int64_t kCompileThreshold = 10;
   const int64_t kMinExecutionsPerCompile = 50;
+
+  int64_t tf_xla_threshold_for_megamorphic =
+      GetMarkForCompilationPassFlags()->tf_xla_threshold_for_megamorphic;
+
+  // Negative values other that -1 cannot be used
+  if (tf_xla_threshold_for_megamorphic < -1) {
+    LOG(FATAL) << "The value for the tf_xla_threshold_for_megamorphic flag "
+               << "is out of range.\n"
+               << "Allowed ranges are (-1) to "
+               << std::numeric_limits<int64_t>::max()
+               << " got " << tf_xla_threshold_for_megamorphic << ".";
+  }
+
+  // -1: setting clusters as Megamorphic is disabled
+  //  0 Default behaviour in Tensorflow
+  //  Any other number sets the compilation threshold
+  if (tf_xla_threshold_for_megamorphic == -1) {
+    return false;
+  } else if (tf_xla_threshold_for_megamorphic > 0) {
+    kCompileThreshold = tf_xla_threshold_for_megamorphic;
+  }
 
   // This heuristic is trying to capture the following property: have we sunk a
   // certain minimum amount of compile time into the cluster that didn't quite
