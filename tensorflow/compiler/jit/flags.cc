@@ -46,7 +46,7 @@ std::vector<Flag>* jitrt_flag_list;
 std::vector<Flag>* flag_list;
 absl::once_flag flags_init;
 
-bool SetterForXlaAutoJitFlag(const std::string& value) {
+bool SetterForXlaAutoJitFlag(const string& value) {
   int32_t opt_level;
   // We need to use the mark_for_compilation_flags directly here instead of
   // going via GetMarkForCompilationPassFlags() to avoid infinite recursion. The
@@ -81,7 +81,7 @@ bool SetterForXlaAutoJitFlag(const std::string& value) {
   return true;
 }
 
-bool SetterForXlaCallModuleDisabledChecks(const std::string& value) {
+bool SetterForXlaCallModuleDisabledChecks(const string& value) {
   auto directives = absl::StrSplit(value, ',', absl::SkipEmpty());
   call_module_flags->disabled_checks.insert(directives.begin(),
                                             directives.end());
@@ -108,6 +108,18 @@ void AppendMarkForCompilationPassFlagsInternal(std::vector<Flag>* flag_list) {
       Flag("tf_xla_max_cluster_size",
            &mark_for_compilation_flags->tf_xla_max_cluster_size,
            "Maximum number of operators in an XLA compilation."),
+      Flag("tf_xla_annotate_cluster_id",
+           &mark_for_compilation_flags->tf_xla_annotate_cluster_id,
+           "Allow operator names to influence clustering scheme."
+           "Operators whose name starting with .cluster.{id} will likely"
+           "to be clustered together if the ids are the same number. "
+           ".cluster.none will not be clustered with those having numbered id"),
+      Flag("tf_xla_cluster_single_dynamic_dim",
+           &mark_for_compilation_flags->tf_xla_cluster_single_dynamic_dim,
+           "Only allow clustering of a single dynamic dimension."),
+      Flag("tf_xla_cluster_parallel",
+           &mark_for_compilation_flags->tf_xla_cluster_parallel,
+           "Split parallel compute subgraph info different clusters"),
       Flag(
           "tf_xla_ops_to_cluster",
           &mark_for_compilation_flags->tf_xla_ops_to_cluster,
@@ -155,6 +167,9 @@ void AppendMarkForCompilationPassFlagsInternal(std::vector<Flag>* flag_list) {
            &mark_for_compilation_flags->tf_xla_deterministic_cluster_names,
            "Causes the function names assigned by auto clustering to be "
            "deterministic from run to run."),
+      Flag("tf_xla_enable_dynamic_sizes",
+           &mark_for_compilation_flags->tf_xla_enable_dynamic_sizes,
+           "Enable dynamic sizes support."),
       Flag("tf_xla_persistent_cache_directory",
            &mark_for_compilation_flags->tf_xla_persistent_cache_directory,
            "If non-empty, JIT-compiled executables are saved to and loaded "
@@ -175,6 +190,11 @@ void AppendMarkForCompilationPassFlagsInternal(std::vector<Flag>* flag_list) {
            &mark_for_compilation_flags->tf_xla_persistent_cache_prefix,
            "Specifies the persistance cache prefix. Default is "
            "\"xla_compile_cache\""),
+     Flag("tf_xla_threshold_for_megamorphic",
+           &mark_for_compilation_flags->tf_xla_threshold_for_megamorphic,
+           "Sets the threshold for marking a cluster megamorphic. "
+           "Setting it to -1 disables marking clusters megamorphic."
+           "Setting it to 0 uses the default behaviour of TensorFlow."),
       Flag("tf_xla_sparse_core_disable_table_stacking",
            &sparse_core_flags->tf_xla_sparse_core_disable_table_stacking,
            "Disable table stacking for all the tables passed to the SparseCore"
@@ -231,16 +251,21 @@ void AllocateAndParseFlags() {
   mark_for_compilation_flags->xla_auto_jit_flag.optimization_level_general = 0;
   mark_for_compilation_flags->tf_xla_min_cluster_size = 4;
   mark_for_compilation_flags->tf_xla_max_cluster_size =
-      std::numeric_limits<int32_t>::max();
+      std::numeric_limits<int32>::max();
+  mark_for_compilation_flags->tf_xla_annotate_cluster_id = false;
+  mark_for_compilation_flags->tf_xla_cluster_single_dynamic_dim = false;
+  mark_for_compilation_flags->tf_xla_cluster_parallel = false;
   mark_for_compilation_flags->tf_xla_clustering_debug = false;
   mark_for_compilation_flags->tf_xla_cpu_global_jit = false;
   mark_for_compilation_flags->tf_xla_clustering_fuel =
       std::numeric_limits<int64_t>::max();
+  mark_for_compilation_flags->tf_xla_threshold_for_megamorphic = 0;
   mark_for_compilation_flags
       ->tf_xla_disable_deadness_safety_checks_for_debugging = false;
   mark_for_compilation_flags
       ->tf_xla_disable_resource_variable_safety_checks_for_debugging = false;
   mark_for_compilation_flags->tf_xla_deterministic_cluster_names = false;
+  mark_for_compilation_flags->tf_xla_enable_dynamic_sizes = false;
   mark_for_compilation_flags->tf_xla_persistent_cache_directory = "";
   mark_for_compilation_flags->tf_xla_persistent_cache_device_types = "";
   mark_for_compilation_flags->tf_xla_persistent_cache_read_only = false;
@@ -287,11 +312,9 @@ void AllocateAndParseFlags() {
   bool enable_mlir_composite_tpuexecute_side_effects = false;
   bool enable_mlir_strict_clusters = false;
   bool enable_mlir_multiple_local_cpu_devices = false;
-  bool enable_mlir_debug_info_serialization = true;
   // Dump graphs in TFG dialect.
   bool use_tfg_graph_dumper = false;
   bool enable_tpu_variable_runtime_reformatting_pass = true;
-  bool enable_serialize_mlir_to_compressed_bytecode = false;
 
   flag_list = new std::vector<Flag>(
       {Flag("tf_xla_enable_lazy_compilation",
@@ -396,9 +419,6 @@ void AllocateAndParseFlags() {
             "Enable multiple local CPU devices. CPU ops which are outside "
             "compiled inside the tpu cluster will also be replicated across "
             "multiple cpu devices."),
-       Flag("tf_mlir_enable_debug_info_serialization",
-            &enable_mlir_debug_info_serialization,
-            "Enable debug info serialization in MLIR."),
        Flag("tf_dump_graphs_in_tfg", &use_tfg_graph_dumper,
             "When tf_dump_graphs_in_tfg is true, graphs after transformations "
             "are dumped in MLIR TFG dialect and not in GraphDef"),
@@ -406,10 +426,7 @@ void AllocateAndParseFlags() {
             &enable_tpu_variable_runtime_reformatting_pass,
             "Enables TPUVariableRuntimeReformatting pass for MLIR-Based "
             "TensorFlow Compiler Bridge. This enables weight update sharding "
-            "and creates TPUReshardVariables ops."),
-       Flag("tf_serialize_mlir_to_compressed_bytecode",
-            &enable_serialize_mlir_to_compressed_bytecode,
-            "If true, serialize MLIR to compressed bytecode.")});
+            "and creates TPUReshardVariables ops.")});
 
   AppendMarkForCompilationPassFlagsInternal(flag_list);
   xla::ParseFlagsFromEnvAndDieIfUnknown("TF_XLA_FLAGS", *flag_list);
@@ -436,10 +453,6 @@ void AllocateAndParseFlags() {
       enable_tpu_variable_runtime_reformatting_pass;
   mlir_flags->tf_mlir_enable_multiple_local_cpu_devices =
       enable_mlir_multiple_local_cpu_devices;
-  mlir_flags->tf_mlir_enable_debug_info_serialization =
-      enable_mlir_debug_info_serialization;
-  mlir_flags->tf_serialize_mlir_to_compressed_bytecode =
-      enable_serialize_mlir_to_compressed_bytecode;
 
   if (use_tfg_graph_dumper) {
     UseMlirForGraphDump(MlirDumpConfig{}.elide_large_attributes().emit_dialect(
@@ -463,7 +476,7 @@ void ResetFlags() {
 
 }  // namespace
 
-bool SetXlaAutoJitFlagFromFlagString(const std::string& value) {
+bool SetXlaAutoJitFlagFromFlagString(const string& value) {
   absl::call_once(flags_init, &AllocateAndParseFlags);
   return SetterForXlaAutoJitFlag(value);
 }
