@@ -662,9 +662,12 @@ absl::Status CompileToLocalExecutable(
             old_vars.push_back({i, j, old});
             xla::DynExpr* padded_expr = xla::DynExpr::_(filled_batch);
             xla::DynExpr* subst_expr = e->substitute(1, padded_expr)->s();
-            shp.set_dim(j, subst_expr->get_val());
-            // Necessary because set_dim removes the expression:
-            shp.set_expression(j, e);
+            int64_t new_dim = subst_expr->get_val();
+            if (new_dim >= 0) {
+              shp.set_dim(j, new_dim);
+              // Necessary because set_dim removes the expression:
+              shp.set_expression(j, e);
+            }
           }
         }
         maybe_rewrite_scalar_constant(i);
