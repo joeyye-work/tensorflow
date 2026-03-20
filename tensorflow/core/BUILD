@@ -61,14 +61,15 @@
 # //tensorflow/tensorflow.bzl) will include the necessary symbols in binary
 # build targets.
 
-load("@com_google_protobuf//bazel:java_proto_library.bzl", "java_proto_library")
+# Placeholder: load py_proto_library
 load("@local_config_cuda//cuda:build_defs.bzl", "if_cuda")
 load("@local_config_tensorrt//:build_defs.bzl", "if_tensorrt")
 load(
     "@local_xla//xla/tsl/mkl:build_defs.bzl",
     "if_mkl",
 )
-load("@rules_python//python:proto.bzl", "py_proto_library")
+
+# Placeholder: load java_proto_library
 load(
     "//tensorflow:tensorflow.bzl",
     "if_android",
@@ -347,7 +348,6 @@ cc_library(
         ":lib_internal",
         ":protos_all_cc",
         "//tensorflow/core/kernels:required",
-        "@com_google_absl//absl/status:status_matchers",
         "@local_tsl//tsl/platform:test",
         "@local_tsl//tsl/platform:test_benchmark",
     ] + tf_additional_test_deps(),
@@ -417,7 +417,6 @@ tf_cuda_library(
         "//tensorflow/core/framework:tensor_slice.h",
         "//tensorflow/core/framework:tensor_types.h",
         "//tensorflow/core/framework:tensor_util.h",
-        "//tensorflow/core/framework:tf_data_file_logger_options.h",
         "//tensorflow/core/framework:thread_factory.h",
         "//tensorflow/core/framework:tracking_allocator.h",
         "//tensorflow/core/framework:type_index.h",
@@ -493,6 +492,8 @@ cc_library(
         "@local_tsl//tsl/platform:framework_lite_hdrs",
         "@local_xla//xla/tsl/framework:numeric_types.h",
         "@local_xla//xla/tsl/framework:type_traits.h",
+        "@local_xla//xla/tsl/platform/default:integral_types.h",
+        "@local_xla//xla/tsl/platform/default:logging.h",
     ],
     visibility = ["//visibility:public"],
     deps = [
@@ -1072,7 +1073,6 @@ cc_library(
 #         "@com_google_absl//absl/status:statusor",
 #         "@com_google_absl//absl/strings",
 #         "@com_google_absl//absl/types:optional",
-#         "@local_xla//xla/tsl/concurrency:executor",
 #         "@local_xla//xla/tsl/framework/fixedpoint",
 #         "@local_xla//xla/tsl/util:safe_reinterpret_cast",
 #         "//tensorflow/core/platform:resource",
@@ -1472,6 +1472,10 @@ cc_library(
     }) +
     # The TF proto implementations that we will statically link here.
     [
+        "//tensorflow/compiler/mlir/lite:model_flags_proto_cc_impl",
+        "//tensorflow/compiler/mlir/lite:converter_flags_proto_cc_impl",
+        "//tensorflow/compiler/mlir/lite:types_proto_cc_impl",
+        "//tensorflow/compiler/mlir/lite/debug:debug_options_proto_cc_impl",
         "//tensorflow/compiler/mlir/quantization/stablehlo:quantization_config_proto_cc_impl",
         "//tensorflow/compiler/mlir/quantization/stablehlo:quantization_options_proto_cc_impl",
         "//tensorflow/compiler/mlir/quantization/tensorflow:exported_model_proto_cc_impl",
@@ -1494,19 +1498,10 @@ cc_library(
         "@local_xla//xla/service/gpu/model:hlo_op_profile_proto_cc_impl",
         "@local_xla//xla/stream_executor:device_description_proto_cc_impl",
         "@local_xla//xla/stream_executor/cuda:cuda_compute_capability_proto_cc_impl",
-    ] + tf_protos_grappler_impl() + tf_monitoring_framework_deps() + select({
-        # Disable the TF Lite proto implementations in the OSS build for LiteRT repository.
-        "//tensorflow:disable_tf_lite_py": [],
-        "//conditions:default": [
-            "//tensorflow/compiler/mlir/lite:converter_flags_proto_cc_impl",
-            "//tensorflow/compiler/mlir/lite:model_flags_proto_cc_impl",
-            "//tensorflow/compiler/mlir/lite:types_proto_cc_impl",
-            "//tensorflow/compiler/mlir/lite/debug:debug_options_proto_cc_impl",
-            "//tensorflow/lite/toco:model_flags_proto_cc_impl",
-            "//tensorflow/lite/toco:toco_flags_proto_cc_impl",
-            "//tensorflow/lite/toco:types_proto_cc_impl",
-        ],
-    }),
+        "//tensorflow/lite/toco:toco_flags_proto_cc_impl",
+        "//tensorflow/lite/toco:model_flags_proto_cc_impl",
+        "//tensorflow/lite/toco:types_proto_cc_impl",
+    ] + tf_protos_grappler_impl() + tf_monitoring_framework_deps(),
     # Alwayslink causes a cc_binary to "always link" in the
     # srcs for a given cc_library, even if they are unreferenced, see:
     # https://docs.bazel.build/versions/master/be/c-cpp.html#cc_library.alwayslink
@@ -1536,6 +1531,8 @@ cc_library(
     hdrs = [
         "//tensorflow/core/platform:tflite_portable_logging_hdrs",
         "@local_tsl//tsl/platform:tflite_portable_logging_hdrs",
+        "@local_xla//xla/tsl/platform/default:integral_types.h",
+        "@local_xla//xla/tsl/platform/default:logging.h",
     ],
     compatible_with = get_compatible_with_portable(),
     copts = tf_copts(),
@@ -1743,6 +1740,7 @@ tf_cuda_library(
         "@local_xla//xla/tsl/framework:cancellation",
         "@local_xla//xla/tsl/util:command_line_flags",
         "@local_xla//xla/tsl/util:device_name_utils",
+        "@local_xla//xla:shape_util",
     ] + if_cuda([
         "@local_config_cuda//cuda:cudnn_header",
     ]) + if_static(
@@ -1833,7 +1831,12 @@ tf_cuda_library(
         "//tensorflow/core/public:session.h",
     ],
     copts = tf_copts(),
-    visibility = ["//visibility:public"],
+    visibility = [
+        ":dependency_allowlist",
+        "//learning/gemini/gemax/core/models/gemini3/vision/vision_decoder:__pkg__",
+        "//tensorflow:internal",
+        "//tensorflow_models:__subpackages__",
+    ],
     deps = ["//tensorflow/core/common_runtime:core_cpu_base_no_ops"] + if_static([
         ":function_ops_op_lib",
         ":functional_grad",
@@ -1897,13 +1900,14 @@ cc_library(
 alias(
     name = "test_main",
     actual = "@local_xla//xla/tsl/platform:test_main",
-    visibility = ["//visibility:public"],
+    visibility = ["//tensorflow:internal"],
 )
 
 tf_cc_tests(
     name = "low_level_library_tests",
     size = "small",
     srcs = [
+        "//tensorflow/core/lib/core:legacy_lib_core_all_tests",
         "//tensorflow/core/lib/gtl:legacy_lib_gtl_tests",
         "//tensorflow/core/lib/monitoring:collection_registry_test.cc",
         "//tensorflow/core/lib/monitoring:counter_test.cc",
@@ -1936,15 +1940,21 @@ tf_cc_tests(
 )
 
 tf_cc_tests(
-    name = "test_utils_test",
+    name = "cell_reader_test",
     size = "small",
     srcs = [
+        "//tensorflow/core/lib/monitoring:cell_reader_test.cc",
         "//tensorflow/core/lib/monitoring:test_utils_test.cc",
     ],
     deps = [
         ":protos_all_cc",
         ":test",
         ":test_main",
+        "//tensorflow/core/lib/monitoring:cell_reader",
+        "//tensorflow/core/lib/monitoring:counter",
+        "//tensorflow/core/lib/monitoring:gauge",
+        "//tensorflow/core/lib/monitoring:percentile_sampler",
+        "//tensorflow/core/lib/monitoring:sampler",
         "//tensorflow/core/lib/monitoring:test_utils",
         "//tensorflow/core/lib/monitoring:types",
         "//tensorflow/core/platform:errors",

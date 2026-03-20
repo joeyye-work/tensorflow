@@ -1,4 +1,4 @@
-load("@rules_python//python:proto.bzl", "py_proto_library")
+# Placeholder: load py_proto_library
 load(
     "//tensorflow:tensorflow.bzl",
     "tf_cc_test",
@@ -62,6 +62,7 @@ package(
 exports_files(
     srcs = [
         "allocator_registry.h",
+        "batch_size_resource.h",
         "collective.h",
         "control_flow.h",
         "dataset.h",
@@ -106,7 +107,6 @@ exports_files(
         "tensor_reference.h",
         "tensor_slice.h",
         "tensor_util.h",
-        "tf_data_file_logger_options.h",
         "thread_factory.h",
         "tracking_allocator.h",
         "versions.h",
@@ -196,6 +196,7 @@ filegroup(
         "allocator.h",
         "allocator_registry.h",
         "attr_value_util.h",
+        "batch_size_resource.h",
         "bfloat16.h",
         "bounds_check.h",
         "cancellation.h",
@@ -261,7 +262,6 @@ filegroup(
         "tensor_slice.h",
         "tensor_types.h",
         "tensor_util.h",
-        "tf_data_file_logger_options.h",
         "thread_factory.h",
         "tracking_allocator.h",
         "type_index.h",
@@ -311,6 +311,7 @@ filegroup(
         "run_handler.cc",
         "run_handler_util.cc",
         "tensor_slice.cc",
+        "tensor_util.cc",
         "versions.cc",
     ],
 )
@@ -341,9 +342,10 @@ filegroup(
         "tensor_key.h",
         "tensor_shape.cc",
         "tensor_shape.h",
+        "tensor_shape_expr.cc",
+        "tensor_shape_expr.h",
         "tensor_types.h",
         "tensor_util.h",
-        "tf_data_file_logger_options.h",
         "tracking_allocator.h",
         "type_index.h",
         "type_traits.h",
@@ -599,7 +601,6 @@ cc_library(
         ":reader_base_proto_cc",
         "//tensorflow/core:framework",
         "//tensorflow/core:lib",
-        "@com_google_absl//absl/synchronization",
     ],
 )
 
@@ -654,7 +655,10 @@ cc_library(
     name = "bfloat16",
     srcs = ["bfloat16.cc"],
     hdrs = ["bfloat16.h"],
-    visibility = ["//visibility:public"],
+    visibility = [
+        "//tensorflow/core:__subpackages__",
+        "//tensorflow/security/fuzzing:__subpackages__",
+    ],
     deps = [
         ":numeric_types",
         "//tensorflow/core/platform:byte_order",
@@ -694,7 +698,12 @@ cc_library(
         "partial_tensor_shape.h",
         "tensor_shape.h",
     ],
-    visibility = ["//visibility:public"],
+    visibility = [
+        "//tensorflow/core:__pkg__",
+        "//tensorflow/core/runtime_fallback:__subpackages__",
+        "//tensorflow/core/tfrt/utils:__subpackages__",
+        "//waymo/ml/deploy/benchmark:__subpackages__",
+    ],
     deps = [
         ":bounds_check",
         ":tensor_shape_proto_cc",
@@ -712,9 +721,24 @@ cc_library(
         "//tensorflow/core/platform:status",
         "//tensorflow/core/platform:statusor",
         "//tensorflow/core/util:overflow",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/strings",
         "@eigen_archive//:eigen3",
+        "@local_xla//xla:shape_util",
+    ],
+    alwayslink = 1,
+)
+
+cc_library(
+    name = "tensor_shape_expr",
+    srcs = ["tensor_shape_expr.cc"],
+    hdrs = ["tensor_shape_expr.h"],
+    visibility = [
+        "//tensorflow/core:__pkg__",
+        "//tensorflow/core/grappler:__subpackages__",
+        "//tensorflow/core/runtime_fallback:__subpackages__",
+        "//tensorflow/core/tfrt/utils:__subpackages__",
+    ],
+    deps = [
+        ":tensor_shape_proto_cc",
     ],
     alwayslink = 1,
 )
@@ -731,14 +755,12 @@ cc_library(
         "//learning/processing/hydra/tensorflow:__pkg__",
         "//learning/sibyl/tfx/state/kernels:__pkg__",
         "//learning/sibyl/tfx/transformation/kernels:__pkg__",
-        "//robotics/datasets/stepstable/tensorflow:__pkg__",
         "//tensorflow/compiler/mlir/tools/kernel_gen:__pkg__",
         "//tensorflow/compiler/tf2xla:__pkg__",
         "//tensorflow/examples/custom_ops_doc/simple_hash_table:__pkg__",
         "//third_party/py/grain/_src/tensorflow/ops:__pkg__",
         "//waymo/ml/compiler/frontend/kernels:__pkg__",
         "//waymo/ml/compiler/runtime/alpine/core:__pkg__",
-        "//waymo/ml/woodshed/ops:__pkg__",
     ],
     deps = [
         "//tensorflow/core/lib/core:refcount",
@@ -805,7 +827,7 @@ cc_library(
 cc_library(
     name = "tensor_types",
     hdrs = ["tensor_types.h"],
-    visibility = ["//visibility:public"],
+    visibility = ["//visibility:private"],
     deps = [
         "//tensorflow/core/platform:logging",
         "@eigen_archive//:eigen3",
@@ -828,7 +850,6 @@ tf_cuda_library(
     srcs = [
         "log_memory.cc",
         "tensor.cc",
-        "tensor_util.cc",
         "typed_allocator.cc",
         "types.cc",
         "variant.cc",
@@ -847,7 +868,18 @@ tf_cuda_library(
         "variant_op_registry.h",
         "variant_tensor_data.h",
     ],
-    visibility = ["//visibility:public"],
+    visibility = [
+        "//learning/gemini/gemax/core/models/gemini3/vision/vision_decoder:__pkg__",
+        "//learning/gemini/gemax/core/models/lsp_inference_staging/vision/vision_decoder:__pkg__",
+        "//learning/infra/runtime/experimental/mixed_engine:__subpackages__",
+        "//tensorflow:__pkg__",
+        "//tensorflow/core:__pkg__",
+        "//tensorflow/core/runtime_fallback:__subpackages__",
+        "//tensorflow/core/tfrt:__subpackages__",
+        "//tensorflow/core/util:__pkg__",
+        "//tensorflow/python/profiler/internal:__pkg__",
+        "//tensorflow/security/fuzzing:__subpackages__",
+    ],
     deps = [
         ":allocation_description_proto_cc",
         ":allocator",
@@ -880,13 +912,13 @@ tf_cuda_library(
         "//tensorflow/core/platform:errors",
         "//tensorflow/core/platform:logging",
         "//tensorflow/core/platform:macros",
-        "//tensorflow/core/platform:numbers",
         "//tensorflow/core/platform:platform_port",
         "//tensorflow/core/platform:protobuf",
         "//tensorflow/core/platform:strcat",
         "//tensorflow/core/platform:tensor_coding",
         "//tensorflow/core/platform:types",
         "//tensorflow/core/public:version",
+        "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/numeric:bits",
@@ -910,6 +942,7 @@ cc_library(
         ":node_def_util",
         ":op_def_proto_cc",
         ":tensor_shape",
+        ":tensor_shape_expr",
         ":tensor_shape_proto_cc",
         "//tensorflow/core/lib/core:errors",
         "//tensorflow/core/lib/core:status",
@@ -961,24 +994,19 @@ cc_library(
     deps = [
         ":attr_value_proto_text",
         ":tensor",
-        ":tensor_proto_cc",
         ":tensor_shape",
         ":tensor_shape_proto_cc",
-        "//tensorflow/core:portable_gif_internal",
         "//tensorflow/core/lib/core:errors",
         "//tensorflow/core/lib/core:status",
         "//tensorflow/core/lib/core:stringpiece",
         "//tensorflow/core/lib/gtl:array_slice",
+        "//tensorflow/core/lib/hash",
         "//tensorflow/core/lib/strings:proto_serialization",
         "//tensorflow/core/lib/strings:str_util",
         "//tensorflow/core/platform:fingerprint",
-        "//tensorflow/core/platform:hash",
-        "//tensorflow/core/platform:numbers",
+        "//tensorflow/core/platform:protobuf",
         "//tensorflow/core/util:overflow",
-        "@com_google_absl//absl/log",
-        "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/types:span",
     ],
 )
 
@@ -1422,7 +1450,6 @@ tf_cc_tests(
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/synchronization",
         "@com_google_googletest//:gtest",
         "@eigen_archive//:eigen3",
         "@local_xla//xla/tsl/profiler/utils:xplane_utils",
@@ -1634,7 +1661,6 @@ tf_proto_library(
     name = "device_attributes_proto",
     srcs = ["device_attributes.proto"],
     make_default_target_header_only = True,
-    visibility = ["//visibility:public"],
 )
 
 tf_proto_library(
@@ -1783,7 +1809,6 @@ tf_proto_library(
     name = "types_proto",
     srcs = ["types.proto"],
     make_default_target_header_only = True,
-    visibility = ["//visibility:public"],
 )
 
 tf_jspb_proto_library(
