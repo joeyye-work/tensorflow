@@ -79,6 +79,20 @@ absl::Status FeedInputs(
     TF_RETURN_IF_ERROR(
         feed_rewrites[i]->AddNode(g, {n, id.second}, &feed_node));
 
+    // Set an attribute in _Arg node to indicate it has a batch dimension
+    auto node_attrs = n->attrs();
+    const AttrValue* shape_attr = node_attrs.FindByString("_output_shapes");
+    if (shape_attr && shape_attr->has_list()) {
+      const TensorShapeProto& shape = shape_attr->list().shape(0);
+      for (int i = 0; i < shape.dim_size(); ++i) {
+        if (shape.dim(i).size() == -1) {
+          feed_node->AddAttr("_dynamic_dim", i);
+          break;
+        }
+      }
+      // Keep _output_shapes for further runs of shape inference
+      feed_node->AddAttr("_output_shapes", *shape_attr);
+    }
     // Update name_index
     (*name_index)[feed_node->name()] = feed_node;
     // Duplicate control edges aren't allowed, but feed_node was *just* created
@@ -195,12 +209,12 @@ absl::Status PruneForTargets(Graph* g, const NameIndex& name_index,
   std::unordered_set<const Node*> targets;
   for (Node* n : fetch_nodes) {
     if (!AddNodeToTargets(n->name(), name_index, &targets)) {
-      absl::StrAppend(&not_found, n->name(), " ");
+      strings::StrAppend(&not_found, n->name(), " ");
     }
   }
   for (const string& s : target_nodes) {
     if (!AddNodeToTargets(s, name_index, &targets)) {
-      absl::StrAppend(&not_found, s, " ");
+      strings::StrAppend(&not_found, s, " ");
     }
   }
   if (!not_found.empty()) {
@@ -238,8 +252,8 @@ absl::Status RecvFeedRewrite::AddNode(Graph* g,
                                       NodeBuilder::NodeOut feed_tensor,
                                       Node** out_node) {
   TF_RETURN_IF_ERROR(
-      NodeBuilder(absl::StrCat("_recv_", feed_tensor.node->name(), "_",
-                               feed_tensor.index),
+      NodeBuilder(strings::StrCat("_recv_", feed_tensor.node->name(), "_",
+                                  feed_tensor.index),
                   "_Recv")
           .Attr("tensor_type",
                 BaseType(feed_tensor.node->output_type(feed_tensor.index)))
@@ -279,8 +293,8 @@ absl::Status SendFetchRewrite::AddNode(Graph* g,
                                        NodeBuilder::NodeOut fetch_tensor,
                                        Node** out_node) {
   TF_RETURN_IF_ERROR(
-      NodeBuilder(absl::StrCat("_send_", fetch_tensor.node->name(), "_",
-                               fetch_tensor.index),
+      NodeBuilder(strings::StrCat("_send_", fetch_tensor.node->name(), "_",
+                                  fetch_tensor.index),
                   "_Send")
           .Input(fetch_tensor.node, fetch_tensor.index)
           .Attr("tensor_name", endpoint_name())

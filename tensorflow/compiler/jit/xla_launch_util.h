@@ -23,13 +23,13 @@ limitations under the License.
 #include <set>
 #include <vector>
 
-#include "absl/container/flat_hash_map.h"
 #include "tensorflow/compiler/jit/variable_info.h"
 #include "tensorflow/compiler/jit/xla_tensor.h"
 #include "tensorflow/compiler/tf2xla/xla_compiler.h"
 #include "xla/client/local_client.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/service/shaped_buffer.h"
+#include "xla/executable_run_options.h"
 #include "xla/stream_executor/device_memory_allocator.h"
 #include "tensorflow/core/framework/allocation_description.pb.h"
 #include "tensorflow/core/framework/tensor.h"
@@ -189,7 +189,7 @@ class XlaComputationLaunchContext {
   absl::StatusOr<std::vector<xla::ExecutionInput>> PopulateInputs(
       OpKernelContext* ctx,
       const XlaCompiler::CompilationResult* compilation_result,
-      const absl::flat_hash_map<int, const Tensor*>& resource_vars,
+      const std::map<int, const Tensor*>& resource_vars,
       int missing_ctx_input_prefix,
       const xla::HloInputOutputAliasConfig& input_output_alias);
 
@@ -209,7 +209,8 @@ class XlaComputationLaunchContext {
       xla::ScopedShapedBuffer output, int missing_ctx_input_prefix,
       absl::Span<VariableInfo> variable_infos,
       const xla::HloInputOutputAliasConfig& input_output_alias,
-      const absl::flat_hash_map<int, const Tensor*>& resource_vars);
+      const std::map<int, const Tensor*>& resource_vars,
+      const xla::ExecutableRunOptions* run_options = nullptr);
 
  private:
   xla::LocalClient* client_;

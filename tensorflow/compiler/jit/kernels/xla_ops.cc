@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -53,44 +54,34 @@ limitations under the License.
 #include "tensorflow/compiler/jit/xla_host_send_device_context.h"
 #include "tensorflow/compiler/jit/xla_launch_util.h"
 #include "tensorflow/compiler/jit/xla_platform_info.h"
+#include "tensorflow/compiler/jit/xla_batch_matcher.h"
 #include "tensorflow/compiler/tf2xla/tf2xla_util.h"
 #include "tensorflow/compiler/tf2xla/xla_compiler.h"
 #include "tensorflow/compiler/tf2xla/xla_helpers.h"
 #include "tensorflow/compiler/tf2xla/xla_op_registry.h"
 #include "xla/client/local_client.h"
 #include "xla/executable_run_options.h"
-#include "xla/hlo/ir/hlo_input_output_alias_config.h"
 #include "xla/pjrt/pjrt_client.h"
-#include "xla/service/executable.h"
 #include "xla/service/gpu/gpu_executable_run_options.h"
-#include "xla/stream_executor/host/host_platform_id.h"
 #include "xla/tsl/concurrency/async_value_ref.h"
 #include "xla/tsl/protobuf/error_codes.pb.h"
 #include "tensorflow/core/framework/allocator.h"
-#include "tensorflow/core/framework/control_flow.h"
-#include "tensorflow/core/framework/device.h"
-#include "tensorflow/core/framework/function.h"
+#include "tensorflow/core/framework/batch_size_resource.h"
 #include "tensorflow/core/framework/node_def_util.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/op_requires.h"
-#include "tensorflow/core/framework/rendezvous.h"
 #include "tensorflow/core/framework/tensor.h"
-#include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/framework/types.pb.h"
 #include "tensorflow/core/lib/monitoring/counter.h"
 #include "tensorflow/core/platform/env.h"
 #include "tensorflow/core/platform/errors.h"
-#include "tensorflow/core/platform/mutex.h"
 #include "tensorflow/core/platform/refcount.h"
+#include "tensorflow/core/platform/statusor.h"
 #include "tensorflow/core/platform/stream_executor_no_cuda.h"
-#include "tensorflow/core/platform/threadpool.h"
-#include "tensorflow/core/platform/tstring.h"
-#include "tensorflow/core/platform/types.h"
-#include "tensorflow/core/util/device_name_utils.h"
+#include "tensorflow/core/profiler/lib/traceme.h"
 #include "tensorflow/core/util/stream_executor_util.h"
-#include "tsl/platform/thread_annotations.h"
-#include "tsl/profiler/lib/traceme.h"
+#include "tsl/platform/statusor.h"
 
 // OP_REQUIRES_OK_RETURN is the same as OP_REQUIRES_OK except that
 // in error case, it returns RET instead of void.
@@ -390,6 +381,72 @@ GetXlaCompilerArgsAndSnapshotVariables(
   return result;
 }
 
+
+std::unique_ptr<DimExpr> ExprFromProto(const ExpressionProto& proto) {
+  switch (proto.node_type_case()) {
+    case ExpressionProto::kConstantValue:
+      return DimExpr::Cons(proto.constant_value());
+    case ExpressionProto::kVariableId:
+      return DimExpr::Var(proto.variable_id());
+    case ExpressionProto::kAddNode: {
+      auto lhs = ExprFromProto(proto.add_node().lhs());
+      auto rhs = ExprFromProto(proto.add_node().rhs());
+      // Note: These are owning pointers, but ExprAdd takes raw pointers.
+      // The caller must manage lifetime appropriately.
+      return std::make_unique<ExprAdd>(lhs.release(), rhs.release());
+    }
+    case ExpressionProto::kSubNode: {
+      auto lhs = ExprFromProto(proto.sub_node().lhs());
+      auto rhs = ExprFromProto(proto.sub_node().rhs());
+      return std::make_unique<ExprSub>(lhs.release(), rhs.release());
+    }
+    case ExpressionProto::kMulNode: {
+      auto lhs = ExprFromProto(proto.mul_node().lhs());
+      auto rhs = ExprFromProto(proto.mul_node().rhs());
+      return std::make_unique<ExprMul>(lhs.release(), rhs.release());
+    }
+    case ExpressionProto::kDivNode: {
+      auto lhs = ExprFromProto(proto.div_node().lhs());
+      auto rhs = ExprFromProto(proto.div_node().rhs());
+      return std::make_unique<ExprDiv>(lhs.release(), rhs.release());
+    }
+    case ExpressionProto::NODE_TYPE_NOT_SET:
+    default:
+      return nullptr;
+  }
+}
+
+static xla::DynExpr* DimExprToDynExpr(const DimExpr* e) {
+  switch (e->kind()) {
+    case DimExpr::Kind::kConstant: {
+      auto* ac = static_cast<const Constant*>(e);
+      return xla::DynExpr::_(ac->value());
+    }
+    case DimExpr::Kind::kVariable: {
+      auto* av = static_cast<const Variable*>(e);
+      return xla::DynExpr::V(1);
+    }
+    case DimExpr::Kind::kAdd: {
+      auto* ee = static_cast<const ExprAdd*>(e);
+      return *DimExprToDynExpr(ee->lhs()) + *DimExprToDynExpr(ee->rhs());
+    }
+    case DimExpr::Kind::kSub: {
+      auto* ee = static_cast<const ExprSub*>(e);
+      return *DimExprToDynExpr(ee->lhs()) - *DimExprToDynExpr(ee->rhs());
+    }
+    case DimExpr::Kind::kMul: {
+      auto* ee = static_cast<const ExprMul*>(e);
+      return *DimExprToDynExpr(ee->lhs()) * *DimExprToDynExpr(ee->rhs());
+    }
+    case DimExpr::Kind::kDiv: {
+      auto* ee = static_cast<const ExprDiv*>(e);
+      return *DimExprToDynExpr(ee->lhs()) / *DimExprToDynExpr(ee->rhs());
+    }
+  }
+  return nullptr;
+}
+
+
 absl::Status CompileToLocalExecutable(
     OpKernelContext* ctx, const NameAttrList& function, bool has_ref_vars,
     const XlaPlatformInfo& platform_info,
@@ -438,9 +495,183 @@ absl::Status CompileToLocalExecutable(
   XlaCompiler::CompileOptions compile_options =
       GenerateCompileOptions(has_ref_vars, may_alias_resource_update);
 
-  return xla_device_compiler->CompileIfNeeded(
-      options, function, args, compile_options, compile_mode, profiler,
-      compilation_result, executable);
+  MarkForCompilationPassFlags* flags = GetMarkForCompilationPassFlags();
+  if (flags->tf_xla_enable_dynamic_sizes) {
+    // Rewriting the argument with expressions if they have dynamic
+    // dimension, detecting dynamic dimension via either _dynamic_dim or
+    // _output_shapes attr in the argument.
+    std::vector<XlaCompiler::Argument> norm_args(args.begin(), args.end());
+    int64_t filled_batch = 0;
+    bool saw_dynamic_dim_value = false;
+    // Only supporting one dynamic dimension. 
+    bool has_multiple_dynamic_dim_values = false;
+    int64_t dynamic_dim_value = 0;
+    XlaBatchMatcher* xla_batch_matcher =
+        xla_device_compiler->xla_batch_matcher();
+    auto record_dynamic_dim_value = [&](int64_t dim_size) {
+      if (!saw_dynamic_dim_value) {
+        saw_dynamic_dim_value = true;
+        dynamic_dim_value = dim_size;
+        return;
+      }
+      if (dynamic_dim_value != dim_size) {
+        has_multiple_dynamic_dim_values = true;
+      }
+    };
+    if (options.flib_def != nullptr) {
+      const FunctionDef* fdef = options.flib_def->Find(function.name());
+      if (fdef != nullptr) {
+        for (const auto& kv : fdef->arg_attr()) {
+          int arg_index = kv.first;
+          const auto& attr_map = kv.second.attr();
+          const std::string& node_name =
+              fdef->signature().input_arg(arg_index).name();
+
+          // Special case for _dynamic_dim...
+          auto dyn_dim_attr = attr_map.find("_dynamic_dim");
+          if (dyn_dim_attr != attr_map.end()) {
+            TensorShape& shp =
+                std::get<TensorShape>(norm_args[arg_index].shape);
+            const AttrValue& v = dyn_dim_attr->second;
+            int64_t idx = v.i();
+            record_dynamic_dim_value(shp.dim_size(idx));
+            if (!filled_batch && xla_batch_matcher) {
+              filled_batch =
+                  xla_batch_matcher->get_xla_compile_batch(shp.dim_size(idx));
+            }
+
+            std::vector<xla::DynExpr*> dyn_exprs;
+            for (int d : shp.dim_sizes()) {
+              dyn_exprs.push_back(xla::DynExpr::_(d));
+            }
+            dyn_exprs[idx] = xla::DynExpr::V(1);
+            shp.set_expressions(dyn_exprs);
+            continue;
+          }
+          auto it = attr_map.find("_output_shapes");
+          if (it == attr_map.end()) continue;
+
+          const TensorShapeProto& proto = it->second.list().shape(0);
+          const auto& exp = proto.expressions();
+          TensorShape& shp = std::get<TensorShape>(norm_args[arg_index].shape);
+
+          if (!filled_batch && xla_batch_matcher) {
+            for (int idx = 0; idx < exp.size(); ++idx) {
+              // Look for dynamic expression. If found then compute padding
+              // value and exit loop.
+              auto e = DimExprToDynExpr(ExprFromProto(exp[idx]).get())->s();
+              if (e->is_dynamic()) {
+                record_dynamic_dim_value(shp.dim_size(idx));
+                filled_batch =
+                    xla_batch_matcher->get_xla_compile_batch(shp.dim_size(idx));
+                break;
+              }
+            }
+          }
+
+          std::vector<xla::DynExpr*> dyn_exprs;
+          for (int d : shp.dim_sizes()) {
+            dyn_exprs.push_back(xla::DynExpr::_(d));
+          }
+          for (int j = 0; j < exp.size(); ++j) {
+            auto e = DimExprToDynExpr(ExprFromProto(exp[j]).get())->s();
+            if (e->is_dynamic()) {
+              dyn_exprs[j] = e;
+            }
+          }
+          shp.set_expressions(dyn_exprs);
+        }
+      }
+    }
+
+    struct SaveOldVar {
+      int arg_index;
+      int64_t dyn_dim;
+      int64_t old_value;
+    };
+    std::vector<SaveOldVar> old_vars;
+    auto maybe_rewrite_scalar_constant = [&](int arg_index) {
+      if (!saw_dynamic_dim_value || has_multiple_dynamic_dim_values) {
+        return;
+      }
+
+      auto& arg = norm_args[arg_index];
+      if (arg.kind != XlaCompiler::Argument::kConstant) {
+        return;
+      }
+
+      const bool is_scalar = TensorShapeUtils::IsScalar(arg.constant_value.shape());
+      const bool is_vector = TensorShapeUtils::IsVector(arg.constant_value.shape()) &&
+                             arg.constant_value.NumElements() > 0;
+      if (!is_scalar && !is_vector) {
+        return;
+      }
+
+      if (arg.constant_value.dtype() == DT_INT32) {
+        const int32 old_value = arg.constant_value.flat<int32>()(0);
+        // Heuristic: rewrite only scalar constants or shape-like int vectors
+        // whose leading entry matches the observed runtime batch size.
+        if (old_value == dynamic_dim_value) {
+          // Deep-copy before rewrite so the compile-time patch does not mutate
+          // a Tensor buffer shared with caller-visible inputs.
+          Tensor scalar_copy(arg.constant_value.dtype(),
+                             arg.constant_value.shape());
+          scalar_copy.flat<int32>() = arg.constant_value.flat<int32>();
+          arg.constant_value = std::move(scalar_copy);
+          arg.constant_value.flat<int32>()(0) =
+              static_cast<int32>(filled_batch);
+        }
+      } else if (arg.constant_value.dtype() == DT_INT64) {
+        const int64_t old_value = arg.constant_value.flat<int64_t>()(0);
+        // Same heuristic for int64 scalar constants.
+        if (old_value == dynamic_dim_value) {
+          Tensor scalar_copy(arg.constant_value.dtype(),
+                             arg.constant_value.shape());
+          scalar_copy.flat<int64_t>() = arg.constant_value.flat<int64_t>();
+          arg.constant_value = std::move(scalar_copy);
+          arg.constant_value.flat<int64_t>()(0) = filled_batch;
+        }
+      }
+    };
+    // We rewrite only dynamic dimensions to the padded compile batch and then
+    // restore the original runtime sizes after compilation. Some scalar
+    // constants are actually runtime batch sizes folded by earlier TF passes,
+    // so rewrite only those that match the detected dynamic runtime value.
+    // Scalar constants are deep-copied before rewrite so the change stays
+    // local to norm_args and does not require restoration.
+    if (filled_batch) {
+      for (int i = 0; i < norm_args.size(); ++i) {
+        TensorShape& shp = std::get<TensorShape>(norm_args[i].shape);
+        for (int j = 0; j < shp.get_expressions().size(); ++j) {
+          auto e = shp.get_expression(j);
+          if (e->is_dynamic()) {
+            int64_t old = shp.dim_size(j);
+            old_vars.push_back({i, j, old});
+            shp.set_dim(j, filled_batch);
+            // Necessary because set_dim removes the expression:
+            shp.set_expression(j, e);
+          }
+        }
+        maybe_rewrite_scalar_constant(i);
+      }
+    }
+    auto status = xla_device_compiler->CompileIfNeeded(
+        options, function, norm_args, compile_options, compile_mode, profiler,
+        compilation_result, executable);
+    // Restore the original runtime dimensions after compilation.
+    if (filled_batch) {
+      for (const auto& old_var : old_vars) {
+        TensorShape& shp =
+            std::get<TensorShape>(norm_args[old_var.arg_index].shape);
+        shp.set_dim(old_var.dyn_dim, old_var.old_value);
+      }
+    }
+    return status;
+  } else {
+    return xla_device_compiler->CompileIfNeeded(
+        options, function, args, compile_options, compile_mode, profiler,
+        compilation_result, executable);
+  }
 }
 
 absl::Status GetUpdatedVariables(
@@ -466,7 +697,7 @@ static thread::ThreadPool* GetOrCreateThreadPoolForCollective(
   static auto& thread_pool_cache ABSL_GUARDED_BY(m) =
       *new absl::node_hash_map<XlaCompilationResult::CollectiveInfo,
                                thread::ThreadPool>();
-  absl::MutexLock l(m);
+  absl::MutexLock l(&m);
   auto it = thread_pool_cache.find(collective_info);
   if (it == thread_pool_cache.end()) {
     // Create & cache thread pool.
@@ -615,7 +846,7 @@ void XlaLocalLaunchBase::ComputeAsync(OpKernelContext* ctx, DoneCallback done) {
           done);
       OP_REQUIRES_OK_ASYNC(ctx, LockVariables(absl::MakeSpan(variable_infos)),
                            done);
-      absl::flat_hash_map<int, const Tensor*> resource_var_ptrs;
+      std::map<int, const Tensor*> resource_var_ptrs;
       for (int i = 0; i < resources.size(); i++) {
         resource_var_ptrs[resources[i]] = variable_infos[i].var()->tensor();
       }
@@ -813,14 +1044,24 @@ void XlaCompileOp::Compute(OpKernelContext* ctx) {
           ctx, function_, has_ref_vars_, platform_info_, args, compile_mode,
           /*may_alias_resource_update=*/false, &client, &kernel, &executable);
     }
+
     if (compile_mode != DeviceCompileMode::kLazy ||
         status.code() != error::UNIMPLEMENTED) {
-      OP_REQUIRES_OK(ctx, status);
+      if ((status != OkStatus()) &&
+          (status.code() != error::UNIMPLEMENTED) &&
+        (compile_mode == DeviceCompileMode::kLazy)) {
+        // We set the error to error::UNIMPLEMENTED so it falls in the
+        // conditions of the if to fall back to TensorFlow function call
+        status = tensorflow::errors::Unimplemented(status.ToString());
+      } else {
+        OP_REQUIRES_OK(ctx, status);
+      }
     }
 
     if (status.code() == error::UNIMPLEMENTED) {
-      LOG(WARNING) << "Compilation failed:" << status
-                   << ".  Falling back to TF function call.";
+      LOG(WARNING) << "[HUAWEI] Compilation of the cluster failed with:";
+      LOG(WARNING) << "[HUAWEI] " << status;
+      LOG(WARNING) << "[HUAWEI] Falling back to TF function call.\n";
 
       BroadcastOptimizationRemark(
           XlaOptimizationRemark::UNIMPLEMENTED_OPERATION, status.ToString())
@@ -828,6 +1069,8 @@ void XlaCompileOp::Compute(OpKernelContext* ctx) {
       executable = nullptr;
       pjrt_executable = nullptr;
       mutex_lock guard(cannot_compile_cluster_mu_);
+      // TODO: decide if we want to set this flag to true, as we may want to
+      // allow the cluster to try to compile again later in time.
       cannot_compile_cluster_ = true;
     }
   }
@@ -882,7 +1125,6 @@ XlaRunOp::XlaRunOp(OpKernelConstruction* ctx)
 void XlaRunOp::Compute(OpKernelContext* ctx) {
   VLOG(3) << "XlaRunOp " << def().name();
   Tensor key_tensor = ctx->input(ctx->num_inputs() - 1);
-
   bool use_pjrt =
       GetXlaOpsCommonFlags()
           ->tf_xla_use_device_api.IsEnabledInXlaCompileAndRunForDevice(
@@ -939,7 +1181,7 @@ void XlaRunOp::Compute(OpKernelContext* ctx) {
   const xla::HloInputOutputAliasConfig& input_output_alias =
       closure.executable()->executable()->module().input_output_alias_config();
   absl::StatusOr<std::vector<xla::ExecutionInput>> execution_inputs;
-  absl::flat_hash_map<int, const Tensor*> snapshot_ptrs;
+  std::map<int, const Tensor*> snapshot_ptrs;
   {
     tsl::profiler::TraceMe hlo_module_activity(
         [&] {
@@ -963,6 +1205,69 @@ void XlaRunOp::Compute(OpKernelContext* ctx) {
   }
 
   xla::ExecutableRunOptions run_options;
+
+  MarkForCompilationPassFlags* flags = GetMarkForCompilationPassFlags();
+  if (flags->tf_xla_enable_dynamic_sizes) {
+    bool is_set = false;
+    std::set<int64_t> dyn_vals;
+    const auto* comp_result = closure.compilation_result();
+    const int num_constant_args = closure.num_constant_args();
+    for (int i = 0; i < comp_result->xla_input_shapes.size(); i++) {
+      const auto& xla_shape = closure.compilation_result()->xla_input_shapes[i];
+      if (!xla_shape.IsArray() || xla_shape.expressions().empty()) continue;
+
+      for (int dim = 0; dim < xla_shape.expressions().size(); dim++) {
+        xla::DynExpr* expr = xla_shape.expressions(dim);
+        if (expr && expr->is_dynamic()) {
+          int input_idx = comp_result->input_mapping[i] - num_constant_args;
+          if (input_idx < 0 || input_idx >= ctx->num_inputs()) {
+            VLOG(1) << "Warning: Input index is out of range";
+            continue;
+          }
+          VLOG(1) << "input shape is " << ctx->input(input_idx).shape()
+                  << ", corresponding xla input shape is " << xla_shape;
+          int64_t size = ctx->input(input_idx).shape().dim_size(dim);
+          int64_t dyn_val = expr->solve(size); // TODO: check if the result is correct later.
+          VLOG(1) << "Found dynamic input. Real size is: " << size
+                        << ", solved dynamic value is " << dyn_val;
+          if (dyn_val == -1) {
+            VLOG(1) << "Warning: Failed to solve the expression";
+            continue;
+          }
+          dyn_vals.insert(dyn_val);
+        }
+      }
+    }
+  
+    if (dyn_vals.size() == 1) {
+      run_options.set_batch_size(*(dyn_vals.begin()));
+      is_set = true;
+    } else {
+      // Found multiple variables
+      VLOG(1) << "Warning: Found multiple variables";
+    }
+    
+    if (!is_set) {
+      // TODO: Fallback to BatchSizeResource for now. Remove it later.
+      BatchSizeResource* bsr = nullptr;
+      ScopedStepContainer* step_container = ctx->step_container();
+
+      absl::Status st = step_container->Lookup<BatchSizeResource>(
+          ctx->resource_manager(), BatchSizeResourceName, &bsr);
+
+      if (st.ok()) {
+        run_options.set_batch_size(bsr->GetBatchSize());
+        VLOG(1) << "run_options.batch_size is set to: "
+                << run_options.batch_size() << ". step_id: " << ctx->step_id();
+        bsr->Unref();
+
+      } else if (IsNotFound(st)) {
+        VLOG(1) << "Warning: Not found BatchSizeResource in step_container.";
+      } else {
+        OP_REQUIRES_OK(ctx, st);
+      }
+    }
+  }
 
   // Host callbacks used for HLO send/recv.
   xla::SendDeviceMemoryFunction send_function =
@@ -992,7 +1297,8 @@ void XlaRunOp::Compute(OpKernelContext* ctx) {
       launch_context.PopulateOutputs(
           ctx, closure.compilation_result(), execution_output->ConsumeResult(),
           /*missing_ctx_input_prefix=*/closure.num_constant_args(),
-          absl::MakeSpan(*variable_infos), input_output_alias, snapshot_ptrs));
+          absl::MakeSpan(*variable_infos), input_output_alias, snapshot_ptrs,
+          &run_options));
 }
 
 XlaMergeOp::XlaMergeOp(OpKernelConstruction* ctx) : OpKernel(ctx) {}

@@ -24,6 +24,7 @@ limitations under the License.
 #include "tensorflow/core/common_runtime/gradients.h"
 #include "tensorflow/core/common_runtime/graph_constructor.h"
 #include "tensorflow/core/common_runtime/memory_types.h"
+#include "tensorflow/core/framework/batch_size_resource.h"
 #include "tensorflow/core/framework/cancellation.h"
 #include "tensorflow/core/framework/full_type.pb.h"
 #include "tensorflow/core/framework/full_type_util.h"
@@ -42,6 +43,13 @@ static constexpr const char* const kGradientOp =
 ArgOp::ArgOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
   OP_REQUIRES_OK(ctx, ctx->GetAttr("T", &dtype_));
   OP_REQUIRES_OK(ctx, ctx->GetAttr("index", &index_));
+
+  Status s = ctx->GetAttr("_dynamic_dim", &dynamic_dim_);
+  if (IsNotFound(s)) {
+    dynamic_dim_ = -1;
+  } else {
+    OP_REQUIRES_OK(ctx, s);
+  }
 }
 
 void ArgOp::Compute(OpKernelContext* ctx) {
@@ -59,15 +67,42 @@ void ArgOp::Compute(OpKernelContext* ctx) {
     }
   };
 
+  Tensor t;
   if (frame->CanConsumeArg(index_)) {
-    Tensor val;
-    frame->ConsumeArg(index_, &val);
-    OP_REQUIRES_OK(ctx, validate_type(val));
-    ctx->set_output(0, std::move(val));
+    frame->ConsumeArg(index_, &t);
+    OP_REQUIRES_OK(ctx, validate_type(t));
+    ctx->set_output(0, std::move(t));
+    val = &t;
   } else {
     OP_REQUIRES_OK(ctx, frame->GetArg(index_, &val));
     OP_REQUIRES_OK(ctx, validate_type(*val));
     ctx->set_output(0, *val);
+  }
+  if (dynamic_dim_ >= 0) {
+    BatchSizeResource* bsr = nullptr;
+    ScopedStepContainer* step_container = ctx->step_container();
+
+    OP_REQUIRES_OK(ctx, step_container->LookupOrCreate<BatchSizeResource>(
+                            ctx->resource_manager(), BatchSizeResourceName, &bsr,
+                            [](BatchSizeResource** ret) -> Status {
+                              *ret = new BatchSizeResource();
+                              return OkStatus();
+                            }));
+
+    const int64_t batch_size = val->dim_size(dynamic_dim_);
+    VLOG(1) << "Found batch_size in dimension #" << dynamic_dim_;
+    if (bsr->GetBatchSize() == 0) {
+      bsr->SetBatchSize(batch_size);
+      VLOG(1) << "Set batch_size from 0 to " << batch_size
+              << ". step_id: " << ctx->step_id();
+    } else if (bsr->GetBatchSize() != batch_size) {
+      VLOG(1) << "Warning: Set batch_size from " << bsr->GetBatchSize()
+              << ". step_id: " << ctx->step_id();
+      bsr->SetBatchSize(batch_size);
+    } else {
+      VLOG(1) << "batch_size already set to " << batch_size;
+    }
+    bsr->Unref();
   }
 }
 
@@ -323,8 +358,8 @@ void RemoteCallOp::ComputeAsync(OpKernelContext* ctx, DoneCallback done) {
       VLOG(1) << "Instantiating " << func_name << " on " << target_device;
       tsl::profiler::TraceMe activity(
           [&] {
-            return absl::StrCat("RemoteCall: Instantiate: ", func_name, " on ",
-                                target_device);
+            return strings::StrCat("RemoteCall: Instantiate: ", func_name,
+                                   " on ", target_device);
           },
           tsl::profiler::TraceMeLevel::kInfo);
       FunctionLibraryRuntime::InstantiateOptions instantiate_opts;
@@ -435,7 +470,7 @@ void RemoteCallOp::ComputeAsync(OpKernelContext* ctx, DoneCallback done) {
 string RemoteCallOp::TraceString(const OpKernelContext& ctx,
                                  bool verbose) const {
   string trace_string = tsl::profiler::TraceMeOp(
-      absl::StrCat(name_view(), "__", func_.name()), type_string_view());
+      strings::StrCat(name_view(), "__", func_.name()), type_string_view());
   if (verbose) {
     string shape = ShapeTraceString(ctx);
     if (!shape.empty()) {
