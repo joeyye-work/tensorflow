@@ -41,6 +41,7 @@ limitations under the License.
 #include "tensorflow/compiler/jit/deadness_analysis.h"
 #include "tensorflow/compiler/jit/defs.h"
 #include "tensorflow/compiler/jit/device_util.h"
+#include "tensorflow/compiler/jit/encapsulate_util.h"
 #include "tensorflow/compiler/jit/flags.h"
 #include "tensorflow/compiler/jit/resource_operation_safety_analysis.h"
 #include "tensorflow/compiler/jit/xla_cluster_util.h"
@@ -780,7 +781,7 @@ static xla::DynExpr* DimExprToDynExpr(const DimExpr* e) {
 
 // Runs Grappler static inference and logs any ExpressionProto found in output
 // tensor shapes (from GraphProperties, not from _output_shapes attrs).
-void LogExpressionsViaGraphProperties(const tensorflow::Graph& graph) {
+void LogExpressionsViaGraphProperties(tensorflow::Graph& graph) {
   using tensorflow::ExpressionProto;
   using tensorflow::GraphDef;
   using tensorflow::NodeDef;
@@ -790,6 +791,7 @@ void LogExpressionsViaGraphProperties(const tensorflow::Graph& graph) {
 
   GraphDef graph_def;
   graph.ToGraphDef(&graph_def);
+  auto node_name_index = graph.BuildNodeNameIndex();
 
   GrapplerItem item;
   item.id = "mark_for_compilation_pass_expr_dump";
@@ -811,14 +813,31 @@ void LogExpressionsViaGraphProperties(const tensorflow::Graph& graph) {
   int found = 0;
   VLOG(1) << "[EXPR][GP] === GraphProperties output expr dump ===";
 
+  auto convert_graph_properties_shape = [](const TensorShapeProto& gp_shape) {
+    TensorShapeProto out;
+    out.set_unknown_rank(gp_shape.unknown_rank());
+    for (const auto& dim : gp_shape.dim()) {
+      out.add_dim()->set_size(dim.size());
+      ExpressionProto* expr = out.add_expressions();
+      if (dim.expr().node_type_case() != ExpressionProto::NODE_TYPE_NOT_SET) {
+        *expr = dim.expr();
+      } else {
+        expr->set_constant_value(dim.size());
+      }
+    }
+    return out;
+  };
 
   for (const NodeDef& n : graph_def.node()) {
     if (!props.HasOutputProperties(n.name())) continue;
     const auto& outs = props.GetOutputProperties(n.name());
+    std::vector<TensorShapeProto> inferred_output_shapes;
+    inferred_output_shapes.reserve(outs.size());
     std::vector<std::vector<std::unique_ptr<DimExpr>>> list_exprs(outs.size());
     for (int out_idx = 0; out_idx < static_cast<int>(outs.size()); ++out_idx) {
       const auto& tp = outs[out_idx];
       const TensorShapeProto& shp = tp.shape();
+      inferred_output_shapes.push_back(convert_graph_properties_shape(shp));
 
       std::vector<std::unique_ptr<DimExpr>> exprs;
       for (int d = 0; d < shp.dim_size(); ++d) {
@@ -845,6 +864,11 @@ void LogExpressionsViaGraphProperties(const tensorflow::Graph& graph) {
       list_exprs[out_idx] = std::move(exprs);
     }
     expr_map[n.name()] = std::move(list_exprs);
+    auto node_it = node_name_index.find(n.name());
+    if (node_it != node_name_index.end()) {
+      node_it->second->AddAttr(kXlaInferredOutputTensorShapesAttrName,
+                               inferred_output_shapes);
+    }
 
   }
 
@@ -892,8 +916,10 @@ absl::StatusOr<bool> MarkForCompilationPassImpl::Initialize() {
   if (debug_options_.annotate_cluster_id) {
     TF_RETURN_IF_ERROR(AssignAnnotatedClusterIDs());
   }
-  if (debug_options_.cluster_single_dynamic_dim) {
+  if (debug_options_.enable_dynamic_sizes) {
     LogExpressionsViaGraphProperties(*graph_);
+  }
+  if (debug_options_.cluster_single_dynamic_dim) {
     TF_RETURN_IF_ERROR(AssignDimVars());
   }
   if (debug_options_.enable_cluster_parallel) {
