@@ -327,7 +327,7 @@ void ConsiderConstantFoldableNode(
     std::unordered_map<const Node*, gtl::FlatSet<Node*>>* constant_control_deps,
     std::unordered_map<const Node*, std::vector<Tensor>>* shape_replacement_map,
     bool* internal_node_inserted) {
-  if (!IsConstantFoldable(n, opts.shape_map, opts.consider,
+    if (!IsConstantFoldable(n, opts.shape_map, opts.consider,
                           opts.max_constant_size_in_bytes,
                           shape_replacement_map)) {
     return;

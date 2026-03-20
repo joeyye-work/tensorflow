@@ -79,6 +79,20 @@ absl::Status FeedInputs(
     TF_RETURN_IF_ERROR(
         feed_rewrites[i]->AddNode(g, {n, id.second}, &feed_node));
 
+    // Set an attribute in _Arg node to indicate it has a batch dimension
+    auto node_attrs = n->attrs();
+    const AttrValue* shape_attr = node_attrs.FindByString("_output_shapes");
+    if (shape_attr && shape_attr->has_list()) {
+      const TensorShapeProto& shape = shape_attr->list().shape(0);
+      for (int i = 0; i < shape.dim_size(); ++i) {
+        if (shape.dim(i).size() == -1) {
+          feed_node->AddAttr("_dynamic_dim", i);
+          break;
+        }
+      }
+      // Keep _output_shapes for further runs of shape inference
+      feed_node->AddAttr("_output_shapes", *shape_attr);
+    }
     // Update name_index
     (*name_index)[feed_node->name()] = feed_node;
     // Duplicate control edges aren't allowed, but feed_node was *just* created
