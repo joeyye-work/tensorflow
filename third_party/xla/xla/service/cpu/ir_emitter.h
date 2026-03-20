@@ -60,9 +60,9 @@ limitations under the License.
 #include "xla/service/name_uniquer.h"
 #include "xla/xla_data.pb.h"
 
-#ifdef XLA_ONEDNN
+#if defined(INTEL_MKL)
 #include "xla/service/cpu/onednn_memory_util.h"
-#endif  // XLA_ONEDNN
+#endif
 
 namespace xla {
 namespace cpu {
@@ -332,11 +332,12 @@ class IrEmitter : public DfsHloVisitorWithDefault,
 
  private:
   absl::Status HandleSliceToDynamic(HloInstruction* hlo);
+  absl::Status HandleOuterBatchValue(HloInstruction* hlo);
   absl::Status HandlePadToStatic(HloInstruction* hlo);
   absl::Status HandleTopK(HloInstruction* hlo) override;
   absl::Status HandleAllReduceSingleReplica(HloInstruction* crs);
   absl::Status HandleAllReduceMultipleReplica(HloInstruction* crs);
-#ifdef XLA_ONEDNN
+#if defined(INTEL_MKL)
   std::vector<StackAlloca> EmitOneDnnOperandsAlloca(HloInstruction* custom_call,
                                                     llvm::Value*& args_val,
                                                     int& arg_indx);
@@ -344,7 +345,10 @@ class IrEmitter : public DfsHloVisitorWithDefault,
       const BufferAllocation::Slice& slice, const Shape& shape);
   absl::Status HandleOneDnnMatMulCalls(HloInstruction* hlo,
                                        std::string runtime_symbol_name);
-#endif  // XLA_ONEDNN
+  absl::Status HandleOneDnnSoftmax(HloInstruction* hlo);
+  absl::Status HandleOneDnnLayerNorm(HloInstruction* hlo);
+  absl::Status HandleOneDnnConvolution(HloInstruction* hlo);
+#endif  // INTEL_MKL
   // Private helper to initialize an IR function for the computation.
   void InitializeIrFunction(const std::string& function_name);
 
@@ -566,7 +570,7 @@ class IrEmitter : public DfsHloVisitorWithDefault,
   // Emits LLVM IR to transfer "element_count" elements of type "primitive_type"
   // from the address "source" to the address "target".
   void EmitTransferElements(llvm::Value* target, llvm::Value* source,
-                            int64_t element_count, PrimitiveType primitive_type,
+                            xla::DynExpr* element_count, PrimitiveType primitive_type,
                             const llvm_ir::IrArray& target_array,
                             const llvm_ir::IrArray& source_array);
 
@@ -856,19 +860,17 @@ class IrEmitter : public DfsHloVisitorWithDefault,
 
 // Decoupled implementation of IrEmitter::EmitTransferElements.
 void EmitTransferElements(llvm::Value* target, llvm::Value* source,
-                          int64_t element_count, PrimitiveType primitive_type,
+                          xla::DynExpr* element_count, PrimitiveType primitive_type,
                           const llvm_ir::IrArray& target_array,
                           const llvm_ir::IrArray& source_array,
                           llvm::Module* module, llvm::IRBuilderBase& b);
 
 // Decoupled implementation of IrEmitter::EmitFastConcatenate.
-// Returns true if the concatenate was parallelized.
-absl::StatusOr<bool> EmitFastConcatenate(
+absl::Status EmitFastConcatenate(
     const HloInstruction* instr,
     absl::Span<const llvm_ir::IrArray> source_arrays,
     const llvm_ir::IrArray& target_array, llvm::Module* module,
-    llvm::IRBuilderBase& b, llvm::Value* workgroup_id = nullptr,
-    int64_t num_workgroups = -1);
+    llvm::IRBuilderBase& b);
 
 // For each called computation called by the instruction, determines if that
 // computation calls a custom-call function, either directly or transitively.

@@ -28,7 +28,6 @@ limitations under the License.
 #include "absl/types/span.h"
 #include "xla/backends/cpu/runtime/kernel_c_api.h"
 #include "xla/backends/cpu/runtime/work_queue.h"
-#include "xla/runtime/work_group.h"
 #include "xla/stream_executor/device_memory.h"
 #include "xla/tsl/concurrency/async_value_ref.h"
 #include "xla/tsl/platform/logging.h"
@@ -61,11 +60,11 @@ static absl::InlinedVector<XLA_CPU_KernelArg, 8> ConvertBuffersToKernelArgs(
   return args;
 }
 
-template <bool num_workgroups_x_only>
-class Kernel::Task {
+template <bool thread_dim_x_only>
+class Kernel::ParallelTask {
  public:
-  Task(XLA_CPU_Kernel* kernel, NumWorkGroups num_workgroups,
-       absl::Span<const XLA_CPU_KernelArg> args);
+  ParallelTask(XLA_CPU_Kernel* kernel, Kernel::ThreadDim thread_dims,
+               size_t batch_size, absl::Span<const XLA_CPU_KernelArg> args);
 
   // Invokes a host kernel for a given task index.
   absl::Status operator()(size_t task_index) const;
@@ -73,10 +72,11 @@ class Kernel::Task {
  private:
   // Converts linear task index in [0, num_tasks) to (x, y, z) coordinate. We
   // assume that `x` is the fastest iterating dimension.
-  XLA_CPU_WorkGroupId Delinearize(uint64_t task_index) const;
+  XLA_CPU_KernelThread Delinearize(uint64_t task_index) const;
 
   XLA_CPU_Kernel* kernel_;
-  XLA_CPU_NumWorkGroups num_workgroups_;
+  XLA_CPU_KernelThreadDim thread_dims_;
+  size_t batch_size_;
   absl::InlinedVector<XLA_CPU_KernelArg, 8> args_;
 
   size_t num_tasks_;
@@ -86,42 +86,44 @@ class Kernel::Task {
   uint64_t stride_y_;
 };
 
-template <bool num_workgroups_x_only>
-Kernel::Task<num_workgroups_x_only>::Task(
-    XLA_CPU_Kernel* kernel, NumWorkGroups num_workgroups,
+template <bool thread_dim_x_only>
+Kernel::ParallelTask<thread_dim_x_only>::ParallelTask(
+    XLA_CPU_Kernel* kernel, Kernel::ThreadDim thread_dims,
+    size_t batch_size,
     absl::Span<const XLA_CPU_KernelArg> args)
     : kernel_(kernel),
-      num_workgroups_({num_workgroups.x, num_workgroups.y, num_workgroups.z}),
+      thread_dims_({thread_dims.x, thread_dims.y, thread_dims.z}),
       args_(args.begin(), args.end()),
-      num_tasks_(num_workgroups.x * num_workgroups.y * num_workgroups.z),
-      stride_z_(num_workgroups.y * num_workgroups.x),
-      stride_y_(num_workgroups.x) {}
+      num_tasks_(thread_dims_.x * thread_dims_.y * thread_dims_.z),
+      batch_size_(batch_size),
+      stride_z_(thread_dims_.y * thread_dims_.x),
+      stride_y_(thread_dims_.x) {}
 
-template <bool num_workgroups_x_only>
-absl::Status Kernel::Task<num_workgroups_x_only>::operator()(
+template <bool thread_dim_x_only>
+absl::Status Kernel::ParallelTask<thread_dim_x_only>::operator()(
     size_t task_index) const {
   DCHECK_LT(task_index, num_tasks_) << "Task index out of range";  // Crash OK
 
-  XLA_CPU_WorkGroupId workgroup_id = Delinearize(task_index);
-  XLA_CPU_KernelCallFrame call_frame = {&num_workgroups_, &workgroup_id,
-                                        args_.size(), args_.data()};
+  XLA_CPU_KernelThread kernel_thread = Delinearize(task_index);
+  XLA_CPU_KernelCallFrame call_frame = {&thread_dims_, &kernel_thread,
+                                        args_.size(), args_.data(), batch_size_};
 
   XLA_CPU_KernelError* error = (*kernel_)(&call_frame);
 
   if (ABSL_PREDICT_TRUE(error == nullptr)) {
     return absl::OkStatus();
+  } else {
+    return Internal("Failed to call host kernel: x=%d, y=%d, z=%d",
+                    kernel_thread.x, kernel_thread.y, kernel_thread.z);
   }
-
-  return Internal("Failed to call host kernel: x=%d, y=%d, z=%d",
-                  workgroup_id.x, workgroup_id.y, workgroup_id.z);
 }
 
-template <bool num_workgroups_x_only>
-XLA_CPU_WorkGroupId Kernel::Task<num_workgroups_x_only>::Delinearize(
+template <bool thread_dim_x_only>
+XLA_CPU_KernelThread Kernel::ParallelTask<thread_dim_x_only>::Delinearize(
     uint64_t task_index) const {
   // In the most common case we parallelize only over the `x` dimension.
-  if constexpr (num_workgroups_x_only) {
-    return XLA_CPU_WorkGroupId{task_index, 0, 0};
+  if constexpr (thread_dim_x_only) {
+    return XLA_CPU_KernelThread{task_index, 1, 1};
   }
 
   // Convert linear task index to (x, y, z) coordinate.
@@ -131,7 +133,7 @@ XLA_CPU_WorkGroupId Kernel::Task<num_workgroups_x_only>::Delinearize(
   task_index = task_index % stride_y_;
   uint64_t x = task_index;
 
-  return XLA_CPU_WorkGroupId{x, y, z};
+  return XLA_CPU_KernelThread{x, y, z};
 }
 
 Kernel::Kernel(unsigned arity, XLA_CPU_Kernel* kernel)
@@ -139,23 +141,27 @@ Kernel::Kernel(unsigned arity, XLA_CPU_Kernel* kernel)
       kernel_(function_->kernel()),
       arity_(arity) {}
 
-absl::Status Kernel::Launch(const NumWorkGroups& num_workgroups,
+absl::Status Kernel::Launch(const ThreadDim& thread_dims, size_t batch_size,
                             absl::Span<const DeviceMemoryBase> buffers) const {
-  return Launch(num_workgroups, ConvertBuffersToKernelArgs(buffers));
+  return Launch(thread_dims, batch_size, ConvertBuffersToKernelArgs(buffers));
 }
 
-absl::Status Kernel::Launch(const NumWorkGroups& num_workgroups,
+absl::Status Kernel::Launch(const ThreadDim& thread_dims, size_t batch_size,
                             absl::Span<const XLA_CPU_KernelArg> args) const {
-  for (uint64_t z = 0; z < num_workgroups.z; ++z) {
-    for (uint64_t y = 0; y < num_workgroups.y; ++y) {
-      for (uint64_t x = 0; x < num_workgroups.x; ++x) {
-        XLA_CPU_NumWorkGroups dim = {num_workgroups.x, num_workgroups.y,
-                                     num_workgroups.z};
+  XLA_CPU_KernelThreadDim kernel_thread_dims = {
+      thread_dims.x,
+      thread_dims.y,
+      thread_dims.z,
+  };
 
-        XLA_CPU_WorkGroupId id = {x, y, z};
+  for (uint64_t z = 0; z < thread_dims.z; ++z) {
+    for (uint64_t y = 0; y < thread_dims.y; ++y) {
+      for (uint64_t x = 0; x < thread_dims.x; ++x) {
+        XLA_CPU_KernelThread kernel_thread = {x, y, z};
 
-        XLA_CPU_KernelCallFrame call_frame = {&dim, &id, args.size(),
-                                              args.data()};
+        XLA_CPU_KernelCallFrame call_frame = {&kernel_thread_dims,
+                                              &kernel_thread, args.size(),
+                                              args.data(), batch_size};
 
         XLA_CPU_KernelError* error = (*kernel_)(&call_frame);
 
@@ -170,22 +176,23 @@ absl::Status Kernel::Launch(const NumWorkGroups& num_workgroups,
 }
 
 tsl::AsyncValueRef<LaunchEvent> Kernel::Launch(
-    const NumWorkGroups& num_workgroups,
+    const ThreadDim& thread_dims, size_t batch_size,
     absl::Span<const DeviceMemoryBase> buffers,
     const Eigen::ThreadPoolDevice* device) const {
-  return Launch(num_workgroups, ConvertBuffersToKernelArgs(buffers), device);
+  return Launch(thread_dims, batch_size, ConvertBuffersToKernelArgs(buffers),
+                device);
 }
 
 tsl::AsyncValueRef<LaunchEvent> Kernel::Launch(
-    const NumWorkGroups& num_workgroups,
+    const ThreadDim& thread_dims, size_t batch_size,
     absl::Span<const XLA_CPU_KernelArg> args,
     const Eigen::ThreadPoolDevice* device) const {
-  size_t num_tasks = num_workgroups.x * num_workgroups.y * num_workgroups.z;
+  size_t num_tasks = thread_dims.x * thread_dims.y * thread_dims.z;
   CHECK_GT(num_tasks, 0) << "Number of tasks must be positive";  // Crash Ok
 
   // Short-circuit launch with a single task and run it in the caller thread.
   if (ABSL_PREDICT_TRUE(num_tasks == 1)) {
-    absl::Status launched = Launch(num_workgroups, args);
+    absl::Status launched = Launch(thread_dims, batch_size, args);
     return ABSL_PREDICT_TRUE(launched.ok())
                ? OkLaunchEvent()
                : tsl::MakeErrorAsyncValueRef(std::move(launched));
@@ -196,13 +203,15 @@ tsl::AsyncValueRef<LaunchEvent> Kernel::Launch(
       std::min<size_t>(std::min<size_t>(num_tasks, device->numThreadsInPool()),
                        std::numeric_limits<uint16_t>::max());
 
-  if (ABSL_PREDICT_TRUE(num_workgroups.y == 1 && num_workgroups.z == 1)) {
-    return Worker::Parallelize(device->getPool(), num_workers, num_tasks,
-                               Task<true>(kernel_, num_workgroups, args));
+  if (ABSL_PREDICT_TRUE(thread_dims.y == 1 && thread_dims.z == 1)) {
+    return Worker::Parallelize(
+        device, num_workers, num_tasks,
+        ParallelTask<true>(kernel_, thread_dims, batch_size, args));
+  } else {
+    return Worker::Parallelize(
+        device, num_workers, num_tasks,
+        ParallelTask<false>(kernel_, thread_dims, batch_size, args));
   }
-
-  return Worker::Parallelize(device->getPool(), num_workers, num_tasks,
-                             Task<false>(kernel_, num_workgroups, args));
 }
 
 }  // namespace xla::cpu

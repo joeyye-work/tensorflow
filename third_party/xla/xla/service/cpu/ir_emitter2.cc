@@ -195,6 +195,27 @@ absl::StatusOr<IrEmitter2::KernelInfo> IrEmitter2::EmitPadHostKernel(
       KernelInfo(std::move(kernel_prototype), se::BlockDim(), se::ThreadDim()));
 }
 
+absl::StatusOr<IrEmitter2::KernelInfo>
+IrEmitter2::EmitGetOuterBatchValueHostKernel(const HloInstruction* getBatch) {
+  VLOG(2) << "Emit GetOuterBatchValue host kernel: " << getBatch->name();
+
+  TF_ASSIGN_OR_RETURN(KernelPrototype kernel_prototype,
+                      EmitKernelPrototype(getBatch));
+  llvm_ir::IrArray operand_array = kernel_prototype.arguments[0];
+  llvm_ir::IrArray output_array = kernel_prototype.results[0];
+  xla::DynExpr* expr = getBatch->operand(0)->shape().expressions(0);
+  llvm::IRBuilder<> b(module_->getContext());
+  b.SetInsertPoint(kernel_prototype.function->getEntryBlock().getTerminator());
+  llvm::Value* bdim_value = llvm_ir::EmitExpression(&b, expr);
+  llvm_ir::IrArray::Index output_index(/*multidimensional_index=*/{},
+                                       getBatch->shape(), b.getInt32Ty());
+  llvm::Value* output_ptr =
+      output_array.EmitArrayElementAddress(output_index, &b);
+  b.CreateStore(bdim_value, output_ptr);
+  return kernels_.emplace_back(
+      KernelInfo(std::move(kernel_prototype), se::BlockDim(), se::ThreadDim()));
+}
+
 absl::StatusOr<IrEmitter2::KernelInfo> IrEmitter2::EmitFusionHostKernel(
     const HloFusionInstruction* fusion) {
   VLOG(2) << "Emit fusion host kernel: " << fusion->name();
@@ -319,18 +340,14 @@ absl::StatusOr<IrEmitter2::KernelInfo> IrEmitter2::EmitDotFusionHostKernel(
   llvm_ir::IrArray addend_array = kernel_prototype.arguments[addend_pnum];
   llvm_ir::IrArray target_array = kernel_prototype.results[0];
 
-  TF_ASSIGN_OR_RETURN(
-      DotOpWorkGroupDim num_workgroups,
-      EmitDotOperation(
-          *dot, target_array, lhs_array, rhs_array, &addend_array,
-          {kernel_prototype.workgroup_id.x, kernel_prototype.workgroup_id.y},
-          /*executable_run_options_value=*/nullptr, &b, hlo_module_.config(),
-          nested_ir_emitter_->target_machine_features(),
-          /*allow_runtime_calls=*/false, /*allow_parallelism=*/false));
+  TF_RETURN_IF_ERROR(EmitDotOperation(
+      *dot, target_array, lhs_array, rhs_array, &addend_array,
+      /*executable_run_options_value=*/nullptr, &b, hlo_module_.config(),
+      nested_ir_emitter_->target_machine_features(),
+      /*allow_runtime_calls=*/false));
 
-  return kernels_.emplace_back(KernelInfo(
-      std::move(kernel_prototype),
-      se::BlockDim(num_workgroups.x, num_workgroups.y), se::ThreadDim()));
+  return kernels_.emplace_back(
+      KernelInfo(std::move(kernel_prototype), se::BlockDim(), se::ThreadDim()));
 }
 
 absl::StatusOr<IrEmitter2::KernelInfo> IrEmitter2::EmitSliceToDynamicHostKernel(
@@ -416,7 +433,7 @@ absl::StatusOr<IrEmitter2::ComparatorInfo> IrEmitter2::EmitSortComparator(
 absl::StatusOr<IrEmitter2::KernelPrototype> IrEmitter2::EmitKernelPrototype(
     const HloInstruction* instr) {
   return kernel_api_ir_builder_.EmitKernelPrototype(
-      *module_, instr, &nested_ir_emitter_->assignment(), "ir_emitter2");
+      *module_, instr, &nested_ir_emitter_->assignment());
 }
 
 std::optional<IrEmitter2::ParallelConfig> IrEmitter2::GetParallelConfig(
@@ -489,7 +506,7 @@ IrEmitter2::ParallelPartitionBounds IrEmitter2::EmitParallelPartitionBounds(
   // Construct IR to load bounds for all parallel dimensions.
   ParallelPartitionBounds bounds;
   for (size_t i = 0; i < num_parallel_dimensions; ++i) {
-    llvm::Value* partition = kernel_prototype.workgroup_id.x;
+    llvm::Value* partition = kernel_prototype.thread_id.x;
     llvm::Value* parallel_dim = b.getInt32(i);
 
     llvm::Value* lower_gep = b.CreateInBoundsGEP(

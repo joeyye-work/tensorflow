@@ -41,29 +41,23 @@ extern "C" {
 //
 // (*) https://llvm.org/docs/LangRef.html#structure-types
 
-// XLA:CPU compiler generates a tiled function from an HLO fusion where each
-// tile is responsible for computing a part of the output. Each tile is
-// processed by a different workgroup. It's up to compiler to chose the tiling
-// strategy, from CPU runtime perspective it's simply an iteration space where
-// each task is independent and can be executed concurrently.
-//
-// XLA:CPU runtime uses a thread pool to execute tasks in parallel. Mapping of
-// workgroups to threads is dynamic, in some cases all workgroups are processed
-// by the same parallel task.
-
-// Dimensionality of an XLA:CPU kernel workgroup.
-typedef struct XLA_CPU_NumWorkGroups {
+// Similar to a Gpu backend an XLA:CPU compiler generates a tiled function from
+// an HLO fusion where each tile is responsible for computing a part of the
+// output. It's up to compiler to chose the tiling strategy, from CPU runtime
+// perspective it's simply an iteration space where each task is independent and
+// can be executed concurrently.
+typedef struct XLA_CPU_KernelDim3 {
   uint64_t x;
   uint64_t y;
   uint64_t z;
-} XLA_CPU_NumWorkGrousm;
+} XLA_CPU_KernelDim3;
 
-// Workgroup id for an XLA:CPU kernel invocation.
-typedef struct XLA_CPU_WorkGroupId {
-  uint64_t x;
-  uint64_t y;
-  uint64_t z;
-} XLA_CPU_WorkGroupId;
+// Kernel grid size roughly corresponds to a CUDA block size.
+typedef struct XLA_CPU_KernelDim3 XLA_CPU_KernelThreadDim;
+
+// Kernel grid coordinate roughly corresponds to a CUDA block, with an
+// assumption that all kernel invocations can run concurrently.
+typedef struct XLA_CPU_KernelDim3 XLA_CPU_KernelThread;
 
 // A CPU kernel argument that corresponds to se::DeviceMemoryBase.
 typedef struct XLA_CPU_KernelArg {
@@ -73,11 +67,12 @@ typedef struct XLA_CPU_KernelArg {
 
 // A CPU kernel call frame.
 typedef struct XLA_CPU_KernelCallFrame {
-  const XLA_CPU_NumWorkGroups* num_workgroups;
-  const XLA_CPU_WorkGroupId* workgroup_id;
+  const XLA_CPU_KernelThreadDim* thread_dims;
+  const XLA_CPU_KernelThread* thread;
 
   size_t num_args;
   const XLA_CPU_KernelArg* args;
+  size_t batch_size;
 } XLA_CPU_KernelCallFrame;
 
 // Error reporting for host kernels. NULL means success.

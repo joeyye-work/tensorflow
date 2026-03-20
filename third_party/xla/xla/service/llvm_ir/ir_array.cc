@@ -43,6 +43,7 @@ limitations under the License.
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/tsl/platform/logging.h"
+#include "xla/tsl/platform/status.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
 
@@ -198,7 +199,7 @@ IrArray::IrArray(llvm::Value* base_ptr, llvm::Type* pointee_type, Shape shape)
     : base_ptr_(base_ptr),
       pointee_type_(pointee_type),
       shape_(std::move(shape)) {
-  CHECK_OK(ShapeUtil::ValidateShape(shape_));
+  TF_CHECK_OK(ShapeUtil::ValidateShape(shape_));
   CHECK(base_ptr_->getType()->isPointerTy());
   int depth = 0;
   element_type_ = pointee_type;
@@ -280,8 +281,11 @@ IrArray::Index IrArray::Index::SourceIndexOfReshape(
       // linear index by each dimension size.
       for (int64_t i = common_factors[k + 1].first - 1;
            i >= common_factors[k].first; --i) {
+        xla::DynExpr* input_expr = input_shape.expressions(i);
+        bool is_dynamic = input_expr != nullptr && input_expr->is_dynamic();
         llvm::Value* divisor =
-            GetConstantWithIndexType(input_shape.dimensions(i));
+            is_dynamic ? llvm_ir::EmitExpression(builder, input_expr)
+                       : GetConstantWithIndexType(input_shape.dimensions(i));
         if (input_shape.dimensions(i) == 1) {
           source_multidim_index[i] = GetConstantWithIndexType(0);
         } else if (i == common_factors[k].first) {
@@ -325,8 +329,8 @@ IrArray::Index IrArray::Index::SourceIndexOfSlice(
 IrArray::Index IrArray::Index::SourceIndexOfTranspose(
     const Shape& shape, const Shape& operand_shape,
     absl::Span<const int64_t> dimension_mapping) const {
-  auto operand_multidim_index =
-      PermuteInverse<std::vector<llvm::Value*>>(multidim(), dimension_mapping);
+  std::vector<llvm::Value*> operand_multidim_index =
+      PermuteInverse(multidim(), dimension_mapping);
 
   if (linear() != nullptr && LayoutUtil::HasLayout(operand_shape) &&
       LayoutUtil::HasLayout(shape) &&
@@ -344,28 +348,27 @@ IrArray::Index IrArray::Index::SourceIndexOfBitcast(
 
   const ShapeUtil::BitcastDecomposition decomposition =
       ShapeUtil::DecomposeBitcast(operand_shape, shape);
-  CHECK(decomposition.has_value());
 
   // In case the bitcast is just a reshape, we can use SourceIndexOfReshape()
   // instead. This will reuse linear() if possible, so we don't have to build a
   // new 'linear_index'.
   if (std::holds_alternative<ShapeUtil::BitcastDecompositionReshape>(
-          *decomposition)) {
+          decomposition)) {
     return SourceIndexOfReshape(shape, operand_shape, builder);
   }
 
   if (std::holds_alternative<ShapeUtil::BitcastDecompositionTranspose>(
-          *decomposition)) {
+          decomposition)) {
     const auto& decomposition_transpose =
-        std::get<ShapeUtil::BitcastDecompositionTranspose>(*decomposition);
+        std::get<ShapeUtil::BitcastDecompositionTranspose>(decomposition);
     return SourceIndexOfTranspose(shape, operand_shape,
                                   decomposition_transpose.transpose_dims);
   }
 
   CHECK(std::holds_alternative<ShapeUtil::BitcastDecompositionTrt>(
-      *decomposition));
+      decomposition));
   const auto& decomposition_trt =
-      std::get<ShapeUtil::BitcastDecompositionTrt>(*decomposition);
+      std::get<ShapeUtil::BitcastDecompositionTrt>(decomposition);
 
   Index index = *this;
   if (!decomposition_trt.IsTranspose2Identity()) {
@@ -559,8 +562,25 @@ llvm::Value* IrArray::EmitArrayElementAddress(const IrArray::Index& index,
     int64_t dimension = LayoutUtil::Major(shape_.layout(), i);
     gep_indices.push_back(actual_index[dimension]);
   }
-  return b->CreateInBoundsGEP(pointee_type_, base_ptr_, gep_indices,
-                              llvm_ir::AsStringRef(name));
+
+  // Do not make a dynamic "GEP" if only the first dimension is dynamic since
+  // it's always indiced with 0 (i.e. the dynamic dimension has no impact on the
+  // address computation).
+  auto expressions = shape_.expressions();
+  bool dynamic_first_dim =
+      expressions[0]->is_dynamic() &&
+      std::all_of(expressions.begin() + 1, expressions.end(),
+                  [](DynExpr* e) { return e->is_constant(); });
+  if (!dynamic_first_dim && shape_.has_dynamic_expr()) {
+    llvm::Type* element_type =
+        PrimitiveTypeToIrType(shape_.element_type(), b->getContext());
+    return llvm_ir::createDynamicGEP(
+        b, base_ptr_, gep_indices, shape_.dimensions(), expressions,
+        element_type, llvm_ir::AsStringRef(name));
+  } else {
+    return b->CreateInBoundsGEP(pointee_type_, base_ptr_, gep_indices,
+                                llvm_ir::AsStringRef(name));
+  }
 }
 
 llvm::Value* IrArray::EmitLinearArrayElementAddress(

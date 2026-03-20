@@ -26,7 +26,6 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <string>
-#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -66,16 +65,16 @@ limitations under the License.
 #include "llvm/Support/Casting.h"
 #include "llvm/TargetParser/Triple.h"
 #include "mlir/IR/MLIRContext.h"
-#include "xla/backends/cpu/codegen/kernel_api_ir_builder.h"
 #include "xla/backends/cpu/codegen/target_machine_features.h"
+#include "xla/hlo/ir/collective_device_list.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
-#include "xla/hlo/ir/replica_group.h"
 #include "xla/layout.h"
 #include "xla/layout_util.h"
 #include "xla/literal.h"
+#include "xla/literal_util.h"
 #include "xla/map_util.h"
 #include "xla/primitive_util.h"
 #include "xla/service/buffer_assignment.h"
@@ -106,13 +105,14 @@ limitations under the License.
 #include "xla/status_macros.h"
 #include "xla/tsl/lib/math/math_util.h"
 #include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/status.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
 
-#ifdef XLA_ONEDNN
+#if defined(INTEL_MKL)
 #include "xla/service/cpu/onednn_memory_util.h"
-#endif  // XLA_ONEDNN
+#endif
 
 namespace xla {
 
@@ -167,8 +167,7 @@ IrEmitter::IrEmitter(mlir::MLIRContext* mlir_context,
       &hlo_module, &thread_local_computations_, &global_computations_);
   absl::c_sort(thread_local_computations_);
   absl::c_sort(global_computations_);
-  CHECK_OK(s) << "Should have failed buffer assignment.";
-  SetModuleMemoryRegionName(*module_, "ir_emitter");
+  TF_CHECK_OK(s) << "Should have failed buffer assignment.";
 }
 
 IrEmitter::~IrEmitter() {
@@ -799,18 +798,10 @@ absl::Status IrEmitter::HandleDot(HloInstruction* dot) {
           << llvm_ir::DumpToString(target_array.GetBasePointer());
 
   // Dot operation is complicated so we delegate to a helper class.
-  TF_ASSIGN_OR_RETURN(
-      DotOpWorkGroupDim num_workgroups,
-      EmitDotOperation(*dot, target_array, lhs_array, rhs_array,
-                       /*addend_array=*/nullptr,
-                       /*work_group_id=*/{b()->getInt64(0), b()->getInt64(0)},
-                       GetExecutableRunOptionsArgument(), b(),
-                       hlo_module_config_, target_machine_features_,
-                       allow_runtime_calls_, false));
-  DCHECK_EQ(num_workgroups.x, 1);
-  DCHECK_EQ(num_workgroups.y, 1);
-
-  return absl::OkStatus();
+  return EmitDotOperation(
+      *dot, target_array, lhs_array, rhs_array,
+      /*addend_array=*/nullptr, GetExecutableRunOptionsArgument(), b(),
+      hlo_module_config_, target_machine_features_, allow_runtime_calls_);
 }
 
 absl::Status IrEmitter::HandleConvolution(HloInstruction* convolution) {
@@ -901,6 +892,9 @@ absl::Status IrEmitter::HandleConvolution(HloInstruction* convolution) {
       PrimitiveType primitive_type = lhs->shape().element_type();
       bool multi_threaded =
           hlo_module_config_.debug_options().xla_cpu_multi_thread_eigen();
+      bool use_mkl_dnn =
+          hlo_module_config_.debug_options().xla_cpu_use_mkl_dnn() &&
+          convolution->feature_group_count() == 1;
       bool use_acl = hlo_module_config_.debug_options().xla_cpu_use_acl();
 
       auto valid_num_dims = [](absl::Span<const int64_t> xs) {
@@ -924,8 +918,10 @@ absl::Status IrEmitter::HandleConvolution(HloInstruction* convolution) {
                        ? runtime::kEigenConv2DF16SymbolName
                        : runtime::kEigenSingleThreadedConv2DF16SymbolName)
                 : (multi_threaded
-                       ? (use_acl ? runtime::kACLConv2DF32SymbolName
-                                  : runtime::kEigenConv2DF32SymbolName)
+                       ? (use_mkl_dnn
+                              ? runtime::kMKLConv2DF32SymbolName
+                              : (use_acl ? runtime::kACLConv2DF32SymbolName
+                                         : runtime::kEigenConv2DF32SymbolName))
                        : runtime::kEigenSingleThreadedConv2DF32SymbolName);
       } else if (input_dims.size() == 3) {
         fn_name =
@@ -938,6 +934,10 @@ absl::Status IrEmitter::HandleConvolution(HloInstruction* convolution) {
                        : runtime::kEigenSingleThreadedConv3DF32SymbolName);
       } else {
         LOG(FATAL) << "Invalid number of dimensions " << input_dims.size();
+      }
+      if (!multi_threaded && use_mkl_dnn) {
+        LOG(WARNING) << "Using Eigen instead of MKL-DNN for single-threaded "
+                        "convolution.";
       }
       std::vector<llvm::Value*> args = {
           GetExecutableRunOptionsArgument(),
@@ -991,7 +991,55 @@ absl::Status IrEmitter::HandleConvolution(HloInstruction* convolution) {
 }
 
 absl::Status IrEmitter::HandleFft(HloInstruction* fft) {
-  return Unimplemented("Fft is not implemented in the legacy emitter");
+  auto operand = fft->operand(0);
+  TF_RETURN_IF_ERROR(ElementTypesSameAndSupported(
+      /*instruction=*/*fft, /*operands=*/{operand},
+      /*supported_types=*/{F32, F64, C64, C128}));
+  TF_RET_CHECK(LayoutUtil::IsMonotonicWithDim0Major(operand->shape().layout()));
+  TF_RET_CHECK(LayoutUtil::IsMonotonicWithDim0Major(fft->shape().layout()));
+  VLOG(3) << "operand=" << ShapeUtil::HumanStringWithLayout(operand->shape());
+  VLOG(3) << "fft=" << ShapeUtil::HumanStringWithLayout(fft->shape());
+
+  llvm::Value* operand_address = GetEmittedValueFor(operand);
+  TF_RETURN_IF_ERROR(EmitTargetAddressForOp(fft));
+
+  const std::vector<int64_t>& fft_length = fft->fft_length();
+  const int fft_rank = fft_length.size();
+
+  // Flatten operand batches.
+  absl::InlinedVector<int64_t, 4> operand_shape_flat(fft_rank + 1);
+  int64_t input_batch = 1;
+  int64_t input_batch_length = fft->shape().dimensions().size() - fft_rank;
+  for (int i = 0; i < input_batch_length; i++) {
+    input_batch *= operand->shape().dimensions(i);
+  }
+  operand_shape_flat[0] = input_batch;
+  for (int i = 0; i < fft_rank; ++i) {
+    operand_shape_flat[i + 1] =
+        operand->shape().dimensions(i + input_batch_length);
+  }
+
+  // Args have been computed, make the call.
+  bool multi_threaded_eigen =
+      hlo_module_config_.debug_options().xla_cpu_multi_thread_eigen();
+  const char* fn_name = multi_threaded_eigen
+                            ? runtime::kLegacyDuccFftSymbolName
+                            : runtime::kDuccSingleThreadedFftSymbolName;
+  auto* fft_lengths =
+      EmitGlobalForLiteral(LiteralUtil::CreateR1<int64_t>(fft_length));
+  auto* input_shape =
+      EmitGlobalForLiteral(LiteralUtil::CreateR1<int64_t>(operand_shape_flat));
+  EmitCallToFunc(fn_name,
+                 {GetExecutableRunOptionsArgument(), GetEmittedValueFor(fft),
+                  operand_address, b()->getInt32(fft->fft_type()),
+                  b()->getInt32(operand->shape().element_type() == F64 ||
+                                operand->shape().element_type() == C128),
+                  b()->getInt32(fft_rank), input_shape, fft_lengths},
+                 b()->getVoidTy(), /*does_not_throw=*/true,
+                 /*only_accesses_arg_memory=*/false,
+                 /*only_accesses_inaccessible_mem_or_arg_mem=*/true);
+
+  return absl::OkStatus();
 }
 
 absl::Status IrEmitter::HandleAllReduceSingleReplica(HloInstruction* crs) {
@@ -2019,7 +2067,7 @@ absl::Status IrEmitter::HandleSlice(HloInstruction* slice) {
   const int64_t memcpy_elements =
       primitive_elements_per_logical_element * memcpy_logical_elements;
 
-  EmitTransferElements(memcpy_dest, memcpy_source, memcpy_elements,
+  EmitTransferElements(memcpy_dest, memcpy_source, DynExpr::_(memcpy_elements),
                        slice->shape().element_type(), target_array,
                        source_array);
 
@@ -2199,16 +2247,10 @@ absl::Status IrEmitter::HandleFusion(HloInstruction* fusion) {
     llvm_ir::IrArray addend_array(
         GetIrArrayFor(fusion->operand(addend_param_number)));
 
-    TF_ASSIGN_OR_RETURN(
-        DotOpWorkGroupDim num_workgroups,
-        EmitDotOperation(
-            *dot, target_array, lhs_array, rhs_array, &addend_array,
-            /*work_group_id=*/{b()->getInt64(0), b()->getInt64(0)},
-            GetExecutableRunOptionsArgument(), b(), hlo_module_config_,
-            target_machine_features_, true, false));
-    DCHECK_EQ(num_workgroups.x, 1);
-    DCHECK_EQ(num_workgroups.y, 1);
-
+    TF_RETURN_IF_ERROR(
+        EmitDotOperation(*dot, target_array, lhs_array, rhs_array,
+                         &addend_array, GetExecutableRunOptionsArgument(), b(),
+                         hlo_module_config_, target_machine_features_));
     return absl::OkStatus();
   } else {
     return Unimplemented("Fusion kind not implemented on CPU");
@@ -2316,6 +2358,24 @@ absl::Status IrEmitter::HandleSliceToDynamic(HloInstruction* hlo) {
   return EmitSliceToDynamic(hlo, source_arrays, target_array);
 }
 
+absl::Status IrEmitter::HandleOuterBatchValue(HloInstruction* hlo) {
+  TF_RETURN_IF_ERROR(EmitTargetAddressForOp(hlo));
+
+  llvm_ir::IrArray out_array = GetIrArrayFor(hlo);
+
+  llvm::Value* expr_value =
+      llvm_ir::EmitExpression(b(), hlo->operand(0)->shape().expressions(0));
+
+  auto it = emitted_value_.find(hlo);
+  if (it == emitted_value_.end()) {
+    LOG(ERROR) << "No buffer assigned for instruction " << hlo->name();
+  }
+  llvm::Value* dest_ptr = it->second;
+  b()->CreateStore(expr_value, dest_ptr);
+
+  return absl::OkStatus();
+}
+
 absl::Status IrEmitter::HandlePadToStatic(HloInstruction* hlo) {
   TF_RETURN_IF_ERROR(EmitTargetAddressForOp(hlo));
 
@@ -2421,7 +2481,7 @@ absl::Status IrEmitter::HandleTopK(HloInstruction* hlo) {
   return absl::OkStatus();
 }
 
-#ifdef XLA_ONEDNN
+#if defined(INTEL_MKL)
 
 // Emits operands alloca vector for oneDNN custom calls.
 std::vector<StackAlloca> IrEmitter::EmitOneDnnOperandsAlloca(
@@ -2478,7 +2538,7 @@ absl::Status IrEmitter::HandleOneDnnMatMulCalls(
   llvm::Value* nargs_val = b()->getInt64(nargs);
   llvm::Value* nargs_ptr =
       llvm_ir::EmitAllocaAtFunctionEntry(i64_type, "nargs", b());
-  b()->CreateLifetimeStart(nargs_ptr);
+  b()->CreateLifetimeStart(nargs_ptr, b()->getInt64(-1));
   b()->CreateStore(nargs_val, nargs_ptr);
   args_val = b()->CreateInsertValue(args_val, nargs_ptr, arg_indx++);
 
@@ -2505,7 +2565,7 @@ absl::Status IrEmitter::HandleOneDnnMatMulCalls(
 
   llvm::Value* args_ptr =
       llvm_ir::EmitAllocaAtFunctionEntry(ptr_array_type, "matmul.args", b());
-  b()->CreateLifetimeStart(args_ptr);
+  b()->CreateLifetimeStart(args_ptr, b()->getInt64(-1));
   b()->CreateStore(args_val, args_ptr);
 
   TF_RETURN_IF_ERROR(EmitTargetAddressForOp(custom_call));
@@ -2549,8 +2609,8 @@ absl::Status IrEmitter::HandleOneDnnMatMulCalls(
                  b()->getVoidTy());
 
   // Lifetime ends for all stack allocations.
-  b()->CreateLifetimeEnd(nargs_ptr);
-  b()->CreateLifetimeEnd(args_ptr);
+  b()->CreateLifetimeEnd(nargs_ptr, b()->getInt64(-1));
+  b()->CreateLifetimeEnd(args_ptr, b()->getInt64(-1));
   for (auto& alloca : operands_stack_alloca) {
     alloca.EmitLifetimeEnd();
   }
@@ -2561,9 +2621,213 @@ absl::Status IrEmitter::HandleOneDnnMatMulCalls(
 
   return absl::OkStatus();
 }
-#endif  // XLA_ONEDNN
+
+absl::Status IrEmitter::HandleOneDnnConvolution(HloInstruction* custom_call) {
+  //      args[0]: ptr to nargs
+  //      args[1]: ptr to ExecutableRunOptions
+  //      args[2]: ptr to OneDnnConvolutionConfig
+  //      args[3...]: ptrs to operands
+
+  // First three arguments: nargs, ExecutableRunOptions, and
+  // OneDnnConvolutionConfig.
+  const int nargs_offset = 3;
+  const int num_operands = custom_call->operand_count();
+  const int nargs = nargs_offset + num_operands;
+  int arg_indx = 0;
+
+  llvm::Type* i64_type = b()->getInt64Ty();
+  llvm::Type* ptr_type = b()->getPtrTy();
+  llvm::ArrayType* ptr_array_type = llvm::ArrayType::get(ptr_type, nargs);
+  llvm::Value* args_val = llvm::UndefValue::get(ptr_array_type);
+
+  llvm::Value* nargs_val = b()->getInt64(nargs);
+  llvm::Value* nargs_ptr =
+      llvm_ir::EmitAllocaAtFunctionEntry(i64_type, "nargs", b());
+  b()->CreateLifetimeStart(nargs_ptr, b()->getInt64(-1));
+  b()->CreateStore(nargs_val, nargs_ptr);
+  args_val = b()->CreateInsertValue(args_val, nargs_ptr, arg_indx++);
+
+  llvm::Value* run_opts_val = GetExecutableRunOptionsArgument();
+  args_val = b()->CreateInsertValue(args_val, run_opts_val, arg_indx++);
+
+  auto typed_custom_call = Cast<HloCustomCallInstruction>(custom_call);
+  auto backend_config = typed_custom_call->backend_config<BackendConfig>();
+  OneDnnConvolutionConfig conv_config;
+  conv_config.CopyFrom(backend_config->onednn_conv_config());
+  std::string str_config;
+  conv_config.SerializeToString(&str_config);
+  llvm::Value* conv_config_val =
+      b()->CreateGlobalStringPtr(llvm_ir::AsStringRef(str_config));
+  args_val = b()->CreateInsertValue(args_val, conv_config_val, arg_indx++);
+
+  auto operands_stack_alloca =
+      EmitOneDnnOperandsAlloca(custom_call, args_val, arg_indx);
+  TF_RET_CHECK(nargs == arg_indx)
+      << "Number of arguments don't equal the last argument index.";
+
+  llvm::Value* args_ptr = llvm_ir::EmitAllocaAtFunctionEntry(
+      ptr_array_type, "convolution.args", b());
+  b()->CreateLifetimeStart(args_ptr, b()->getInt64(-1));
+  b()->CreateStore(args_val, args_ptr);
+
+  TF_RETURN_IF_ERROR(EmitTargetAddressForOp(custom_call));
+
+  StackAlloca result_stack_alloca;
+  StackAlloca scratch_stack_alloca;
+  std::vector<llvm::Value*> fn_call_args;
+  fn_call_args.reserve(3);
+  // Add the scratch buffer to the output, so that oneDNN can use it as a
+  // user-provided scratchpad
+  const bool use_scratchpad = custom_call->shape().IsTuple();
+  if (use_scratchpad) {
+    llvm::Value* result_slice_ptr;
+    llvm::Value* scratch_slice_ptr;
+    TF_ASSIGN_OR_RETURN(const BufferAllocation::Slice result_slice,
+                        assignment_.GetUniqueSlice(custom_call, {0}));
+    const Shape& result_shape = custom_call->shape().tuple_shapes(0);
+    std::tie(result_slice_ptr, result_stack_alloca) =
+        GetPtrAndAllocaFromBufferSlice(result_slice, result_shape);
+    fn_call_args.push_back(result_stack_alloca.value);
+
+    TF_ASSIGN_OR_RETURN(const BufferAllocation::Slice scratch_slice,
+                        assignment_.GetUniqueSlice(custom_call, {1}));
+    const Shape& scratch_shape = custom_call->shape().tuple_shapes(1);
+    std::tie(scratch_slice_ptr, scratch_stack_alloca) =
+        GetPtrAndAllocaFromBufferSlice(scratch_slice, scratch_shape);
+    fn_call_args.push_back(scratch_stack_alloca.value);
+    llvm_ir::EmitTuple(GetIrArrayFor(custom_call),
+                       {result_slice_ptr, scratch_slice_ptr}, b());
+  } else {
+    llvm_ir::IrArray result_array;
+    result_array = GetIrArrayFor(custom_call);
+    result_stack_alloca = GetAllocaAndEmitMemrefInfo(*b(), result_array);
+    fn_call_args.push_back(result_stack_alloca.value);
+    fn_call_args.push_back(llvm::ConstantPointerNull::get(b()->getPtrTy()));
+  }
+  fn_call_args.push_back(args_ptr);
+  EmitCallToFunc(runtime::kOneDnnConvolutionSymbolName, fn_call_args,
+                 b()->getVoidTy());
+
+  // Lifetime ends for all stack allocations.
+  b()->CreateLifetimeEnd(nargs_ptr, b()->getInt64(-1));
+  b()->CreateLifetimeEnd(args_ptr, b()->getInt64(-1));
+  for (StackAlloca& alloca : operands_stack_alloca) {
+    alloca.EmitLifetimeEnd();
+  }
+  result_stack_alloca.EmitLifetimeEnd();
+  if (use_scratchpad) {
+    scratch_stack_alloca.EmitLifetimeEnd();
+  }
+
+  return absl::OkStatus();
+}
+
+absl::Status IrEmitter::HandleOneDnnLayerNorm(HloInstruction* custom_call) {
+  //      args[0]: ptr to nargs
+  //      args[1]: ptr to ExecutableRunOptions
+  //      args[2]: ptr to OneDnnNormConfig
+  //      args[3...]: ptrs to operands
+
+  // First three arguments: nargs, ExecutableRunOptions, and
+  // OneDnnNormConfig.
+  const int nargs_offset = 3;
+  const int num_operands = custom_call->operand_count();
+  const int nargs = nargs_offset + num_operands;
+  int arg_indx = 0;
+
+  llvm::Type* i64_type = b()->getInt64Ty();
+  llvm::Type* ptr_type = b()->getPtrTy();
+  llvm::ArrayType* ptr_array_type = llvm::ArrayType::get(ptr_type, nargs);
+  llvm::Value* args_val = llvm::UndefValue::get(ptr_array_type);
+
+  // Insert nargs.
+  llvm::Value* nargs_val = b()->getInt64(nargs);
+  llvm::Value* nargs_ptr =
+      llvm_ir::EmitAllocaAtFunctionEntry(i64_type, "nargs", b());
+  b()->CreateLifetimeStart(nargs_ptr, b()->getInt64(-1));
+  b()->CreateStore(nargs_val, nargs_ptr);
+  args_val = b()->CreateInsertValue(args_val, nargs_ptr, arg_indx++);
+
+  // Insert ExecutableRunOptions.
+  llvm::Value* run_opts_val = GetExecutableRunOptionsArgument();
+  args_val = b()->CreateInsertValue(args_val, run_opts_val, arg_indx++);
+
+  // Insert OneDnnNormConfig.
+  auto typed_custom_call = Cast<HloCustomCallInstruction>(custom_call);
+  auto backend_config = typed_custom_call->backend_config<BackendConfig>();
+  OneDnnNormConfig ln_config;
+  ln_config.CopyFrom(backend_config->onednn_layer_norm_config());
+  std::string str_config;
+  ln_config.SerializeToString(&str_config);
+  llvm::Value* ln_config_val =
+      b()->CreateGlobalStringPtr(llvm_ir::AsStringRef(str_config));
+  args_val = b()->CreateInsertValue(args_val, ln_config_val, arg_indx++);
+
+  // Insert operands.
+  auto operands_stack_alloca =
+      EmitOneDnnOperandsAlloca(custom_call, args_val, arg_indx);
+  TF_RET_CHECK(nargs == arg_indx)
+      << "Number of arguments don't equal the last argument index.";
+
+  llvm::Value* args_ptr =
+      llvm_ir::EmitAllocaAtFunctionEntry(ptr_array_type, "layernorm.args", b());
+  b()->CreateLifetimeStart(args_ptr, b()->getInt64(-1));
+  b()->CreateStore(args_val, args_ptr);
+
+  TF_RETURN_IF_ERROR(EmitTargetAddressForOp(custom_call));
+  llvm_ir::IrArray result_array = GetIrArrayFor(custom_call);
+  auto result_stack_alloca = GetAllocaAndEmitMemrefInfo(*b(), result_array);
+
+  EmitCallToFunc(runtime::kOneDnnLayerNormSymbolName,
+                 {result_stack_alloca.value, args_ptr}, b()->getVoidTy());
+
+  // Lifetime ends for all stack allocations.
+  b()->CreateLifetimeEnd(nargs_ptr, b()->getInt64(-1));
+  for (int i = 0; i < num_operands; ++i) {
+    operands_stack_alloca[i].EmitLifetimeEnd();
+  }
+  b()->CreateLifetimeEnd(args_ptr, b()->getInt64(-1));
+  result_stack_alloca.EmitLifetimeEnd();
+
+  return absl::OkStatus();
+}
+
+absl::Status IrEmitter::HandleOneDnnSoftmax(HloInstruction* custom_call) {
+  // Serialize and emit OneDnnSoftmaxConfig.
+  auto typed_custom_call = Cast<HloCustomCallInstruction>(custom_call);
+  auto backend_config = typed_custom_call->backend_config<BackendConfig>();
+  OneDnnSoftmaxConfig softmax_config;
+  softmax_config.CopyFrom(backend_config->onednn_softmax_config());
+  std::string str_config;
+  softmax_config.SerializeToString(&str_config);
+  llvm::Value* softmax_config_val =
+      b()->CreateGlobalStringPtr(llvm_ir::AsStringRef(str_config));
+
+  auto input = custom_call->operand(0);
+  llvm_ir::IrArray input_array(GetIrArrayFor(input));
+  auto input_stack_alloca = GetAllocaAndEmitMemrefInfo(*b(), input_array);
+
+  TF_RETURN_IF_ERROR(EmitTargetAddressForOp(custom_call));
+  llvm_ir::IrArray result_array = GetIrArrayFor(custom_call);
+  auto result_stack_alloca = GetAllocaAndEmitMemrefInfo(*b(), result_array);
+
+  EmitCallToFunc(runtime::kOneDnnSoftmaxSymbolName,
+                 {GetExecutableRunOptionsArgument(), input_stack_alloca.value,
+                  result_stack_alloca.value, softmax_config_val},
+                 b()->getVoidTy());
+
+  input_stack_alloca.EmitLifetimeEnd();
+  result_stack_alloca.EmitLifetimeEnd();
+
+  return absl::OkStatus();
+}
+#endif  // INTEL_MKL
 
 absl::Status IrEmitter::HandleCustomCall(HloInstruction* custom_call) {
+  if (custom_call->custom_call_target() == "GetOuterBatchValue") {
+    return HandleOuterBatchValue(custom_call);
+  }
+
   if (custom_call->custom_call_target() == "PadToStatic") {
     return HandlePadToStatic(custom_call);
   }
@@ -2573,16 +2837,25 @@ absl::Status IrEmitter::HandleCustomCall(HloInstruction* custom_call) {
   if (custom_call->custom_call_target() == "TopK") {
     return HandleTopK(custom_call);
   }
-#ifdef XLA_ONEDNN
+#if defined(INTEL_MKL)
   if (custom_call->custom_call_target() == "__onednn$matmul") {
     return HandleOneDnnMatMulCalls(custom_call,
                                    runtime::kOneDnnMatMulSymbolName);
+  }
+  if (custom_call->custom_call_target() == "__onednn$softmax") {
+    return HandleOneDnnSoftmax(custom_call);
+  }
+  if (custom_call->custom_call_target() == "__onednn$layernorm") {
+    return HandleOneDnnLayerNorm(custom_call);
+  }
+  if (custom_call->custom_call_target() == "__onednn$convolution") {
+    return HandleOneDnnConvolution(custom_call);
   }
   if (custom_call->custom_call_target() == "__onednn$matmul_reorder") {
     return HandleOneDnnMatMulCalls(custom_call,
                                    runtime::kOneDnnMatMulReorderSymbolName);
   }
-#endif  // XLA_ONEDNN
+#endif  // INTEL_MKL
   absl::Span<HloInstruction* const> operands(custom_call->operands());
   auto typed_custom_call = Cast<HloCustomCallInstruction>(custom_call);
   auto is_typed_ffi = typed_custom_call->api_version() ==
@@ -2830,22 +3103,17 @@ absl::Status IrEmitter::EmitFastConcatenate(
     absl::Span<const llvm_ir::IrArray> source_arrays,
     const llvm_ir::IrArray& target_array) {
   return ::xla::cpu::EmitFastConcatenate(instr, source_arrays, target_array,
-                                         module_, *b())
-      .status();
+                                         module_, *b());
 }
 
-absl::StatusOr<bool> EmitFastConcatenate(
+absl::Status EmitFastConcatenate(
     const HloInstruction* instr,
     absl::Span<const llvm_ir::IrArray> source_arrays,
     const llvm_ir::IrArray& target_array, llvm::Module* module,
-    llvm::IRBuilderBase& b, llvm::Value* workgroup_id, int64_t num_workgroups) {
+    llvm::IRBuilderBase& b) {
   // We split the dimensions into three categories: the dimension over which we
   // are concatenating (concat_dim), the dimensions that are minor to it
   // (inner_dims) and the dimensions that are major to it (outer_dims).
-
-  if (workgroup_id != nullptr && num_workgroups <= 0) {
-    return absl::UnimplementedError("Missing number of workgroups");
-  }
 
   auto* concatenate = Cast<HloConcatenateInstruction>(instr);
   const Shape& output_shape = concatenate->shape();
@@ -2860,46 +3128,8 @@ absl::StatusOr<bool> EmitFastConcatenate(
                                   output_min2maj.end());
 
   llvm_ir::ForLoopNest loops(IrName(concatenate), &b);
-
-  bool has_workgroup_id = workgroup_id != nullptr;
-  bool has_multiple_workers = num_workgroups > 1;
-  bool has_outer_dims = !outer_dims.empty();
-  bool is_parallel = has_workgroup_id && has_multiple_workers && has_outer_dims;
-
-  llvm::Value* workgroup_ind_var = nullptr;
-  if (is_parallel) {
-    int64_t outer_dim_size = output_shape.dimensions(outer_dims.back());
-    int64_t workgroup_size = CeilOfRatio(outer_dim_size, num_workgroups);
-    llvm::Value* workgroup_size_value =
-        llvm::ConstantInt::get(b.getInt64Ty(), workgroup_size);
-    llvm::Value* constant_1 = llvm::ConstantInt::get(b.getInt64Ty(), 1);
-    llvm::Value* constant_dim_size =
-        llvm::ConstantInt::get(b.getInt64Ty(), outer_dim_size);
-    llvm::Value* workgroup_start_idx =
-        b.CreateMul(workgroup_id, workgroup_size_value);
-    llvm::Value* workgroup_end_idx = b.CreateBinaryIntrinsic(
-        llvm::Intrinsic::smin,
-        b.CreateMul(b.CreateAdd(workgroup_id, constant_1),
-                    workgroup_size_value),
-        constant_dim_size);
-
-    auto workgroup_loop =
-        loops.AddLoop("workgroup", workgroup_start_idx, workgroup_end_idx);
-    workgroup_ind_var = workgroup_loop->GetIndVarValue();
-  }
-
   std::vector<llvm::Value*> target_multi_index =
-      loops.AddLoopsForShapeOnDimensions(
-          output_shape,
-          workgroup_ind_var
-              ? absl::MakeSpan(outer_dims).first(outer_dims.size() - 1)
-              : absl::MakeSpan(outer_dims),
-          "concat");
-
-  if (workgroup_ind_var) {
-    target_multi_index[outer_dims.back()] = workgroup_ind_var;
-  }
-
+      loops.AddLoopsForShapeOnDimensions(output_shape, outer_dims, "concat");
   absl::c_replace(target_multi_index, static_cast<llvm::Value*>(nullptr),
                   static_cast<llvm::Value*>(b.getInt64(0)));
   llvm_ir::IrArray::Index target_index(target_multi_index, output_shape,
@@ -2917,11 +3147,11 @@ absl::StatusOr<bool> EmitFastConcatenate(
   // contiguous subregion in the target buffer starting at target_region_begin.
   llvm::Value* target_region_begin =
       target_array.EmitArrayElementAddress(target_index, &b, "target_region");
-  int64_t byte_offset_into_target_region = 0;
+  llvm::Value* byte_offset_into_target_region = b.getInt64(0);
 
-  int64_t inner_dims_product = absl::c_accumulate(
-      inner_dims, int64_t{1}, [&](int64_t product, int64_t inner_dim) {
-        return product * output_shape.dimensions(inner_dim);
+  DynExpr* inner_exprs_product = absl::c_accumulate(
+      inner_dims, DynExpr::one, [&](DynExpr* product, int64_t inner_dim) {
+        return *product * *output_shape.expressions(inner_dim);
       });
 
   // For each operand, emit a memcpy from the operand to the target of size
@@ -2934,24 +3164,30 @@ absl::StatusOr<bool> EmitFastConcatenate(
     llvm::Value* copy_source_address =
         source_array.EmitArrayElementAddress(source_index, &b, "src_addr");
 
-    llvm::Value* copy_target_address =
-        b.CreateGEP(b.getInt8Ty(), target_region_begin,
-                    b.getInt64(byte_offset_into_target_region));
+    llvm::Value* copy_target_address = b.CreateGEP(
+        b.getInt8Ty(), target_region_begin, byte_offset_into_target_region);
 
-    ::xla::cpu::EmitTransferElements(
-        copy_target_address, copy_source_address,
-        inner_dims_product * input_shape.dimensions(concat_dim), primitive_type,
-        target_array, source_array, module, b);
+    auto cexpr = input_shape.expressions(concat_dim);
 
-    byte_offset_into_target_region += inner_dims_product *
-                                      input_shape.dimensions(concat_dim) *
-                                      primitive_type_size;
+    ::xla::cpu::EmitTransferElements(copy_target_address, copy_source_address,
+                                     (*inner_exprs_product * *cexpr)->s(),
+                                     primitive_type, target_array, source_array,
+                                     module, b);
+
+    llvm::Value* concat_dim_count = xla::llvm_ir::EmitExpression(
+        &b, (*inner_exprs_product * *input_shape.expressions(concat_dim))->s());
+
+    llvm::Value* concat_dim_size =
+        b.CreateMul(concat_dim_count, b.getInt64(primitive_type_size));
+    byte_offset_into_target_region =
+        b.CreateAdd(byte_offset_into_target_region, concat_dim_size,
+                    "byte_offset_into_target_region");
   }
 
   if (!outer_dims.empty()) {
     SetToFirstInsertPoint(loops.GetOuterLoopExitBasicBlock(), &b);
   }
-  return is_parallel;
+  return absl::OkStatus();
 }
 
 llvm::Value* IrEmitter::EmitPrintf(absl::string_view fmt,
@@ -3156,7 +3392,7 @@ llvm::Value* IrEmitter::EmitCallToFfi(HloCustomCallInstruction* custom_call,
 }
 
 void IrEmitter::EmitTransferElements(llvm::Value* target, llvm::Value* source,
-                                     int64_t element_count,
+                                     xla::DynExpr* element_count,
                                      PrimitiveType primitive_type,
                                      const llvm_ir::IrArray& target_array,
                                      const llvm_ir::IrArray& source_array) {
@@ -3166,7 +3402,8 @@ void IrEmitter::EmitTransferElements(llvm::Value* target, llvm::Value* source,
 }
 
 void EmitTransferElements(llvm::Value* target, llvm::Value* source,
-                          int64_t element_count, PrimitiveType primitive_type,
+                          xla::DynExpr* element_count,
+                          PrimitiveType primitive_type,
                           const llvm_ir::IrArray& target_array,
                           const llvm_ir::IrArray& source_array,
                           llvm::Module* module, llvm::IRBuilderBase& b) {
@@ -3178,7 +3415,7 @@ void EmitTransferElements(llvm::Value* target, llvm::Value* source,
   llvm::Type* primitive_llvm_type =
       llvm_ir::PrimitiveTypeToIrType(primitive_type, module->getContext());
 
-  if (element_count == 1) {
+  if (element_count == DynExpr::one) {
     auto* load_instruction =
         b.CreateAlignedLoad(primitive_llvm_type, source, element_alignment);
     source_array.AnnotateLoadStoreInstructionWithMetadata(load_instruction);
@@ -3186,11 +3423,12 @@ void EmitTransferElements(llvm::Value* target, llvm::Value* source,
         b.CreateAlignedStore(load_instruction, target, element_alignment);
     target_array.AnnotateLoadStoreInstructionWithMetadata(store_instruction);
   } else {
+    auto element_count_value = xla::llvm_ir::EmitExpression(&b, element_count);
+    llvm::Value* elements_size =
+        b.CreateMul(element_count_value, b.getInt64(primitive_type_size));
     auto* memcpy_instruction = b.CreateMemCpy(
         target, /*DstAlign=*/llvm::Align(element_alignment), source,
-        /*SrcAlign=*/llvm::Align(element_alignment),
-        element_count * primitive_type_size);
-
+        /*SrcAlign=*/llvm::Align(element_alignment), elements_size);
     // The memcpy does the load and the store internally.  The aliasing related
     // metadata has to reflect that.
     std::map<int, llvm::MDNode*> merged_metadata =
@@ -3231,10 +3469,8 @@ absl::Status IrEmitter::HandleConcatenate(HloInstruction* concatenate) {
     for (HloInstruction* operand : concatenate->operands()) {
       source_arrays.emplace_back(GetIrArrayFor(operand));
     }
-    TF_RETURN_IF_ERROR(
-        ::xla::cpu::EmitFastConcatenate(concatenate, source_arrays,
-                                        target_array, module_, *b())
-            .status());
+    TF_RETURN_IF_ERROR(::xla::cpu::EmitFastConcatenate(
+        concatenate, source_arrays, target_array, module_, *b()));
     VLOG(1) << "Emitted fast concatenate for " << concatenate->ToString();
     return absl::OkStatus();
   }
@@ -3633,8 +3869,9 @@ llvm_ir::IrArray IrEmitter::GetIrArrayFor(const HloInstruction* hlo) {
 std::vector<llvm_ir::IrArray> IrEmitter::GetIrArraysForOperandsOf(
     const HloInstruction* hlo) {
   std::vector<llvm_ir::IrArray> arrays;
-  absl::c_transform(
-      hlo->operands(), std::back_inserter(arrays),
+  std::transform(
+      hlo->operands().begin(), hlo->operands().end(),
+      std::back_inserter(arrays),
       [&](const HloInstruction* operand) { return GetIrArrayFor(operand); });
   return arrays;
 }
@@ -3704,8 +3941,10 @@ llvm::Value* IrEmitter::EmitThreadLocalBufferPointer(
 
       if (!target_shape.IsOpaque()) {
         AttachAlignmentMetadataForLoad(param_address_untyped, target_shape);
-        AttachDereferenceableMetadataForLoad(param_address_untyped,
-                                             target_shape);
+        if (!target_shape.has_dynamic_expr()) {
+          AttachDereferenceableMetadataForLoad(param_address_untyped,
+                                               target_shape);
+        }
       }
       return param_address_untyped;
     }
@@ -3751,7 +3990,10 @@ llvm::Value* IrEmitter::EmitGlobalBufferPointer(
 
   AttachInvariantLoadMetadataForLoad(tempbuf_address_base);
   AttachAlignmentMetadataForLoad(tempbuf_address_base, allocation.size());
-  AttachDereferenceableMetadataForLoad(tempbuf_address_base, allocation.size());
+
+  if (!target_shape.has_dynamic_expr())
+    AttachDereferenceableMetadataForLoad(tempbuf_address_base,
+                                         allocation.size());
 
   llvm::Value* tempbuf_address_untyped = tempbuf_address_base;
   // Any explicit buffer pointer should point to the start of the slice.
@@ -3852,9 +4094,38 @@ absl::Status IrEmitter::EmitMemcpy(const HloInstruction& source,
   llvm::Value* source_value = GetEmittedValueFor(&source);
   llvm::Value* destination_value = GetEmittedValueFor(&destination);
   int64_t source_size = ByteSizeOf(source.shape());
-  // TODO(b/63762267): Be more aggressive about specifying alignment.
-  MemCpy(destination_value, /*DstAlign=*/llvm::Align(1), source_value,
-         /*SrcAlign=*/llvm::Align(1), source_size);
+  auto shape = source.shape();
+  auto expressions = shape.expressions();
+  bool is_dynamic =
+      std::any_of(expressions.begin(), expressions.end(),
+                  [](DynExpr* e) { return e->is_dynamic(); });
+  if (is_dynamic) {
+    llvm::LLVMContext& ctx = b()->getContext();
+    llvm::IntegerType* i64Type = llvm::IntegerType::getInt64Ty(ctx);
+    int64_t dimensions_accu = 1;
+    DynExpr* expression_accu = DynExpr::one;
+    for (int i = 0; i < shape.dimensions_size(); i++) {
+      auto expression = shape.expressions(i);
+      if (expression->is_dynamic()) {
+        dimensions_accu *= shape.dimensions(i);
+        expression_accu = (*expression_accu) * (*expression);
+      }
+    }
+    llvm::Value* expr_value =
+        xla::llvm_ir::EmitExpression(b(), expression_accu->s());
+    // Divide the size in bytes by the size of the dynamic dimension(s).
+    // TODO: make that less hacky
+    llvm::ConstantInt* size =
+        llvm::ConstantInt::get(i64Type, source_size / dimensions_accu, true);
+    llvm::Value* memcopy_size =
+        b()->CreateMul(expr_value, size, "memcopy_size");
+    MemCpy(destination_value, /*DstAlign=*/llvm::Align(1), source_value,
+           /*SrcAlign=*/llvm::Align(1), memcopy_size);
+  } else {
+    // TODO(b/63762267): Be more aggressive about specifying alignment.
+    MemCpy(destination_value, /*DstAlign=*/llvm::Align(1), source_value,
+           /*SrcAlign=*/llvm::Align(1), source_size);
+  }
   return absl::OkStatus();
 }
 
