@@ -20,7 +20,6 @@ limitations under the License.
 #include <functional>
 #include <memory>
 #include <string>
-#include <vector>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/statusor.h"
@@ -48,7 +47,6 @@ class AsyncValueRef;
 
 namespace xla {
 
-class CliqueKey;
 class DeviceAssignment;
 class ExecutionProfile;
 class Shape;
@@ -197,6 +195,13 @@ class ExecutableRunOptions {
     return *this;
   }
 
+  ExecutableRunOptions& set_batch_size(int64_t batch_size) {
+    batch_size_ = batch_size;
+    return *this;
+  }
+
+  int64_t batch_size() const { return batch_size_; }
+
   int32_t launch_id() const { return launch_id_; }
 
   ExecutableRunOptions& set_run_id(RunId id);
@@ -256,10 +261,6 @@ class ExecutableRunOptions {
   ExecutableRunOptions& set_local_device_count(int local_device_count);
   int local_device_count() const;
 
-  ExecutableRunOptions& set_clique_keys(
-      std::vector<std::unique_ptr<CliqueKey>>* clique_keys);
-  std::vector<std::unique_ptr<CliqueKey>>* clique_keys() const;
-
  private:
   stream_executor::DeviceMemoryAllocator* allocator_ = nullptr;
   int device_ordinal_ = -1;
@@ -271,6 +272,7 @@ class ExecutableRunOptions {
   ExecutionProfile* execution_profile_ = nullptr;
   int rng_seed_ = 0;
   int32_t launch_id_ = 0;
+  int64_t batch_size_ = 0;
   stream_executor::Stream* device_to_host_stream_ = nullptr;
   stream_executor::Stream* host_to_device_stream_ = nullptr;
   ThenExecuteFunction* then_execute_function_ = nullptr;
@@ -280,7 +282,6 @@ class ExecutableRunOptions {
   const cpu::CpuExecutableRunOptions* cpu_executable_run_options_ = nullptr;
   const gpu::GpuExecutableRunOptions* gpu_executable_run_options_ = nullptr;
   const ffi::ExecutionContext* ffi_execution_context_ = nullptr;
-  std::vector<std::unique_ptr<CliqueKey>>* clique_keys_ = nullptr;
 };
 
 }  // namespace xla
