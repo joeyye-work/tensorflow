@@ -41,9 +41,8 @@ namespace xla {
 xla::XlaOp ConcatScalars(xla::XlaBuilder* builder,
                          absl::Span<const xla::XlaOp> scalars) {
   std::vector<xla::XlaOp> vectors;
-  absl::c_transform(scalars, std::back_inserter(vectors), [](xla::XlaOp x) {
-    return xla::Reshape(x, {1}, {xla::DynExpr::one});
-  });
+  absl::c_transform(scalars, std::back_inserter(vectors),
+                    [](xla::XlaOp x) { return xla::Reshape(x, {1}); });
   return ConcatInDim(builder, vectors, 0);
 }
 
@@ -155,8 +154,7 @@ std::pair<ThreeFry2x32State, XlaOp> GetThreeFryInputsAndUpdatedState(
   XlaBuilder* builder = initial_state.builder();
   auto u64_shape = ShapeUtil::MakeShape(U64, shape.dimensions());
   // initial_state is an R1, so reshape it to a scalar.
-  auto input_u64 = Broadcast(Reshape(initial_state, {}), shape.dimensions(),
-                             shape.expressions());
+  auto input_u64 = Broadcast(Reshape(initial_state, {}), shape.dimensions());
   int64_t trailing_dims_product = 1;
   for (int64_t i = shape.dimensions().size() - 1; i >= 0; --i) {
     if (shape.dimensions(i) < 2) {
@@ -247,12 +245,8 @@ XlaOp CombineShapePair(absl::Span<const XlaOp> pair,
       original_shape.dimensions(shape_pair.split_dim);
   std::vector<int64_t> reshape_dims(original_shape.dimensions().begin(),
                                     original_shape.dimensions().end());
-  std::vector<DynExpr*> reshape_exprs(original_shape.expressions().begin(),
-                                     original_shape.expressions().end());
   reshape_dims[shape_pair.split_dim] = RoundUpTo<int64_t>(pre_split_size, 2);
-  reshape_exprs[shape_pair.split_dim] =
-      DynExpr::_(RoundUpTo<int64_t>(pre_split_size, 2));
-  result = Reshape(result, reshape_dims, reshape_exprs);
+  result = Reshape(result, reshape_dims);
   if (reshape_dims[shape_pair.split_dim] != pre_split_size) {
     result = Slice(result,
                    std::vector<int64_t>(original_shape.dimensions().size(), 0),
@@ -459,11 +453,11 @@ RngOutput PhiloxRngBit32(XlaOp op_key, XlaOp initial_state,
   }
   XlaOp numbers = ConcatInDim(builder, {bits[0], bits[1], bits[2], bits[3]},
                               /*dimension=*/1);
-  numbers = Reshape(numbers, {bits_len * 4}, {});
+  numbers = Reshape(numbers, {bits_len * 4});
   numbers = Slice(numbers, /*start_indices=*/{0},
                   /*limit_indices=*/{num_elems},
                   /*strides=*/{1});
-  return {Reshape(numbers, shape.dimensions(), shape.expressions()), new_state};
+  return {Reshape(numbers, shape.dimensions()), new_state};
 }
 
 // Generates an array of primitive type U16 with the given shape containing
@@ -513,7 +507,7 @@ RngOutput PhiloxRngBit64(XlaOp op_key, XlaOp initial_state,
   numbers = Slice(numbers, /*start_indices=*/{0},
                   /*limit_indices=*/{num_elems},
                   /*strides=*/{1});
-  return {Reshape(numbers, shape.dimensions(), shape.expressions()), new_state};
+  return {Reshape(numbers, shape.dimensions()), new_state};
 }
 
 XlaOp ConvertRandomBitsToUniformFloatingPoint(XlaOp bits, XlaOp minval,

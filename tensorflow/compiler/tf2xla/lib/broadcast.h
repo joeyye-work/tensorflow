@@ -29,9 +29,8 @@ namespace tensorflow {
 
 // Forwards to xla::BroadcastTo.
 // TODO(cheshire): Call the underlying function directly.
-absl::StatusOr<xla::XlaOp> BroadcastTo(
-    xla::XlaOp input, absl::Span<int64_t const> output_dims,
-    absl::Span<xla::DynExpr* const> output_exprs = {});
+absl::StatusOr<xla::XlaOp> BroadcastTo(xla::XlaOp input,
+                                       absl::Span<int64_t const> output_dims);
 
 // Forwards to xla::BroadcastOpsToSame.
 absl::Status BroadcastOpsToSame(xla::XlaOp* lhs, xla::XlaOp* rhs);

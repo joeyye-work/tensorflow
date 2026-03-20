@@ -3278,57 +3278,51 @@ absl::StatusOr<llvm::Value*> ElementalIrEmitter::EmitElementalConcatenate(
   }
 
   // We use bisection to select the input operand.
-  int64_t coffset = 0;
-  llvm::Value* current_offset = source_index.GetConstantWithIndexType(0);
+  int64_t current_offset = 0;
 
   // Offset for every operand.
-  std::vector<std::pair<llvm::Value*, const HloInstruction*>> cases;
+  std::vector<std::pair<int64_t, const HloInstruction*>> cases;
 
   cases.reserve(hlo->operand_count());
   for (const HloInstruction* operand : hlo->operands()) {
     cases.emplace_back(current_offset, operand);
-    llvm::Value* cdim = source_index.GetConstantWithIndexType(
-        operand->shape().dimensions(concat_dim));
-    xla::DynExpr* concat_expr = operand->shape().expressions(concat_dim);
-    if (concat_expr != nullptr && concat_expr->is_dynamic()) {
-      cdim = llvm_ir::EmitExpression(b_, concat_expr);
-    }
-    current_offset = b_->CreateAdd(current_offset, cdim, "current_offset");
-    coffset += operand->shape().dimensions(concat_dim);
+    current_offset += operand->shape().dimensions(concat_dim);
   }
-  CHECK_EQ(coffset, hlo->shape().dimensions(concat_dim));
+  CHECK_EQ(current_offset, hlo->shape().dimensions(concat_dim));
 
   std::function<llvm::BasicBlock*(
-      absl::Span<const std::pair<llvm::Value*, const HloInstruction*>> operands)>
+      absl::Span<const std::pair<int64_t, const HloInstruction*>> operands)>
       emit_tree =
-          [&](absl::Span<const std::pair<llvm::Value*, const HloInstruction*>>
+          [&](absl::Span<const std::pair<int64_t, const HloInstruction*>>
                   operands) {
             llvm::IRBuilder<>::InsertPointGuard guard(*b_);
             size_t mid = operands.size() / 2;
-            const std::pair<llvm::Value*, const HloInstruction*>& pivot =
+            const std::pair<int64_t, const HloInstruction*>& pivot =
                 operands[mid];
             llvm::BasicBlock* block = llvm_ir::CreateBasicBlock(
                 exit_block,
-                absl::StrCat("concatenate.pivot."), b_);
+                absl::StrCat("concatenate.pivot.", pivot.first, "."), b_);
             b_->SetInsertPoint(block);
 
             // If there's only one element we're done. The range is contiguous
             // so we can just jump to the block for it.
             if (operands.size() == 1) {
-              const std::pair<llvm::Value*, const HloInstruction*>& operand =
+              const std::pair<int64_t, const HloInstruction*>& operand =
                   operands.back();
               int64_t operand_id = to_unique_operand_id[operand.second];
 
               source_index_phis[operand_id]->addIncoming(
-                  operand.first,
+                  source_index.GetConstantWithIndexType(operand.first),
                   b_->GetInsertBlock());
               b_->CreateBr(emit_operand_blocks[operand_id]);
               return block;
             }
 
             // Take the middle element and recurse.
+            llvm::Constant* pivot_const = llvm::ConstantInt::get(
+                source_index[concat_dim]->getType(), pivot.first);
             llvm::Value* comp =
-                b_->CreateICmpULT(source_index[concat_dim], pivot.first);
+                b_->CreateICmpULT(source_index[concat_dim], pivot_const);
 
             llvm::BasicBlock* left_block = emit_tree(operands.subspan(0, mid));
             llvm::BasicBlock* right_block = emit_tree(operands.subspan(mid));
@@ -3622,16 +3616,11 @@ absl::StatusOr<llvm::Value*> ElementalIrEmitter::EmitElementalPad(
             "in_bounds");
     multi_index[i] =
         SDiv(multi_index[i], index_typed_const(pad_dim.interior_padding() + 1));
-
-    int64_t shape_dim = hlo->operand(0)->shape().dimensions(i);
-    llvm::Value* bound = index_typed_const(shape_dim);
-
-    xla::DynExpr* operand_expr = hlo->operand(0)->shape().expressions(i);
-    if (operand_expr != nullptr && operand_expr->is_dynamic()) {
-      bound = llvm_ir::EmitExpression(b_, operand_expr);
-    }
-
-    in_bounds = And(in_bounds, ICmpSLT(multi_index[i], bound), "in_bounds");
+    in_bounds =
+        And(in_bounds,
+            ICmpSLT(multi_index[i],
+                    index_typed_const(hlo->operand(0)->shape().dimensions(i))),
+            "in_bounds");
   }
 
   // if (in_bounds) {
@@ -3698,20 +3687,9 @@ absl::StatusOr<llvm::Value*> ElementalIrEmitter::EmitElementalDot(
     return llvm::ConstantInt::get(index_type, c);
   };
 
-  llvm::Value* contracted_bound = index_typed_const(contracted_dim_size);
-
-  if (!hlo->operand(0)
-           ->shape()
-           .expressions(lhs_contracting_dim)
-           ->is_constant()) {
-    llvm::Value* expr_value = llvm_ir::EmitExpression(
-        b_, hlo->operand(0)->shape().expressions(lhs_contracting_dim));
-    contracted_bound = expr_value;
-  }
-
   std::unique_ptr<llvm_ir::ForLoop> inner_loop = llvm_ir::ForLoop::EmitForLoop(
-      IrName(hlo, "inner"), index_typed_const(0), contracted_bound,
-      index_typed_const(1), b_);
+      IrName(hlo, "inner"), index_typed_const(0),
+      index_typed_const(contracted_dim_size), index_typed_const(1), b_);
 
   SetToFirstInsertPoint(inner_loop->GetPreheaderBasicBlock(), b_);
   PrimitiveType primitive_type = hlo->shape().element_type();
@@ -3905,17 +3883,9 @@ llvm_ir::ElementGenerator ElementalIrEmitter::MakeElementGenerator(
         const HloInstruction* operand = hlo->operand(0);
         std::vector<llvm::Value*> source_multi_index = target_index.multidim();
         for (int64_t dim : hlo->dimensions()) {
-          xla::DynExpr* dim_expr = hlo->shape().expressions(dim);
-          if (dim_expr != nullptr && dim_expr->is_dynamic()) {
-            llvm::Value* one = target_index.GetConstantWithIndexType(1);
-            llvm::Value* expr_value = llvm_ir::EmitExpression(b_, dim_expr);
-            source_multi_index[dim] =
-                Sub(Sub(expr_value, one), target_index[dim]);
-          } else {
-            source_multi_index[dim] = Sub(target_index.GetConstantWithIndexType(
-                                              hlo->shape().dimensions(dim) - 1),
-                                          target_index[dim]);
-          }
+          source_multi_index[dim] = Sub(target_index.GetConstantWithIndexType(
+                                            hlo->shape().dimensions(dim) - 1),
+                                        target_index[dim]);
         }
         llvm_ir::IrArray::Index source_index(
             source_multi_index, operand->shape(), target_index.GetType());
@@ -4266,21 +4236,11 @@ absl::StatusOr<llvm::Value*> ElementalIrEmitter::EmitElementalReduceWindow(
     // comparison is equivalent to the unsigned comparison
     // input_multi_index[i] < bound, as a negative value wraps to a large
     // positive value.
-
-    int64_t dim_bound = reduce_window->inputs()[0]->shape().dimensions(i);
-    llvm::Value* shape_bound = index_typed_const(dim_bound);
-
-    xla::DynExpr* window_expr =
-        reduce_window->inputs()[0]->shape().expressions(i);
-    if (window_expr != nullptr && window_expr->is_dynamic()) {
-      llvm::Value* expr_value = llvm_ir::EmitExpression(b_, window_expr);
-      shape_bound = expr_value;
-    }
-
     in_bounds =
         And(in_bounds,
             ICmpULT(input_multi_index[i],
-                    shape_bound));
+                    index_typed_const(
+                        reduce_window->inputs()[0]->shape().dimensions(i))));
   }
 
   llvm_ir::LlvmIfData if_data =

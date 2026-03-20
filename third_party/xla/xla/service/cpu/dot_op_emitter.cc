@@ -160,27 +160,6 @@ bool CanEmitTiledLlvmIrGemm(
   return true;
 }
 
-bool HasDynamicMatmulDims(const DotInfo& dot_info) {
-  const Shape& lhs_shape = dot_info.lhs_shape;
-  const Shape& rhs_shape = dot_info.rhs_shape;
-  const DotDimensionNumbers& dim_nums = dot_info.dim_nums;
-
-  DynExpr* m_expr = lhs_shape.dimensions().size() <= 1
-                        ? DynExpr::one
-                        : lhs_shape.expressions(
-                              1LL - dim_nums.lhs_contracting_dimensions(0));
-  DynExpr* k_expr =
-      lhs_shape.expressions(dim_nums.lhs_contracting_dimensions(0));
-  DynExpr* n_expr = rhs_shape.dimensions().size() <= 1
-                        ? DynExpr::one
-                        : rhs_shape.expressions(
-                              1LL - dim_nums.rhs_contracting_dimensions(0));
-
-  return (m_expr != nullptr && m_expr->is_dynamic()) ||
-         (k_expr != nullptr && k_expr->is_dynamic()) ||
-         (n_expr != nullptr && n_expr->is_dynamic());
-}
-
 // Returns dot implementation strategy for non-batch dot operations.
 DotImplementationStrategy GetNonBatchDotImplementationStrategy(
     const HloModuleConfig& config, const DotInfo& dot_info,
@@ -193,10 +172,6 @@ DotImplementationStrategy GetNonBatchDotImplementationStrategy(
   DCHECK(dot_info.dim_nums.lhs_batch_dimensions_size() == 0 &&
          dot_info.dim_nums.rhs_batch_dimensions_size() == 0)
       << "Dot operations must be non-batch";
-
-  if (HasDynamicMatmulDims(dot_info)) {
-    return DotImplementationStrategy::kEigen;
-  }
 
   // Any Matrix-Vector product of floating point or integral type, or
   // a transpose-dot fusion of the same can be lowered to a tiled LLVM
@@ -277,12 +252,6 @@ class DotOpEmitter {
 
     // The number of columns on the RHS.
     int64_t n;
-
-    DynExpr* m_expr;
-
-    DynExpr* k_expr;
-
-    DynExpr* n_expr;
 
     // True if the LHS matrix is column major.
     bool lhs_column_major;
@@ -889,20 +858,16 @@ absl::Status DotOpEmitter::EmitCallToRuntime() {
 
   if (!mat_mult_dims.lhs_column_major) {
     std::swap(mat_mult_dims.m, mat_mult_dims.n);
-    std::swap(mat_mult_dims.m_expr, mat_mult_dims.n_expr);
     std::swap(lhs, rhs);
     std::swap(transpose_lhs, transpose_rhs);
   }
 
-  llvm::Value* m_val = xla::llvm_ir::EmitExpression(b_, mat_mult_dims.m_expr);
-  llvm::Value* n_val = xla::llvm_ir::EmitExpression(b_, mat_mult_dims.n_expr);
-  llvm::Value* k_val = xla::llvm_ir::EmitExpression(b_, mat_mult_dims.k_expr);
-
-  b_->CreateCall(
-      matmul_func,
-      {executable_run_options_value_, target_array_.GetBasePointer(),
-       lhs->GetBasePointer(), rhs->GetBasePointer(), m_val, n_val, k_val,
-       b_->getInt32(transpose_lhs), b_->getInt32(transpose_rhs)});
+  b_->CreateCall(matmul_func,
+                 {executable_run_options_value_, target_array_.GetBasePointer(),
+                  lhs->GetBasePointer(), rhs->GetBasePointer(),
+                  b_->getInt64(mat_mult_dims.m), b_->getInt64(mat_mult_dims.n),
+                  b_->getInt64(mat_mult_dims.k), b_->getInt32(transpose_lhs),
+                  b_->getInt32(transpose_rhs)});
   return absl::OkStatus();
 }
 
@@ -977,28 +942,18 @@ absl::Status DotOpEmitter::EmitCallToBatchRuntime() {
 
   if (!mat_mult_dims.lhs_column_major) {
     std::swap(mat_mult_dims.m, mat_mult_dims.n);
-    std::swap(mat_mult_dims.m_expr, mat_mult_dims.n_expr);
     std::swap(lhs, rhs);
     std::swap(transpose_lhs, transpose_rhs);
   }
-
-  llvm::Value* m_val = xla::llvm_ir::EmitExpression(b_, mat_mult_dims.m_expr);
-  llvm::Value* n_val = xla::llvm_ir::EmitExpression(b_, mat_mult_dims.n_expr);
-  llvm::Value* k_val = xla::llvm_ir::EmitExpression(b_, mat_mult_dims.k_expr);
-  DynExpr* batch_size_expr = lhs_shape.expressions(0);
-  if (batch_size_expr == nullptr) {
-    batch_size_expr = DynExpr::_(lhs_shape.dimensions(0));
-  }
-  llvm::Value* batch_size_val =
-      xla::llvm_ir::EmitExpression(b_, batch_size_expr);
 
   VLOG(1) << "Batch dot emitted with runtime:" << fn_name;
 
   b_->CreateCall(
       matmul_func,
       {executable_run_options_value_, target_array_.GetBasePointer(),
-       lhs->GetBasePointer(), rhs->GetBasePointer(), m_val, n_val, k_val,
-       batch_size_val,
+       lhs->GetBasePointer(), rhs->GetBasePointer(),
+       b_->getInt64(mat_mult_dims.m), b_->getInt64(mat_mult_dims.n),
+       b_->getInt64(mat_mult_dims.k), b_->getInt64(lhs_shape.dimensions(0)),
        b_->getInt32(static_cast<uint32_t>(transpose_lhs)),
        b_->getInt32(static_cast<uint32_t>(transpose_rhs))});
   return absl::OkStatus();
@@ -1028,14 +983,6 @@ DotOpEmitter::MatMultDims DotOpEmitter::GetMatMultDims() const {
       /*n=*/rhs_shape.dimensions().size() <= 1
           ? 1LL
           : rhs_shape.dimensions(1LL - dim_nums.rhs_contracting_dimensions(0)),
-      /*m_expr=*/lhs_shape.dimensions().size() <= 1
-          ? DynExpr::one
-          : lhs_shape.expressions(1LL - dim_nums.lhs_contracting_dimensions(0)),
-      /*k_expr=*/
-      lhs_shape.expressions(dim_nums.lhs_contracting_dimensions(0)),
-      /*n_expr=*/rhs_shape.dimensions().size() <= 1
-          ? DynExpr::one
-          : rhs_shape.expressions(1LL - dim_nums.rhs_contracting_dimensions(0)),
       /*lhs_column_major=*/is_column_major(lhs_shape),
       /*lhs_canonical=*/lhs_shape.dimensions().size() <= 1 ||
           dim_nums.lhs_contracting_dimensions(0) == 1,
@@ -1067,14 +1014,6 @@ DotOpEmitter::MatMultDims DotOpEmitter::GetBatchMatMultDims() const {
       /*n=*/rhs_shape.dimensions().size() <= 1
           ? 1LL
           : rhs_shape.dimensions(2LL - dim_nums.rhs_contracting_dimensions(0)),
-      /*m_expr=*/lhs_shape.dimensions().size() <= 1
-          ? DynExpr::one
-          : lhs_shape.expressions(2LL - dim_nums.lhs_contracting_dimensions(0)),
-      /*k_expr=*/
-      lhs_shape.expressions(1LL + dim_nums.lhs_contracting_dimensions(0)),
-      /*n_expr=*/rhs_shape.dimensions().size() <= 1
-          ? DynExpr::one
-          : rhs_shape.expressions(2LL - dim_nums.rhs_contracting_dimensions(0)),
       /*lhs_column_major=*/is_column_major(lhs_shape),
       /*lhs_canonical=*/lhs_shape.dimensions().size() <= 1 ||
           dim_nums.lhs_contracting_dimensions(0) == 1,
@@ -1154,34 +1093,22 @@ absl::Status EmitNonBatchDotOperation(
 
 Shape DropFirstDim(const Shape& shape) {
   absl::Span<int64_t const> array_shape_dims(shape.dimensions());
-  absl::Span<DynExpr* const> array_shape_exprs(shape.expressions());
   array_shape_dims.remove_prefix(1);
-  array_shape_exprs.remove_prefix(1);
-  return ShapeUtil::MakeShapeWithDescendingLayout(
-      shape.element_type(), array_shape_dims, array_shape_exprs);
+  return ShapeUtil::MakeShapeWithDescendingLayout(shape.element_type(),
+                                                  array_shape_dims);
 }
 
 Shape CollapseFirstNDims(const Shape& shape, int64_t n) {
   absl::Span<int64_t const> input_shape_dims(shape.dimensions());
-  absl::Span<DynExpr* const> input_expressions(shape.expressions());
   int64_t prefix_dim =
       std::accumulate(input_shape_dims.begin(), input_shape_dims.begin() + n,
                       1ll, std::multiplies<int64_t>());
-
-  DynExpr* prefix_expression = std::accumulate(
-      input_expressions.begin(), input_expressions.begin() + n, DynExpr::one,
-      [](DynExpr* acc, DynExpr* v) { return (*acc) * (*v); });
-
   DimensionVector result_dims;
-  std::vector<DynExpr*> result_expressions;
   result_dims.push_back(prefix_dim);
-  result_expressions.push_back(prefix_expression->s());
   std::copy(input_shape_dims.begin() + n, input_shape_dims.end(),
             std::back_inserter(result_dims));
-  std::copy(input_expressions.begin() + n, input_expressions.end(),
-            std::back_inserter(result_expressions));
-  return ShapeUtil::MakeShapeWithDescendingLayout(
-      shape.element_type(), result_dims, result_expressions);
+  return ShapeUtil::MakeShapeWithDescendingLayout(shape.element_type(),
+                                                  result_dims);
 }
 
 llvm_ir::IrArray CollapseFirstNDims(llvm::IRBuilderBase* b,

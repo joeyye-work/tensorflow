@@ -49,16 +49,14 @@ void BuildLowerUpperBoundOp(XlaOpKernelContext* ctx, DataType out_dtype,
   // dimension of sorted_sequence.
   auto new_values_shape = values_shape;
   new_values_shape.InsertDim(/* d */ 2, /* size */ 1);
-  auto values_reshaped = xla::Reshape(values, new_values_shape.dim_sizes(),
-                                      new_values_shape.get_expressions());
+  auto values_reshaped = xla::Reshape(values, new_values_shape.dim_sizes());
 
   // Add a new penultimate dimension to sorted_inputs, to allow broadcasting of
   // sorted_sequence entries for each value.
   auto new_sorted_inputs_shape = sorted_inputs_shape;
   new_sorted_inputs_shape.InsertDim(/* d */ 1, /* size */ 1);
   auto sorted_inputs_reshaped =
-      xla::Reshape(sorted_inputs, new_sorted_inputs_shape.dim_sizes(),
-                   new_sorted_inputs_shape.get_expressions());
+      xla::Reshape(sorted_inputs, new_sorted_inputs_shape.dim_sizes());
 
   // We are relying on broadcasting to compare each value against each entry in
   // the associated sorted_inputs row.

@@ -469,7 +469,6 @@ cc_library(
         "layout_util.h",
         "primitive_util.h",
         "shape.h",
-        "shape_dynexpr.h",
         "shape_partition.h",
         "shape_util.h",
     ],

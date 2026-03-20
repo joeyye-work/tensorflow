@@ -165,11 +165,9 @@ class TensorArrayOp : public XlaOpKernel {
       CHECK(element_shape_.AsTensorShape(&shape));
       TensorShape ta_shape;
       ta_shape.AddDim(size);
-      ta_shape.AddExpression(xla::DynExpr::_(size));
       ta_shape.AppendShape(shape);
       xla::XlaOp zero = XlaHelpers::Zero(b, dtype_);
-      value = xla::Broadcast(zero, ta_shape.dim_sizes(),
-                             ta_shape.get_expressions());
+      value = xla::Broadcast(zero, ta_shape.dim_sizes());
     }
 
     XlaResource* var =
@@ -225,8 +223,7 @@ class TensorArrayWriteOp : public XlaOpKernel {
 
     TensorShape slice_shape = elem_shape;
     slice_shape.InsertDim(0, 1LL);
-    auto update = xla::Reshape(value, slice_shape.dim_sizes(),
-                               slice_shape.get_expressions());
+    auto update = xla::Reshape(value, slice_shape.dim_sizes());
 
     xla::XlaOp written;
     if (resource->tensor_array_multiple_writes_aggregate()) {
@@ -277,12 +274,9 @@ class TensorArrayReadOp : public XlaOpKernel {
     start_indices[0] = index;
 
     auto slice_shape = ta_shape.dim_sizes();
-    auto slice_exprs = ta_shape.get_expressions();
     slice_shape[0] = 1LL;
-    slice_exprs[0] = xla::DynExpr::_(1LL);
 
-    xla::XlaOp read =
-        xla::DynamicSlice(ta, start_indices, slice_shape, slice_exprs);
+    xla::XlaOp read = xla::DynamicSlice(ta, start_indices, slice_shape);
 
     // Remove the leading '1' dimension.
     std::vector<int64_t> value_shape(slice_shape.begin() + 1,
@@ -475,12 +469,9 @@ class TensorArrayConcatOp : public XlaOpKernel {
     xla::XlaOp ta = resource->value();
 
     auto ta_dims = ta_shape.dim_sizes();
-    auto ta_exprs = ta_shape.get_expressions();
     std::vector<int64_t> shape(ta_dims.begin() + 1, ta_dims.end());
-    std::vector<xla::DynExpr*> exprs(ta_exprs.begin() + 1, ta_exprs.end());
     shape[0] *= ta_shape.dim_size(0);
-    exprs[0] = *ta_exprs[0] * *ta_shape.get_expression(0);
-    ctx->SetOutput(0, xla::Reshape(ta, shape, exprs));
+    ctx->SetOutput(0, xla::Reshape(ta, shape));
 
     Tensor lengths(DT_INT64, {ta_dims[0]});
     auto lengths_vec = lengths.vec<int64_t>();
@@ -535,7 +526,6 @@ class TensorArraySplitOp : public XlaOpKernel {
 
     TensorShape ta_shape;
     ta_shape.AddDim(resource->max_array_size());
-    ta_shape.AddExpression(xla::DynExpr::_(resource->max_array_size()));
     ta_shape.AppendShape(elem_shape);
 
     OP_REQUIRES(ctx, lengths.size() == resource->max_array_size(),
@@ -551,8 +541,7 @@ class TensorArraySplitOp : public XlaOpKernel {
                                         value_shape.DebugString(), " vs. ",
                                         ta_shape.DebugString()));
 
-    const xla::XlaOp reshape =
-        xla::Reshape(value, ta_shape.dim_sizes(), ta_shape.get_expressions());
+    const xla::XlaOp reshape = xla::Reshape(value, ta_shape.dim_sizes());
     if (dtype_ == DT_BOOL) {
       ta = xla::Or(ta, reshape);
     } else {

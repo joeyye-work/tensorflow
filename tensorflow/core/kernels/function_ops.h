@@ -38,7 +38,6 @@ class ArgOp : public OpKernel {
  private:
   int index_;
   DataType dtype_;
-  int dynamic_dim_;
 
   ArgOp(const ArgOp&) = delete;
   void operator=(const ArgOp&) = delete;
@@ -55,7 +54,6 @@ class RetvalOp : public OpKernel {
  private:
   int index_;
   DataType dtype_;
-  int dynamic_dim_;
 
   RetvalOp(const RetvalOp&) = delete;
   void operator=(const RetvalOp&) = delete;

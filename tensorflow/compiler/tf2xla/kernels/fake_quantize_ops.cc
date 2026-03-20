@@ -127,8 +127,7 @@ class FakeQuantWithMinMaxArgsGradOp : public XlaOpKernel {
     xla::XlaOp between_nudged_min_max = xla::And(
         xla::Le(nudged_input_min, input), xla::Le(input, nudged_input_max));
     xla::XlaOp zeroes = xla::Broadcast(XlaHelpers::Zero(b, data_type),
-                                       gradient_shape.dim_sizes(),
-                                       gradient_shape.get_expressions());
+                                       gradient_shape.dim_sizes());
     xla::XlaOp output = xla::Select(between_nudged_min_max, gradient, zeroes);
     ctx->SetOutput(0, output);
   }
@@ -214,8 +213,7 @@ class FakeQuantWithMinMaxVarsGradOp : public XlaOpKernel {
     xla::XlaOp between_nudged_min_max = xla::And(
         xla::Le(nudged_input_min, input), xla::Le(input, nudged_input_max));
     xla::XlaOp zero = XlaHelpers::Zero(b, data_type);
-    xla::XlaOp zeroes = xla::Broadcast(zero, gradient_shape.dim_sizes(),
-                                       gradient_shape.get_expressions());
+    xla::XlaOp zeroes = xla::Broadcast(zero, gradient_shape.dim_sizes());
     xla::XlaOp output0 = xla::Select(between_nudged_min_max, gradient, zeroes);
     ctx->SetOutput(0, output0);
 
@@ -270,12 +268,9 @@ class FakeQuantWithMinMaxVarsPerChannelOp : public XlaOpKernel {
 
     xla::Shape input_shape = b->GetShape(input).value();
     absl::Span<const int64_t> input_dimensions = input_shape.dimensions();
-    absl::Span<xla::DynExpr* const> input_expressions =
-        input_shape.expressions();
     auto convert_to_input_shape = [&](const xla::XlaOp op) {
       return xla::BroadcastInDim(op, input_dimensions,
-                                 {input_shape.dimensions_size() - 1},
-                                 input_expressions);
+                                 {input_shape.dimensions_size() - 1});
     };
     input_min = convert_to_input_shape(input_min);
     input_max = convert_to_input_shape(input_max);
@@ -328,8 +323,6 @@ class FakeQuantWithMinMaxVarsPerChannelGradOp : public XlaOpKernel {
     xla::XlaBuilder* b = ctx->builder();
     xla::Shape input_shape = b->GetShape(input).value();
     absl::Span<const int64_t> input_dimensions = input_shape.dimensions();
-    absl::Span<xla::DynExpr* const> input_expressions =
-        input_shape.expressions();
 
     std::vector<int64_t> reduce_axes;
     for (int64_t i = 0; i + 1 < input_shape.dimensions_size(); ++i) {
@@ -338,8 +331,7 @@ class FakeQuantWithMinMaxVarsPerChannelGradOp : public XlaOpKernel {
 
     auto convert_to_input_shape = [&](const xla::XlaOp op) {
       return xla::BroadcastInDim(op, input_dimensions,
-                                 {input_shape.dimensions_size() - 1},
-                                 input_expressions);
+                                 {input_shape.dimensions_size() - 1});
     };
     input_min = convert_to_input_shape(input_min);
     input_max = convert_to_input_shape(input_max);
@@ -351,8 +343,7 @@ class FakeQuantWithMinMaxVarsPerChannelGradOp : public XlaOpKernel {
     xla::XlaOp between_nudged_min_max = xla::And(
         xla::Le(nudged_input_min, input), xla::Le(input, nudged_input_max));
     xla::XlaOp zero = XlaHelpers::Zero(b, data_type);
-    xla::XlaOp zeroes = xla::Broadcast(zero, gradient_shape.dim_sizes(),
-                                       gradient_shape.get_expressions());
+    xla::XlaOp zeroes = xla::Broadcast(zero, gradient_shape.dim_sizes());
     xla::XlaOp output0 = xla::Select(between_nudged_min_max, gradient, zeroes);
     ctx->SetOutput(0, output0);
 

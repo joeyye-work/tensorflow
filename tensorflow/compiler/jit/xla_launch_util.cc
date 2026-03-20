@@ -47,7 +47,6 @@ limitations under the License.
 #include "tensorflow/core/common_runtime/gpu/gpu_serving_device_selector.h"
 #include "tensorflow/core/common_runtime/gpu_device_context.h"
 #include "tensorflow/core/framework/allocator.h"
-#include "tensorflow/core/framework/batch_size_resource.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/resource_mgr.h"
@@ -362,8 +361,7 @@ absl::Status XlaComputationLaunchContext::PopulateOutputs(
     ScopedShapedBuffer output, int missing_ctx_input_prefix,
     absl::Span<VariableInfo> variable_infos,
     const xla::HloInputOutputAliasConfig& input_output_alias,
-    const std::map<int, const Tensor*>& resource_vars,
-    const xla::ExecutableRunOptions* run_options) {
+    const std::map<int, const Tensor*>& resource_vars) {
   se::Stream* stream =
       ctx->op_device_context() ? ctx->op_device_context()->stream() : nullptr;
   Allocator* allocator = ctx->device()->GetAllocator({});
@@ -432,50 +430,8 @@ absl::Status XlaComputationLaunchContext::PopulateOutputs(
     }
   } else {
     for (int i = 0; i < ctx->num_outputs(); ++i) {
-      xla::Shape output_host_shape = output.on_host_shape();
-      const xla::Shape& subshape =
-          xla::ShapeUtil::GetSubshape(output_host_shape, {i});
-      VLOG(2) << "PopulateOutputs: subshape[" << i << "]: "<< subshape;
-      TensorShape shape;
-      TF_RETURN_IF_ERROR(XLAShapeToTensorShape(subshape, &shape));
-      bool has_dynamic = false;
-
-      for (int dim = 0; dim < subshape.expressions().size(); ++dim) {
-        auto expr = subshape.expressions(dim);
-        if (expr != nullptr && expr->is_dynamic()) {
-          has_dynamic = true;
-          VLOG(1) << "Current expression is " << expr;
-          if (run_options) {
-            xla::DynExpr* batch_size = xla::DynExpr::_(run_options->batch_size());
-            xla::DynExpr* subst_expr = expr->substitute(1, batch_size)->s();
-            shape.set_dim(dim, subst_expr->get_val());
-          } else {
-            // TODO: Fallback to BatchSizeResource for now. Remove it later.
-            VLOG(1) << "Warning: Didn't find run_options";
-            BatchSizeResource* bsr = nullptr;
-            ScopedStepContainer* step_container = ctx->step_container();
-            TF_RETURN_IF_ERROR(step_container->Lookup<BatchSizeResource>(
-                          ctx->resource_manager(), BatchSizeResourceName, &bsr));
-            xla::DynExpr* batch_size = xla::DynExpr::_(bsr->GetBatchSize());
-            // Just substitute Var(1) for now.
-            xla::DynExpr* subst_expr = expr->substitute(1, batch_size)->s();
-            shape.set_dim(dim, subst_expr->get_val());
-            bsr->Unref();
-          }
-        }
-      }
-      if (has_dynamic) {
-        output_tensor_shapes.push_back(shape);
-      }
-      else {
-        output_tensor_shapes.push_back(compilation_result->outputs[i].shape);
-      }
+      output_tensor_shapes.push_back(compilation_result->outputs[i].shape);
     }
-  }
-
-  VLOG(2) << "output_tensor_shapes:";
-  for (auto s:output_tensor_shapes) {
-    VLOG(2) << s;
   }
 
   // Copy XLA results to the OpOutputList.

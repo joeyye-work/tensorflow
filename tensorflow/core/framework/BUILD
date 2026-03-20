@@ -62,7 +62,6 @@ package(
 exports_files(
     srcs = [
         "allocator_registry.h",
-        "batch_size_resource.h",
         "collective.h",
         "control_flow.h",
         "dataset.h",
@@ -196,7 +195,6 @@ filegroup(
         "allocator.h",
         "allocator_registry.h",
         "attr_value_util.h",
-        "batch_size_resource.h",
         "bfloat16.h",
         "bounds_check.h",
         "cancellation.h",
@@ -342,8 +340,6 @@ filegroup(
         "tensor_key.h",
         "tensor_shape.cc",
         "tensor_shape.h",
-        "tensor_shape_expr.cc",
-        "tensor_shape_expr.h",
         "tensor_types.h",
         "tensor_util.h",
         "tracking_allocator.h",
@@ -722,23 +718,6 @@ cc_library(
         "//tensorflow/core/platform:statusor",
         "//tensorflow/core/util:overflow",
         "@eigen_archive//:eigen3",
-        "@local_xla//xla:shape_util",
-    ],
-    alwayslink = 1,
-)
-
-cc_library(
-    name = "tensor_shape_expr",
-    srcs = ["tensor_shape_expr.cc"],
-    hdrs = ["tensor_shape_expr.h"],
-    visibility = [
-        "//tensorflow/core:__pkg__",
-        "//tensorflow/core/grappler:__subpackages__",
-        "//tensorflow/core/runtime_fallback:__subpackages__",
-        "//tensorflow/core/tfrt/utils:__subpackages__",
-    ],
-    deps = [
-        ":tensor_shape_proto_cc",
     ],
     alwayslink = 1,
 )
@@ -942,7 +921,6 @@ cc_library(
         ":node_def_util",
         ":op_def_proto_cc",
         ":tensor_shape",
-        ":tensor_shape_expr",
         ":tensor_shape_proto_cc",
         "//tensorflow/core/lib/core:errors",
         "//tensorflow/core/lib/core:status",

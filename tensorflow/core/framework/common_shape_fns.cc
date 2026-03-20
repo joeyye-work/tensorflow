@@ -2369,13 +2369,7 @@ absl::Status BroadcastBinaryOpOutputShapeFnHelper(InferenceContext* c,
       } else if (dim_y.SameHandle(dim_x)) {
         dims.push_back(dim_x);
       } else if (!c->ValueKnown(dim_x) && !c->ValueKnown(dim_y)) {
-        DimensionHandle merged;
-        absl::Status s = c->Merge(dim_x, dim_y, &merged);
-        if (s.ok()) {
-          dims.push_back(merged);
-        } else {
-          dims.push_back(c->UnknownDim());
-        }
+        dims.push_back(c->UnknownDim());
       } else {
         if (!incompatible_shape_error) {
           *out = c->UnknownShape();

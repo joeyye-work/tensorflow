@@ -69,8 +69,7 @@ class UnpackOp : public XlaOpKernel {
       limit_indices[axis] = i + 1;
       auto slice = xla::Slice(input, start_indices, limit_indices, strides);
       // Reshape to drop the 'axis' dimension.
-      auto result = xla::Reshape(slice, output_shape.dim_sizes(),
-                                 output_shape.get_expressions());
+      auto result = xla::Reshape(slice, output_shape.dim_sizes());
       ctx->SetOutput(i, result);
     }
   }

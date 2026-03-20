@@ -37,7 +37,6 @@ limitations under the License.
 #include "xla/service/llvm_ir/llvm_util.h"
 #include "xla/shape.h"
 #include "xla/tsl/platform/logging.h"
-#include "llvm/include/llvm/Support/Debug.h"
 
 namespace xla {
 namespace llvm_ir {
@@ -186,32 +185,24 @@ llvm::BasicBlock* ForLoop::CreateLoopBB(absl::string_view name,
   return CreateBasicBlock(insert_before_bb_, GetQualifiedName(name), b);
 }
 
-std::unique_ptr<ForLoop> ForLoopNest::AddLoop(
-    absl::string_view suffix, llvm::Value* start_index, llvm::Value* end_index,
-    UnrollMode unroll_mode, bool prevent_vectorization,
-    DynExpr* expression) {
+std::unique_ptr<ForLoop> ForLoopNest::AddLoop(absl::string_view suffix,
+                                              llvm::Value* start_index,
+                                              llvm::Value* end_index,
+                                              UnrollMode unroll_mode,
+                                              bool prevent_vectorization) {
   return AddLoop(suffix, start_index, end_index, GetConstantWithIndexType(1),
-                 unroll_mode, prevent_vectorization, expression);
+                 unroll_mode, prevent_vectorization);
 }
 
 std::unique_ptr<ForLoop> ForLoopNest::AddLoop(
     absl::string_view suffix, llvm::Value* start_index, llvm::Value* end_index,
-    llvm::Value* stride, UnrollMode unroll_mode, bool prevent_vectorization,
-    DynExpr* expression) {
+    llvm::Value* stride, UnrollMode unroll_mode, bool prevent_vectorization) {
   if (inner_loop_body_bb_ != nullptr) {
     // Create this loop inside the previous one.
     b_->SetInsertPoint(&*inner_loop_body_bb_->getFirstInsertionPt());
   }
-  llvm::Value* actual_end = end_index;
-  if (expression && expression->is_dynamic()) {
-    // Get batch dim and compare with end_index to use minimum value
-    llvm::Value* expr_value =
-        llvm_ir::EmitExpression(b_, expression);
-    actual_end = b_->CreateSelect(b_->CreateICmpULT(end_index, expr_value),
-                                  end_index, expr_value, "loop_end_min");
-  }
   std::unique_ptr<ForLoop> loop(new ForLoop(
-      /*prefix=*/name_, suffix, start_index, actual_end, stride, unroll_mode,
+      /*prefix=*/name_, suffix, start_index, end_index, stride, unroll_mode,
       prevent_vectorization));
   loop->Emit(b_);
 
@@ -228,31 +219,25 @@ std::unique_ptr<ForLoop> ForLoopNest::AddLoop(
   return loop;
 }
 
-std::unique_ptr<ForLoop> ForLoopNest::AddLoop(
-    int64_t start_index, int64_t end_index, absl::string_view suffix,
-    UnrollMode unroll_mode, bool prevent_vectorization,
-    DynExpr* expression) {
+std::unique_ptr<ForLoop> ForLoopNest::AddLoop(int64_t start_index,
+                                              int64_t end_index,
+                                              absl::string_view suffix,
+                                              UnrollMode unroll_mode,
+                                              bool prevent_vectorization) {
   CHECK_LE(start_index, end_index);
-
-  llvm::Value* end = (expression && expression->is_dynamic())
-                         ? EmitExpression(b_, expression)
-                         : GetConstantWithIndexType(end_index);
-  return AddLoop(suffix, GetConstantWithIndexType(start_index), end,
-                 unroll_mode, prevent_vectorization);
+  return AddLoop(suffix, GetConstantWithIndexType(start_index),
+                 GetConstantWithIndexType(end_index), unroll_mode,
+                 prevent_vectorization);
 }
 
 std::unique_ptr<ForLoop> ForLoopNest::AddLoop(int64_t start_index,
                                               int64_t end_index, int64_t stride,
                                               absl::string_view suffix,
                                               UnrollMode unroll_mode,
-                                              bool prevent_vectorization,
-                                              DynExpr* expression) {
+                                              bool prevent_vectorization) {
   CHECK_LE(start_index, end_index);
-
-  llvm::Value* end = (expression && expression->is_dynamic())
-                         ? EmitExpression(b_, expression)
-                         : GetConstantWithIndexType(end_index);
-  return AddLoop(suffix, GetConstantWithIndexType(start_index), end,
+  return AddLoop(suffix, GetConstantWithIndexType(start_index),
+                 GetConstantWithIndexType(end_index),
                  GetConstantWithIndexType(stride), unroll_mode,
                  prevent_vectorization);
 }
@@ -274,9 +259,7 @@ std::vector<llvm::Value*> ForLoopNest::AddLoopsForShapeOnDimensions(
         /*start_index=*/0,
         /*end_index=*/shape.dimensions(dimension),
         /*suffix=*/
-        llvm_ir::IrName(suffix, absl::StrCat(dimension)),
-        /*unroll_mode=*/llvm_ir::UnrollMode::kDefaultUnroll,
-        /*prevent_vectorization=*/false, shape.expressions(dimension));
+        llvm_ir::IrName(suffix, absl::StrCat(dimension)));
     multi_index[dimension] = loop->GetIndVarValue();
   }
   return multi_index;

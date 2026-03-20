@@ -20,7 +20,6 @@ limitations under the License.
 #include "absl/memory/memory.h"
 #include "tensorflow/core/framework/full_type.pb.h"
 #include "tensorflow/core/framework/node_def_util.h"
-#include "tensorflow/core/framework/tensor_shape_expr.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/platform/macros.h"
@@ -117,16 +116,13 @@ class InferenceContext;
 class Dimension {
  private:
   Dimension();
-  Dimension(int64_t value, int64_t dynamic_ratio = 0, DimExpr* expr = nullptr);
+  Dimension(int64_t value);
   ~Dimension() {}
 
   const int64_t value_;
-  const int64_t dynamic_ratio_;
-  DimExpr* expr_;
 
   friend class InferenceContext;
   friend class ShapeManager;
-  friend class ::tensorflow::grappler::SymbolicShapeManager;
   Dimension(const Dimension&) = delete;
   void operator=(const Dimension&) = delete;
 };
@@ -443,9 +439,6 @@ class InferenceContext {
   static inline int64_t Value(DimensionOrConstant d) {
     return d.dim.IsSet() ? d.dim->value_ : d.val;
   }
-  static inline int64_t DynamicRatio(DimensionOrConstant d) {
-    return d.dim->dynamic_ratio_ ;
-  }
   static inline bool ValueKnown(DimensionOrConstant d) {
     return Value(d) != kUnknownDim;
   }
@@ -579,25 +572,11 @@ class InferenceContext {
 
   // Returns a new dimension of the given size.  The returned value is owned by
   // this context.
-  inline DimensionHandle MakeDim(DimensionOrConstant d, int64_t dynamic_ratio = 0) {
-    return shape_manager_.MakeDim(d, dynamic_ratio);
+  inline DimensionHandle MakeDim(DimensionOrConstant d) {
+    return shape_manager_.MakeDim(d);
   }
 
   inline DimensionHandle UnknownDim() { return MakeDim(kUnknownDim); }
-
-  // Create a new unknown dimension (size = -1) tagged with a DimExpr.
-  // The expression is owned by this context's ShapeManager.
-  DimensionHandle UnknownDimWithExpr(std::unique_ptr<DimExpr> expr);
-  // Return the expression pointer for a dimension, or nullptr if none.
-  DimExpr* GetDimExpr(DimensionHandle d) const;
-  // Creates a constant DimExpr node for the given value.
-  // The expression is owned by this context's ShapeManager.
-  DimExpr* MakeConstExpr(int64_t v);
-  // Returns the Expr representation for the given dimension:
-  // - If dim has an expr, returns it
-  // - If dim is known, returns a new Const expr
-  // - If dim is unknown with no expr, returns nullptr
-  DimExpr* ExprForDim(DimensionHandle d);
 
   // Returns in <val> a scalar value from an input tensor <t>.  The input tensor
   // must be a 0-dimensional int32 or int64 tensor.  Caller must ensure that the
@@ -764,6 +743,8 @@ class InferenceContext {
 
   // Adds new outputs; useful when mutating the graph.
   absl::Status ExpandOutputs(int new_output_size);
+
+ private:
   // Creates and stores shapes for use in InferenceContext.
   class ShapeManager {
    public:
@@ -779,31 +760,21 @@ class InferenceContext {
 
     // Returns a new dimension of the given size.  The returned value
     // is owned by this class.
-    inline DimensionHandle MakeDim(DimensionOrConstant d, int64_t dynamic_ratio = 0,  DimExpr* expr = nullptr) {
+    inline DimensionHandle MakeDim(DimensionOrConstant d) {
       if (d.dim.IsSet()) {
         return d.dim;
       } else {
-        all_dims_.push_back(new Dimension(d.val, dynamic_ratio, expr));
+        all_dims_.push_back(new Dimension(d.val));
         return all_dims_.back();
       }
-    }
-    // Takes ownership of an expression and returns a raw pointer to it.
-    DimExpr* OwnExpr(std::unique_ptr<DimExpr> expr) {
-      if (!expr) return nullptr;
-      DimExpr* ptr = expr.get();
-      all_exprs_.push_back(std::move(expr));
-      return ptr;
     }
 
    private:
     std::vector<Shape*> all_shapes_;    // values are owned.
     std::vector<Dimension*> all_dims_;  // values are owned.
-    std::vector<std::unique_ptr<DimExpr>> all_exprs_;   // expressions are owned.
   };
- private:
 
   friend class ::tensorflow::grappler::GraphProperties;
-  friend class ::tensorflow::grappler::SymbolicShapeManager;
 
   friend class ShapeInferenceTest;      // For testing Relax functions.
   friend class ShapeInferenceTestutil;  // For testing shapes.
@@ -917,8 +888,8 @@ class InferenceContext {
 // -----------------------------------------------------------------------------
 // Template and inline method implementations, please ignore
 
-inline Dimension::Dimension() : value_(InferenceContext::kUnknownDim), dynamic_ratio_(0), expr_(nullptr) {}
-inline Dimension::Dimension(int64_t value, int64_t dynamic_ratio, DimExpr* expr) : value_(value), dynamic_ratio_(dynamic_ratio), expr_(expr) {
+inline Dimension::Dimension() : value_(InferenceContext::kUnknownDim) {}
+inline Dimension::Dimension(int64_t value) : value_(value) {
   DCHECK(value >= 0 || value == InferenceContext::kUnknownDim)
       << "Dimension must be non-negative or equal to "
          "InferenceContext::kUnknownDim but got "

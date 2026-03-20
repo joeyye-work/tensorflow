@@ -173,11 +173,8 @@ class QuantizeAndDequantizeOp : public XlaOpKernel {
     if (!xla::ShapeUtil::IsScalar(axis_shape)) {
       xla::Shape input_shape = b->GetShape(input).value();
       absl::Span<const int64_t> input_dimensions = input_shape.dimensions();
-      absl::Span<xla::DynExpr* const> input_expressions =
-          input_shape.expressions();
       auto convert_to_input_shape = [&](const xla::XlaOp op) {
-        return xla::BroadcastInDim(op, input_dimensions, {axis_},
-                                   input_expressions);
+        return xla::BroadcastInDim(op, input_dimensions, {axis_});
       };
       min_range = convert_to_input_shape(min_range);
       max_range = convert_to_input_shape(max_range);

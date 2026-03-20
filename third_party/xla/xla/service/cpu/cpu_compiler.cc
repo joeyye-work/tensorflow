@@ -152,8 +152,6 @@ limitations under the License.
 #include "xla/map_util.h"
 #include "xla/mlir_hlo/transforms/passes.h"
 #include "xla/service/all_reduce_promotion.h"
-#include "xla/service/outer_dimension_propagation.h"
-#include "xla/service/get_outer_batch_value_simplifier.h"
 #include "xla/service/all_to_all_decomposer.h"
 #include "xla/service/batched_gather_scatter_normalizer.h"
 #include "xla/service/batchnorm_expander.h"
@@ -477,7 +475,7 @@ std::unique_ptr<HloPassFix<HloPassPipeline>> CreateSimplificationPipeline(
   }
 
   // Needs to happen after algebraic simplifier.
-  // pipeline->AddPass<TreeReductionRewriter>();
+  pipeline->AddPass<TreeReductionRewriter>();
 
   // BatchNormExpander can create zero-sized ops, so zero-sized HLO
   // elimination has to come after that pass.
@@ -929,8 +927,6 @@ absl::Status CpuCompiler::RunHloPassesAfterLayoutAssn(
     pipeline.AddPass<SmallWhileLoopHoistingPass>(byte_threshold);
   }
 
-  // pipeline.AddPass<OuterDimensionPropagationPass>();
-  // pipeline.AddPass<GetOuterBatchValueSimplifier>();
   pipeline.AddPass<HloDCE>();
   return pipeline.Run(module).status();
 }

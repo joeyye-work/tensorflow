@@ -116,7 +116,6 @@ struct XlaArgument {
 
   // Returns the dimension sizes for either TensorShape or xla::Shape.
   std::vector<int64_t> DimensionSizes() const;
-  std::vector<xla::DynExpr*> DimensionExpressions() const;
   absl::InlinedVector<int64_t, 4> DimensionSizesAsInlinedVector() const;
 
   // Returns the human-readable string for either TensorShape or xla::Shape.

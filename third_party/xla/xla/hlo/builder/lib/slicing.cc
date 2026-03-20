@@ -168,16 +168,13 @@ XlaOp TorchGather(XlaOp input, XlaOp index, int64_t dim, bool sparse) {
       std::vector<int64_t> index_broadcast_dims;
       std::vector<int64_t> input_broadcast_dims;
       std::vector<int64_t> sizes;
-      std::vector<DynExpr*> expressions;
       sizes.reserve(index_shape.dimensions().size());
-      expressions.reserve(index_shape.expressions().size());
       for (int64_t i = 0; i < index_shape.dimensions().size(); ++i) {
         if (i < dim) {
           input_broadcast_dims.push_back(i);
           index_broadcast_dims.push_back(i);
         } else if (i == dim) {
           sizes.push_back(input_shape.dimensions(i));
-          expressions.push_back(input_shape.expressions(i));
           input_broadcast_dims.push_back(i);
           index_broadcast_dims.push_back(i + 1);
         } else {
@@ -185,18 +182,15 @@ XlaOp TorchGather(XlaOp input, XlaOp index, int64_t dim, bool sparse) {
           index_broadcast_dims.push_back(i + 1);
         }
         sizes.push_back(index_shape.dimensions(i));
-        expressions.push_back(index_shape.expressions(i));
       }
-      auto mask =
-          Eq(BroadcastInDim(index, sizes, index_broadcast_dims, expressions),
-             Iota(builder,
-                  ShapeUtil::MakeShape(index_shape.element_type(), sizes,
-                                       expressions),
-                  dim));
+      auto mask = Eq(
+          BroadcastInDim(index, sizes, index_broadcast_dims),
+          Iota(builder, ShapeUtil::MakeShape(index_shape.element_type(), sizes),
+               dim));
       auto masked_input = Select(
-          mask, BroadcastInDim(input, sizes, input_broadcast_dims, expressions),
-          Zeros(builder, ShapeUtil::MakeShape(input_shape.element_type(), sizes,
-                                              expressions)));
+          mask, BroadcastInDim(input, sizes, input_broadcast_dims),
+          Zeros(builder,
+                ShapeUtil::MakeShape(input_shape.element_type(), sizes)));
       return Reduce(masked_input, Zero(builder, input_shape.element_type()),
                     CreateScalarIdentityWithZeroComputation(
                         input_shape.element_type(), builder),
@@ -209,8 +203,7 @@ XlaOp TorchGather(XlaOp input, XlaOp index, int64_t dim, bool sparse) {
     to_concat.reserve(input_shape.dimensions().size());
     for (int64_t i = 0; i < input_shape.dimensions().size(); ++i) {
       if (i == dim) {
-        to_concat.push_back(Reshape(index, index_shape.dimensions(),
-                                    index_shape.expressions()));
+        to_concat.push_back(Reshape(index, index_shape.dimensions()));
       } else {
         to_concat.push_back(Iota(builder, index_shape, i));
       }
@@ -236,33 +229,27 @@ XlaOp TorchScatterDense(XlaOp input, XlaOp index, XlaOp src, int64_t dim,
     TF_ASSIGN_OR_RETURN(Shape input_shape, builder->GetShape(input));
     std::vector<int64_t> index_broadcast_dims;
     std::vector<int64_t> sizes;
-    std::vector<DynExpr*> expressions;
     const auto rank = index_shape.dimensions().size();
     sizes.reserve(rank + 1);
-    expressions.reserve(rank + 1);
     for (int64_t i = 0; i < index_shape.dimensions().size(); ++i) {
       if (i < dim) {
         index_broadcast_dims.push_back(i);
       } else {
         if (i == dim) {
           sizes.push_back(input_shape.dimensions(i));
-          expressions.push_back(input_shape.expressions(i));
         }
         index_broadcast_dims.push_back(i + 1);
       }
       sizes.push_back(index_shape.dimensions(i));
-      expressions.push_back(index_shape.expressions(i));
     }
     auto mask =
-        Eq(BroadcastInDim(index, sizes, index_broadcast_dims, expressions),
+        Eq(BroadcastInDim(index, sizes, index_broadcast_dims),
            Iota(builder,
-                ShapeUtil::MakeShape(index_shape.element_type(), sizes,
-                                     expressions),
-                dim));
-    auto masked_src = Select(
-        mask, BroadcastInDim(src, sizes, index_broadcast_dims, expressions),
-        Zeros(builder, ShapeUtil::MakeShape(input_shape.element_type(), sizes,
-                                            expressions)));
+                ShapeUtil::MakeShape(index_shape.element_type(), sizes), dim));
+    auto masked_src =
+        Select(mask, BroadcastInDim(src, sizes, index_broadcast_dims),
+               Zeros(builder,
+                     ShapeUtil::MakeShape(input_shape.element_type(), sizes)));
 
     return combiner(
         input,
@@ -300,8 +287,7 @@ XlaOp TorchIndexSelect(XlaOp input, XlaOp index, int64_t dim,
       for (int64_t batch_dim = 0; batch_dim < batch_dims; ++batch_dim) {
         to_concat.push_back(Iota(builder, iota_shape, batch_dim));
       }
-      to_concat.push_back(
-          Reshape(index, index_shape.dimensions(), index_shape.expressions()));
+      to_concat.push_back(Reshape(index, index_shape.dimensions()));
       index = ConcatInDim(builder, to_concat, gather_dnums.index_vector_dim());
     }
     for (int64_t i = 0; i < input_shape.dimensions().size(); ++i) {

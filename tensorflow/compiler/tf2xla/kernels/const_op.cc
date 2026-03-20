@@ -123,8 +123,7 @@ class ConstOp : public XlaOpKernel {
     if (shape.num_elements() > 1) {
       xla::XlaOp value = GetScalarConst(proto_, b);
       if (value.valid()) {
-        ctx->SetOutput(0, xla::Broadcast(value, shape.dim_sizes(),
-                                         shape.get_expressions()));
+        ctx->SetOutput(0, xla::Broadcast(value, shape.dim_sizes()));
         return;
       }
     }

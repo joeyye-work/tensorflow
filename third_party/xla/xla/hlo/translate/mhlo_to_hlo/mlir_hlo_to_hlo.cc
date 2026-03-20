@@ -2673,8 +2673,6 @@ LogicalResult ExportXlaOp(DynamicReshapeOp op, OpLoweringContext ctx) {
   SmallVector<xla::XlaOp> dimSizes;
   SmallVector<int64_t> newSizeBounds;
   std::vector<bool> dimsAreDynamic;
-  std::vector<xla::DynExpr*> dimExpressions;
-
   for (auto i = 0; i < resultType.getRank(); ++i) {
     auto runtimeSizeX1 = xla::Slice(outputShape, {i}, {i + 1}, {1});
     dimSizes.push_back(xla::Reshape(runtimeSizeX1, {}));
@@ -2685,10 +2683,9 @@ LogicalResult ExportXlaOp(DynamicReshapeOp op, OpLoweringContext ctx) {
       return op->emitOpError() << "unbounded dynamism is not supported";
     newSizeBounds.push_back(hlo::isStaticDimSize(dimSize) ? dimSize : dimBound);
     dimsAreDynamic.push_back(!hlo::isStaticDimSize(dimSize));
-    dimExpressions.push_back(xla::DynExpr::_(-40)); // Don't know.
   }
-  value_map[op] = xla::DynamicReshape(operand, dimSizes, newSizeBounds,
-                                      dimsAreDynamic, dimExpressions);
+  value_map[op] =
+      xla::DynamicReshape(operand, dimSizes, newSizeBounds, dimsAreDynamic);
   return success();
 }
 
@@ -2699,8 +2696,7 @@ LogicalResult ExportXlaOp(ReshapeOp op, OpLoweringContext ctx) {
     return failure();
 
   value_map[op] =
-      xla::Reshape(operand, xla::TypeToShape(op.getType()).dimensions(),
-                   xla::TypeToShape(op.getType()).expressions());
+      xla::Reshape(operand, xla::TypeToShape(op.getType()).dimensions());
   return success();
 }
 
@@ -3008,7 +3004,6 @@ LogicalResult ExportXlaOp(DynamicReshapeOp op, OpLoweringContext ctx) {
   SmallVector<xla::XlaOp> dimSizes;
   SmallVector<int64_t> newSizeBounds;
   std::vector<bool> dimsAreDynamic;
-  std::vector<xla::DynExpr*> dimExpressions;
   for (auto i = 0; i < resultType.getRank(); ++i) {
     auto runtimeSizeX1 = xla::Slice(outputShape, {i}, {i + 1}, {1});
     dimSizes.push_back(xla::Reshape(runtimeSizeX1, {}));
@@ -3019,11 +3014,9 @@ LogicalResult ExportXlaOp(DynamicReshapeOp op, OpLoweringContext ctx) {
       return op->emitOpError() << "unbounded dynamism is not supported";
     newSizeBounds.push_back(hlo::isStaticDimSize(dimSize) ? dimSize : dimBound);
     dimsAreDynamic.push_back(!hlo::isStaticDimSize(dimSize));
-    dimExpressions.push_back(xla::DynExpr::_(-50)); // Don't know
   }
   value_map[op] =
-      xla::DynamicReshape(operand, dimSizes, newSizeBounds, dimsAreDynamic,
-                          dimExpressions);
+      xla::DynamicReshape(operand, dimSizes, newSizeBounds, dimsAreDynamic);
   return success();
 }
 
@@ -4565,8 +4558,7 @@ LogicalResult ExportXlaOp(ReshapeOp op, OpLoweringContext ctx) {
     return failure();
 
   value_map[op] =
-      xla::Reshape(operand, xla::TypeToShape(op.getType()).dimensions(),
-                   xla::TypeToShape(op.getType()).expressions());
+      xla::Reshape(operand, xla::TypeToShape(op.getType()).dimensions());
   return success();
 }
 

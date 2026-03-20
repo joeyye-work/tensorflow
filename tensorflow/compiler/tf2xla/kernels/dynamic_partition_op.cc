@@ -140,9 +140,8 @@ class DynamicPartitionOp : public XlaOpKernel {
       for (int64_t i = 0; i < rank; ++i) {
         broadcasted_dims.push_back(i);
       }
-      partitions =
-          xla::BroadcastInDim(partitions, data_shape.dimensions(),
-                              broadcasted_dims, data_shape.expressions());
+      partitions = xla::BroadcastInDim(partitions, data_shape.dimensions(),
+                                       broadcasted_dims);
     }
 
     // Output shape bounded is calculated by

@@ -290,19 +290,11 @@ class ExpandDimsOp : public XlaOpKernel {
                                         " dimensions."));
 
     auto existing_dims = input_shape.dim_sizes();
-    auto existing_exprs = input_shape.get_expressions();
-
     // Safe - # elements in tensor dims bounded.
     const int existing_dims_size = static_cast<int>(existing_dims.size());
     std::vector<int64_t> new_shape(existing_dims_size);
     for (size_t i = 0; i < new_shape.size(); ++i) {
       new_shape[i] = existing_dims[i];
-    }
-
-    const int existing_exprs_size = static_cast<int>(existing_exprs.size());
-    std::vector<xla::DynExpr*> new_exprs(existing_exprs_size);
-    for (size_t i = 0; i < new_exprs.size(); ++i) {
-      new_exprs[i] = existing_exprs[i];
     }
 
     // We emulate numpy's interpretation of the dim axis when
@@ -314,9 +306,8 @@ class ExpandDimsOp : public XlaOpKernel {
     // Clamp to the end if needed.
     dim = std::min<int32_t>(dim, existing_dims_size);
     new_shape.emplace(new_shape.begin() + dim, 1);
-    new_exprs.emplace(new_exprs.begin() + dim, xla::DynExpr::one);
 
-    ctx->SetOutput(0, xla::Reshape(ctx->Input("input"), new_shape, new_exprs));
+    ctx->SetOutput(0, xla::Reshape(ctx->Input("input"), new_shape));
   }
 };
 REGISTER_XLA_OP(Name("ExpandDims").CompileTimeConstantInput("dim"),
@@ -340,7 +331,6 @@ class SqueezeOp : public XlaOpKernel {
     absl::flat_hash_set<int32_t> wrapped_squeeze_dims;
     wrapped_squeeze_dims.reserve(squeeze_dims_.size());
     std::vector<int64_t> new_shape;
-    std::vector<xla::DynExpr*> new_exprs;
     // Validate squeeze dims against the input.
     for (int32_t dim : squeeze_dims_) {
       OP_REQUIRES(
@@ -368,7 +358,6 @@ class SqueezeOp : public XlaOpKernel {
         } else {
           // This dimension is not being squeezed.
           new_shape.push_back(existing_dim);
-          new_exprs.push_back(shape.expressions(i));
         }
       } else {
         OP_REQUIRES(
@@ -379,12 +368,11 @@ class SqueezeOp : public XlaOpKernel {
         // Copy over all non-1-length dimensions.
         if (existing_dim != 1) {
           new_shape.push_back(existing_dim);
-          new_exprs.push_back(shape.expressions(i));
         }
       }
     }
 
-    ctx->SetOutput(0, xla::Reshape(ctx->Input(0), new_shape, new_exprs));
+    ctx->SetOutput(0, xla::Reshape(ctx->Input(0), new_shape));
   }
 
  private:
@@ -442,8 +430,7 @@ class ZerosLikeOp : public XlaOpKernel {
       auto zero = XlaHelpers::Zero(ctx->builder(), input_type(0));
       xla::XlaOp input = ctx->Input(0);
       auto input_shape = ctx->InputXlaShape(0).value();
-      auto result = xla::Broadcast(zero, input_shape.dimensions(),
-                                   input_shape.expressions());
+      auto result = xla::Broadcast(zero, input_shape.dimensions());
 
       // Setting up dynamic dimensions of the broadcast.
       for (int64_t i = 0; i < input_shape.dimensions().size(); ++i) {
@@ -468,8 +455,7 @@ class OnesLikeOp : public XlaOpKernel {
     const TensorShape input_shape = ctx->InputShape(0);
 
     auto one = XlaHelpers::One(ctx->builder(), input_type(0));
-    ctx->SetOutput(0, xla::Broadcast(one, input_shape.dim_sizes(),
-                                     input_shape.get_expressions()));
+    ctx->SetOutput(0, xla::Broadcast(one, input_shape.dim_sizes()));
   }
 };
 

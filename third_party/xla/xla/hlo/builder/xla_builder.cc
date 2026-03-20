@@ -1017,25 +1017,22 @@ absl::StatusOr<XlaOp> XlaBuilder::AddBroadcastSequence(
   Shape broadcast_shape =
       ShapeUtil::ChangeElementType(output_shape, operand_shape->element_type());
 
-    // Do explicit broadcast for scalar.
-    if (ShapeUtil::IsScalar(*operand_shape)) {
-      return InDimBroadcast(ShapeUtil::MakeStaticShape(broadcast_shape),
-                            operand, {});
-    }
+  // Do explicit broadcast for scalar.
+  if (ShapeUtil::IsScalar(*operand_shape)) {
+    return InDimBroadcast(ShapeUtil::MakeStaticShape(broadcast_shape), operand,
+                          {});
+  }
 
   // Do explicit broadcast for degenerate broadcast.
   std::vector<int64_t> broadcast_dimensions;
   std::vector<int64_t> reshaped_dimensions;
   std::vector<bool> reshaped_dynamic_dimensions;
-  std::vector<DynExpr*> reshaped_expressions;
   for (int i = 0; i < operand_shape->dimensions().size(); i++) {
     if (operand_shape->dimensions(i) == output_shape.dimensions(i)) {
       broadcast_dimensions.push_back(i);
       reshaped_dimensions.push_back(operand_shape->dimensions(i));
       reshaped_dynamic_dimensions.push_back(
           operand_shape->is_dynamic_dimension(i));
-      reshaped_expressions.push_back(
-          operand_shape->expressions(i));
     } else {
       TF_RET_CHECK(operand_shape->dimensions(i) == 1 &&
                    operand_shape->is_static_dimension(i))
@@ -1049,7 +1046,7 @@ absl::StatusOr<XlaOp> XlaBuilder::AddBroadcastSequence(
 
   Shape reshaped_shape =
       ShapeUtil::MakeShape(operand_shape->element_type(), reshaped_dimensions,
-                           reshaped_dynamic_dimensions, reshaped_expressions);
+                           reshaped_dynamic_dimensions);
 
   // Eliminate the size one dimensions.
   // The added reshape reduces the rank of the tensor. Hence we cannot directly
@@ -1097,20 +1094,15 @@ absl::StatusOr<XlaOp> BroadcastToTargetRank(
     return origin;
   }
 
-  // Update target_size and target_exp with origin sizes and expressions using
-  // broadcast_dimensions
+  // Update target_size with origin sizes using broadcast_dimensions
   absl::Span<const int64_t> target_dimensions = target_shape.dimensions();
-  absl::Span<DynExpr* const> target_expressions = target_shape.expressions();
   std::vector<int64_t> target_size{target_dimensions.begin(),
                                    target_dimensions.end()};
-  std::vector<DynExpr*> target_exp{target_expressions.begin(),
-                                   target_expressions.end()};
   for (int64_t origin_dim = 0; origin_dim < origin_rank; origin_dim++) {
     int64_t target_dim = broadcast_dimensions[origin_dim];
     target_size[target_dim] = origin_shape.dimensions(origin_dim);
-    target_exp[target_dim] = origin_shape.expressions(origin_dim);
   }
-  return BroadcastInDim(origin, target_size, broadcast_dimensions, target_exp);
+  return BroadcastInDim(origin, target_size, broadcast_dimensions);
 }
 
 // Extract the `num_dims` counts of dimension sizes from the `op`. First,
@@ -1128,7 +1120,7 @@ absl::StatusOr<std::vector<XlaOp>> ExtractDimensionSizesAndPadOnesToLeft(
             ? ConstantR1<int32_t>(
                   /*builder=*/builder,
                   /*values=*/{static_cast<int32_t>(op_shape->dimensions(i))})
-            : Reshape(GetDimensionSize(op, i), {1}, {xla::DynExpr::one}));
+            : Reshape(GetDimensionSize(op, i), {1}));
   }
   return op_dims;
 }
@@ -1150,8 +1142,7 @@ absl::StatusOr<XlaOp> BroadcastScalarToOutputShapeWithUnbounded(
             ? ConstantR1<int32_t>(
                   /*builder=*/builder,
                   /*values=*/{static_cast<int32_t>(output_shape.dimensions(i))})
-            : Reshape(GetDimensionSize(output, i), {1},
-                      {xla::DynExpr::one});
+            : Reshape(GetDimensionSize(output, i), {1});
   }
   return MhloDynamicBroadcastInDim(
       scalar, /*output_dimensions=*/ConcatInDim(builder, output_sizes, 0), {},
@@ -1534,13 +1525,12 @@ XlaOp XlaBuilder::Parameter(
 }
 
 XlaOp XlaBuilder::Broadcast(XlaOp operand,
-                            absl::Span<const int64_t> broadcast_sizes,
-                            absl::Span<DynExpr* const> broadcast_exprs) {
+                            absl::Span<const int64_t> broadcast_sizes) {
   return ReportErrorOrReturn([&]() -> absl::StatusOr<XlaOp> {
     TF_ASSIGN_OR_RETURN(const Shape* operand_shape, GetShapePtr(operand));
-    TF_ASSIGN_OR_RETURN(const Shape& shape,
-                        ShapeInference::InferBroadcastShape(
-                            *operand_shape, broadcast_sizes, broadcast_exprs));
+    TF_ASSIGN_OR_RETURN(
+        const Shape& shape,
+        ShapeInference::InferBroadcastShape(*operand_shape, broadcast_sizes));
 
     // The client-level broadcast op just appends dimensions on the left (adds
     // lowest numbered dimensions). The HLO broadcast instruction is more
@@ -1560,15 +1550,14 @@ XlaOp XlaBuilder::Broadcast(XlaOp operand,
 
 XlaOp XlaBuilder::BroadcastInDim(
     XlaOp operand, absl::Span<const int64_t> out_dim_size,
-    absl::Span<const int64_t> broadcast_dimensions,
-    absl::Span<DynExpr* const> out_dim_exp) {
+    absl::Span<const int64_t> broadcast_dimensions) {
   return ReportErrorOrReturn([&]() -> absl::StatusOr<XlaOp> {
     TF_ASSIGN_OR_RETURN(const Shape* operand_shape, GetShapePtr(operand));
     // Output shape, in the case of degenerate broadcast, the out_dim_size is
     // not necessarily the same as the dimension sizes of the output shape.
-    TF_ASSIGN_OR_RETURN(auto output_shape, ShapeUtil::MakeValidatedShape(
-                                               operand_shape->element_type(),
-                                               out_dim_size, out_dim_exp));
+    TF_ASSIGN_OR_RETURN(auto output_shape,
+                        ShapeUtil::MakeValidatedShape(
+                            operand_shape->element_type(), out_dim_size));
     TF_RET_CHECK(!output_shape.is_unbounded_dynamic())
         << "BroadcastInDim output must shape be static or bounded dynamic "
         << ShapeUtil::HumanString(output_shape);
@@ -1595,18 +1584,6 @@ XlaOp XlaBuilder::BroadcastInDim(
                            .status());
     std::vector<int64_t> in_dim_size(out_dim_size.begin(), out_dim_size.end());
     std::vector<bool> in_dim_dynamic(out_dim_size.size(), false);
-    std::vector<DynExpr*> in_expressions(out_dim_exp.begin(),
-                                         out_dim_exp.end());
-
-    // If out_dim_exp is empty just make expressions out of the static
-    // dimensions.
-    if (out_dim_exp.empty()) {
-      in_expressions.reserve(out_dim_size.size());
-      std::transform(out_dim_size.begin(), out_dim_size.end(),
-                     std::back_inserter(in_expressions),
-                     [](int d) { return DynExpr::_(d); });
-    }
-
     for (int i = 0; i < broadcast_rank; i++) {
       in_dim_size[broadcast_dimensions[i]] =
           (operand_shape->is_unbounded_dynamic_dimension(i))
@@ -1614,12 +1591,9 @@ XlaOp XlaBuilder::BroadcastInDim(
               : operand_shape->dimensions(i);
       in_dim_dynamic[broadcast_dimensions[i]] =
           operand_shape->is_bounded_dynamic_dimension(i);
-      in_expressions[broadcast_dimensions[i]] =
-          operand_shape->expressions(i);
     }
-    const auto& in_dim_shape =
-        ShapeUtil::MakeShape(operand_shape->element_type(), in_dim_size,
-                             in_dim_dynamic, in_expressions);
+    const auto& in_dim_shape = ShapeUtil::MakeShape(
+        operand_shape->element_type(), in_dim_size, in_dim_dynamic);
     TF_ASSIGN_OR_RETURN(
         XlaOp in_dim_broadcast,
         InDimBroadcast(in_dim_shape, operand, broadcast_dimensions));
@@ -1663,21 +1637,6 @@ XlaOp XlaBuilder::Slice(XlaOp operand, absl::Span<const int64_t> start_indices,
   });
 }
 
-XlaOp XlaBuilder::Slice(XlaOp operand, absl::Span<const int64_t> start_indices,
-                        absl::Span<const int64_t> limit_indices,
-                        absl::Span<DynExpr* const> start_exprs,
-                        absl::Span<DynExpr* const> limit_exprs,
-                        absl::Span<const int64_t> strides) {
-  return ReportErrorOrReturn([&]() -> absl::StatusOr<XlaOp> {
-    TF_ASSIGN_OR_RETURN(const Shape* operand_shape, GetShapePtr(operand));
-    TF_ASSIGN_OR_RETURN(
-        Shape shape, ShapeInference::InferSliceShape(
-                         *operand_shape, start_indices, limit_indices, strides,
-                         start_exprs, limit_exprs));
-    return SliceInternal(shape, operand, start_indices, limit_indices, strides);
-  });
-}
-
 absl::StatusOr<XlaOp> XlaBuilder::SliceInternal(
     const Shape& shape, XlaOp operand, absl::Span<const int64_t> start_indices,
     absl::Span<const int64_t> limit_indices,
@@ -1709,33 +1668,9 @@ XlaOp XlaBuilder::SliceInDim(XlaOp operand, int64_t start_index,
   });
 }
 
-XlaOp XlaBuilder::SliceInDim(XlaOp operand, int64_t start_index,
-                             int64_t limit_index, DynExpr* start_expr,
-                             DynExpr* limit_expr, int64_t stride,
-                             int64_t dimno) {
-  return ReportErrorOrReturn([&]() -> absl::StatusOr<XlaOp> {
-    TF_ASSIGN_OR_RETURN(const Shape* shape, GetShapePtr(operand));
-    std::vector<int64_t> starts(shape->dimensions().size(), 0);
-    std::vector<int64_t> limits(shape->dimensions().begin(),
-                                shape->dimensions().end());
-    std::vector<DynExpr*> start_exprs(shape->dimensions().size(),
-                                            DynExpr::zero);
-    std::vector<DynExpr*> limit_exprs(shape->expressions().begin(),
-                                            shape->expressions().end());
-    std::vector<int64_t> strides(shape->dimensions().size(), 1);
-    starts[dimno] = start_index;
-    limits[dimno] = limit_index;
-    start_exprs[dimno] = start_expr;
-    limit_exprs[dimno] = limit_expr;
-    strides[dimno] = stride;
-    return Slice(operand, starts, limits, start_exprs, limit_exprs, strides);
-  });
-}
-
 XlaOp XlaBuilder::DynamicSlice(XlaOp operand,
                                absl::Span<const XlaOp> start_indices,
-                               absl::Span<const int64_t> slice_sizes,
-                               absl::Span<DynExpr* const> slice_exprs) {
+                               absl::Span<const int64_t> slice_sizes) {
   return ReportErrorOrReturn([&]() -> absl::StatusOr<XlaOp> {
     TF_ASSIGN_OR_RETURN(const Shape* operand_shape, GetShapePtr(operand));
     std::vector<const Shape*> start_indices_shape_ptrs;
@@ -1744,9 +1679,9 @@ XlaOp XlaBuilder::DynamicSlice(XlaOp operand,
     absl::c_transform(start_indices_shapes,
                       std::back_inserter(start_indices_shape_ptrs),
                       [](const Shape& shape) { return &shape; });
-    TF_ASSIGN_OR_RETURN(Shape shape, ShapeInference::InferDynamicSliceShape(
-                                         *operand_shape, start_indices_shapes,
-                                         slice_sizes, slice_exprs));
+    TF_ASSIGN_OR_RETURN(Shape shape,
+                        ShapeInference::InferDynamicSliceShape(
+                            *operand_shape, start_indices_shapes, slice_sizes));
     return DynamicSliceInternal(shape, operand, start_indices, slice_sizes);
   });
 }
@@ -1763,7 +1698,6 @@ absl::StatusOr<XlaOp> XlaBuilder::DynamicSliceInternal(
 
   std::vector<XlaOp> operands = {operand};
   operands.insert(operands.end(), start_indices.begin(), start_indices.end());
-
   return AddInstruction(std::move(instr), HloOpcode::kDynamicSlice, operands);
 }
 
@@ -1860,22 +1794,9 @@ XlaOp XlaBuilder::Reshape(XlaOp operand, absl::Span<const int64_t> dimensions,
                           int64_t inferred_dimension) {
   return ReportErrorOrReturn([&]() -> absl::StatusOr<XlaOp> {
     TF_ASSIGN_OR_RETURN(const Shape* operand_shape, GetShapePtr(operand));
-    TF_ASSIGN_OR_RETURN(const Shape shape, ShapeInference::InferReshapeShape(
-                                               *operand_shape, dimensions,
-                                               inferred_dimension, {}));
-    return ReshapeInternal(shape, operand, inferred_dimension);
-  });
-}
-
-XlaOp XlaBuilder::Reshape(XlaOp operand, absl::Span<const int64_t> dimensions,
-                          absl::Span<DynExpr* const> expressions,
-                          int64_t inferred_dimension) {
-  return ReportErrorOrReturn([&]() -> absl::StatusOr<XlaOp> {
-    TF_ASSIGN_OR_RETURN(const Shape* operand_shape, GetShapePtr(operand));
-    TF_ASSIGN_OR_RETURN(
-        const Shape shape,
-        ShapeInference::InferReshapeShape(*operand_shape, dimensions,
-                                          inferred_dimension, expressions));
+    TF_ASSIGN_OR_RETURN(const Shape shape,
+                        ShapeInference::InferReshapeShape(
+                            *operand_shape, dimensions, inferred_dimension));
     return ReshapeInternal(shape, operand, inferred_dimension);
   });
 }
@@ -1890,8 +1811,7 @@ XlaOp XlaBuilder::Reshape(const Shape& shape, XlaOp operand,
 XlaOp XlaBuilder::DynamicReshape(XlaOp operand,
                                  absl::Span<const XlaOp> dim_sizes,
                                  absl::Span<const int64_t> new_size_bounds,
-                                 const std::vector<bool>& dims_are_dynamic,
-                                 absl::Span<DynExpr* const> expressions) {
+                                 const std::vector<bool>& dims_are_dynamic) {
   return ReportErrorOrReturn([&]() -> absl::StatusOr<XlaOp> {
     TF_ASSIGN_OR_RETURN(const Shape* operand_shape, GetShapePtr(operand));
     std::vector<const Shape*> dim_size_shape_ptrs;
@@ -1900,11 +1820,10 @@ XlaOp XlaBuilder::DynamicReshape(XlaOp operand,
 
     absl::c_transform(dim_size_shapes, std::back_inserter(dim_size_shape_ptrs),
                       [](const Shape& shape) { return &shape; });
-    TF_ASSIGN_OR_RETURN(
-        const Shape shape,
-        ShapeInference::InferDynamicReshapeShape(
-            *operand_shape, dim_size_shape_ptrs, new_size_bounds,
-            dims_are_dynamic, expressions));
+    TF_ASSIGN_OR_RETURN(const Shape shape,
+                        ShapeInference::InferDynamicReshapeShape(
+                            *operand_shape, dim_size_shape_ptrs,
+                            new_size_bounds, dims_are_dynamic));
     TF_RETURN_IF_ERROR(first_error_);
     std::vector<XlaOp> operands;
     operands.reserve(1 + dim_sizes.size());
@@ -1946,21 +1865,17 @@ XlaOp XlaBuilder::Collapse(XlaOp operand,
     VLOG(3) << "dims to collapse: " << absl::StrJoin(dimensions, ",");
 
     std::vector<int64_t> new_sizes;
-    std::vector<DynExpr*> new_exprs;
     for (int i = 0; i < original_shape->dimensions().size(); ++i) {
       if (i <= dimensions.front() || i > dimensions.back()) {
         new_sizes.push_back(original_shape->dimensions(i));
-        new_exprs.push_back(original_shape->expressions(i));
       } else {
         new_sizes.back() *= original_shape->dimensions(i);
-        new_exprs.back() =
-            *(new_exprs.back()) * *(original_shape->expressions(i));
       }
     }
 
     VLOG(3) << "new sizes: [" << absl::StrJoin(new_sizes, ",") << "]";
 
-    return Reshape(operand, new_sizes, new_exprs);
+    return Reshape(operand, new_sizes);
   });
 }
 
@@ -3997,14 +3912,12 @@ XlaOp XlaBuilder::AllToAllArray(
       return all_to_all;
     }
     DimensionVector sizes;
-    std::vector<DynExpr*> expressions;
     const bool is_unbounded = operand_shape->is_unbounded_dynamic();
     std::vector<XlaOp> dynamic_sizes;
     auto GetR1DimensionSizeOrConstant = [&](XlaOp operand,
                                             int64_t dimension) -> XlaOp {
       if (operand_shape->is_unbounded_dynamic_dimension(dimension)) {
-        return Reshape(GetDimensionSize(operand, dimension), {1},
-                       {DynExpr::one});
+        return Reshape(GetDimensionSize(operand, dimension), {1});
       }
       return ConstantR1<int32_t>(
           this, {static_cast<int32_t>(operand_shape->dimensions(dimension))});
@@ -4014,19 +3927,15 @@ XlaOp XlaBuilder::AllToAllArray(
     for (int64_t i = 0; i < operand_shape->dimensions().size(); ++i) {
       if (i != split_dimension) {
         sizes.push_back(operand_shape->dimensions(i));
-        expressions.push_back(operand_shape->expressions(i));
         if (is_unbounded) {
           dynamic_sizes.push_back(GetR1DimensionSizeOrConstant(operand, i));
         }
         continue;
       }
       sizes.push_back(split_count);
-      expressions.push_back(DynExpr::_(split_count));
       sizes.push_back(operand_shape->is_unbounded_dynamic_dimension(i)
                           ? Shape::kUnboundedSize
                           : operand_shape->dimensions(i) / split_count);
-      expressions.push_back(
-          (*operand_shape->expressions(i) / split_count)->s());
 
       if (is_unbounded) {
         dynamic_sizes.push_back(r1_split_count);
@@ -4046,11 +3955,11 @@ XlaOp XlaBuilder::AllToAllArray(
       TF_ASSIGN_OR_RETURN(
           const Shape shape,
           ShapeUtil::MakeValidatedShape(all_to_all_shape.element_type(), sizes,
-                                        dynamic_dimensions, expressions));
+                                        dynamic_dimensions));
       all_to_all =
           MhloDynamicReshape(all_to_all, ConcatInDim(dynamic_sizes, 0), shape);
     } else {
-      all_to_all = Reshape(all_to_all, sizes, expressions);
+      all_to_all = Reshape(all_to_all, sizes);
     }
 
     std::vector<int64_t> permutation;
@@ -5077,18 +4986,16 @@ XlaOp ConstantLiteral(XlaBuilder* builder, const LiteralSlice& literal) {
   return builder->ConstantLiteral(literal);
 }
 
-XlaOp Broadcast(const XlaOp operand, absl::Span<const int64_t> broadcast_sizes,
-                absl::Span<DynExpr* const> broadcast_exprs) {
-  return operand.builder()->Broadcast(operand, broadcast_sizes,
-                                      broadcast_exprs);
+XlaOp Broadcast(const XlaOp operand,
+                absl::Span<const int64_t> broadcast_sizes) {
+  return operand.builder()->Broadcast(operand, broadcast_sizes);
 }
 
 XlaOp BroadcastInDim(const XlaOp operand,
                      absl::Span<const int64_t> out_dim_size,
-                     absl::Span<const int64_t> broadcast_dimensions,
-                     absl::Span<DynExpr* const> out_dim_exp) {
+                     absl::Span<const int64_t> broadcast_dimensions) {
   return operand.builder()->BroadcastInDim(operand, out_dim_size,
-                                           broadcast_dimensions, out_dim_exp);
+                                           broadcast_dimensions);
 }
 
 XlaOp MhloDynamicReshape(const XlaOp operand, const XlaOp output_shape,
@@ -5123,29 +5030,21 @@ XlaOp Reshape(const XlaOp operand, absl::Span<const int64_t> dimensions) {
   return operand.builder()->Reshape(operand, dimensions);
 }
 
-XlaOp Reshape(const XlaOp operand, absl::Span<const int64_t> dimensions,
-              absl::Span<DynExpr* const> expressions) {
-  return operand.builder()->Reshape(operand, dimensions, expressions);
-}
-
 XlaOp Reshape(const Shape& shape, XlaOp operand) {
   return operand.builder()->Reshape(shape, operand);
 }
 
 XlaOp DynamicReshape(XlaOp operand, absl::Span<const XlaOp> dim_sizes,
                      absl::Span<const int64_t> new_size_bounds,
-                     const std::vector<bool>& dims_are_dynamic,
-                     absl::Span<DynExpr* const> expressions) {
+                     const std::vector<bool>& dims_are_dynamic) {
   return operand.builder()->DynamicReshape(operand, dim_sizes, new_size_bounds,
-                                           dims_are_dynamic, expressions);
+                                           dims_are_dynamic);
 }
 
 XlaOp ReshapeWithInferredDimension(XlaOp operand,
                                    absl::Span<const int64_t> new_sizes,
-                                   absl::Span<DynExpr* const> new_exprs,
                                    int64_t inferred_dimension) {
-  return operand.builder()->Reshape(operand, new_sizes, new_exprs,
-                                    inferred_dimension);
+  return operand.builder()->Reshape(operand, new_sizes, inferred_dimension);
 }
 
 XlaOp Collapse(const XlaOp operand, absl::Span<const int64_t> dimensions) {
@@ -5159,33 +5058,15 @@ XlaOp Slice(const XlaOp operand, absl::Span<const int64_t> start_indices,
                                   strides);
 }
 
-XlaOp Slice(const XlaOp operand, absl::Span<const int64_t> start_indices,
-            absl::Span<const int64_t> limit_indices,
-            absl::Span<DynExpr* const> start_exprs,
-            absl::Span<DynExpr* const> limit_exprs,
-            absl::Span<const int64_t> strides) {
-  return operand.builder()->Slice(operand, start_indices, limit_indices,
-                                  start_exprs, limit_exprs, strides);
-}
-
 XlaOp SliceInDim(const XlaOp operand, int64_t start_index, int64_t limit_index,
                  int64_t stride, int64_t dimno) {
   return operand.builder()->SliceInDim(operand, start_index, limit_index,
                                        stride, dimno);
 }
 
-XlaOp SliceInDim(const XlaOp operand, int64_t start_index, int64_t limit_index,
-                 DynExpr* start_expr, DynExpr* limit_expr, int64_t stride,
-                 int64_t dimno) {
-  return operand.builder()->SliceInDim(operand, start_index, limit_index,
-                                       start_expr, limit_expr, stride, dimno);
-}
-
 XlaOp DynamicSlice(const XlaOp operand, absl::Span<const XlaOp> start_indices,
-                   absl::Span<const int64_t> slice_sizes,
-                   absl::Span<DynExpr* const> slice_exprs) {
-  return operand.builder()->DynamicSlice(operand, start_indices, slice_sizes,
-                                         slice_exprs);
+                   absl::Span<const int64_t> slice_sizes) {
+  return operand.builder()->DynamicSlice(operand, start_indices, slice_sizes);
 }
 
 XlaOp DynamicUpdateSlice(const XlaOp operand, const XlaOp update,
@@ -6202,14 +6083,6 @@ XlaOp Iota(XlaBuilder* builder, const Shape& shape, int64_t iota_dimension) {
 
 XlaOp GetDimensionSize(const XlaOp operand, int64_t dimension) {
   return operand.builder()->GetDimensionSize(operand, dimension);
-}
-
-XlaOp GetOuterBatchValue(XlaOp operand) {
-  XlaBuilder* builder = operand.builder();
-  return CustomCall(builder, "GetOuterBatchValue", {operand},
-                             ShapeUtil::MakeShape(S32, {}), "", false, {},
-                             nullptr, CustomCallSchedule::SCHEDULE_NONE,
-                             CustomCallApiVersion::API_VERSION_ORIGINAL);
 }
 
 XlaOp SetDimensionSize(const XlaOp operand, const XlaOp val,

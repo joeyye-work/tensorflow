@@ -248,10 +248,6 @@ void InferenceContext::ShapeHandleToProto(ShapeHandle handle,
       dim_shape->set_size(Value(dim));
     } else {
       dim_shape->set_size(-1);
-      // Serialize expression if available.
-      if (DimExpr* expr = GetDimExpr(dim)) {
-        expr->ToProto(dim_shape->mutable_expr());
-      }
     }
   }
 }
@@ -286,36 +282,6 @@ DimensionHandle InferenceContext::NumElements(ShapeHandle s) {
   }
 }
 
-DimensionHandle InferenceContext::UnknownDimWithExpr(
-    std::unique_ptr<DimExpr> expr) {
-  DimExpr* owned = shape_manager_.OwnExpr(std::move(expr));
-  return shape_manager_.MakeDim(kUnknownDim, /*dynamic_ratio*/0, owned);
-}
-
-DimExpr* InferenceContext::GetDimExpr(DimensionHandle d) const {
-  if (!d.IsSet()) return nullptr;
-  return d->expr_;
-}
-
-DimExpr* InferenceContext::MakeConstExpr(int64_t v) {
-  return shape_manager_.OwnExpr(std::make_unique<Constant>(v));
-}
-
-DimExpr* InferenceContext::ExprForDim(DimensionHandle d) {
-  if (!d.IsSet()) return nullptr;
-
-  // If already tagged with expr, use it.
-  if (DimExpr* e = GetDimExpr(d)) return e;
-
-  // Known dim -> const expr.
-  if (ValueKnown(d)) {
-    return MakeConstExpr(Value(d));
-  }
-
-  // Unknown dim with no expr -> cannot form expression.
-  return nullptr;
-}
-
 string InferenceContext::DebugString(ShapeHandle s) {
   if (RankKnown(s)) {
     std::vector<string> vals;
@@ -327,7 +293,7 @@ string InferenceContext::DebugString(ShapeHandle s) {
 }
 
 string InferenceContext::DebugString(DimensionHandle d) {
-  return ValueKnown(d) ? strings::StrCat(Value(d), strings::StrCat("~",DynamicRatio(d))) : "?";
+  return ValueKnown(d) ? strings::StrCat(Value(d)) : "?";
 }
 
 string InferenceContext::DebugString() const {
@@ -929,12 +895,7 @@ absl::Status InferenceContext::MakeShapeFromPartialTensorShape(
   for (int i = 0; i < num_dims; ++i) {
     // -1 is unknown in PartialTensorShape and in InferenceContext, so this size
     // can be passed directly to MakeDim.
-    if(i == 0){
-      dims[i] = MakeDim(partial_shape.dim_size(i), 1);
-    }
-    else {
-      dims[i] = MakeDim(partial_shape.dim_size(i));
-    }
+    dims[i] = MakeDim(partial_shape.dim_size(i));
   }
   return ReturnCreatedShape(dims, out);
 }
@@ -962,38 +923,8 @@ absl::Status InferenceContext::MakeShapeFromShapeProto(
     const TensorShapeProto& proto, ShapeHandle* out) {
   *out = nullptr;
   TF_RETURN_IF_ERROR(PartialTensorShape::IsValidShape(proto));
-
-  if (proto.unknown_rank()) {
-    *out = UnknownShape();
-    return absl::OkStatus();
-  }
-
-  std::vector<DimensionHandle> dims;
-  dims.reserve(proto.dim_size());
-  for (int i = 0; i < proto.dim_size(); ++i) {
-    const auto& dim_proto = proto.dim(i);
-    if (dim_proto.size() >= 0) {
-      // Known dimension
-      dims.push_back(MakeDim(dim_proto.size()));
-    } else {
-      // Unknown dimension - check for expression
-      if (dim_proto.has_expr() && dim_proto.expr().node_type_case() !=
-                                      ExpressionProto::NODE_TYPE_NOT_SET) {
-        // Deserialize expression
-        std::unique_ptr<DimExpr> expr = DimExpr::FromProto(dim_proto.expr());
-        if (expr) {
-          DimExpr* owned = shape_manager_.OwnExpr(std::move(expr));
-          dims.push_back(shape_manager_.MakeDim(kUnknownDim,/*dynamic_ratio */ 0, owned));
-        } else {
-          dims.push_back(UnknownDim());
-        }
-      } else {
-        dims.push_back(UnknownDim());
-      }
-    }
-  }
-  *out = MakeShape(dims);
-  return absl::OkStatus();
+  PartialTensorShape partial_shape(proto);
+  return MakeShapeFromPartialTensorShape(partial_shape, out);
 }
 
 absl::Status InferenceContext::GetScalarFromTensor(const Tensor* t,
@@ -1099,40 +1030,24 @@ absl::Status InferenceContext::Divide(DimensionHandle dividend,
                                       DimensionOrConstant divisor,
                                       bool evenly_divisible,
                                       DimensionHandle* out) {
-  const bool dividend_known = ValueKnown(dividend);
-  const bool divisor_known = ValueKnown(divisor);
-
-  // Validate divisor if known.
-  if (divisor_known && Value(divisor) <= 0) {
-    return errors::InvalidArgument("Divisor must be positive but is ",
-                                   Value(divisor));
-  }
-  // Fast-path: x / 1 = x
-  if (divisor_known && Value(divisor) == 1) {
+  const int64_t divisor_value = Value(divisor);
+  if (divisor_value == 1) {
     *out = dividend;
-    return absl::OkStatus();
-  }
-  // If both known, do numeric divide.
-  if (dividend_known && divisor_known) {
-    const int64_t v = Value(dividend);
-    const int64_t d = Value(divisor);
-    if (evenly_divisible && (v % d) != 0) {
-      return errors::InvalidArgument(
-          "Dimension size must be evenly divisible by ", d, " but is ", v);
-    }
-    *out = MakeDim(v / d);
-    return absl::OkStatus();
-  }
-  // At least one operand unknown: try to build expression.
-  DimExpr* lhs = ExprForDim(dividend);
-  DimExpr* rhs = divisor.dim.IsSet() ? ExprForDim(divisor.dim)
-                                     : MakeConstExpr(divisor.val);
-  if (lhs && rhs) {
-    DimExpr* node = shape_manager_.OwnExpr(
-        std::make_unique<ExprDiv>(lhs, rhs));
-    *out = shape_manager_.MakeDim(kUnknownDim, /*dynamic_ratio*/0, node);
+  } else if (!ValueKnown(dividend) ||
+             (divisor.dim.IsSet() && !ValueKnown(divisor.dim))) {
+    *out = UnknownDim();
   } else {
-    *out = UnknownDim();  // Can't form expr.
+    const int64_t v = Value(dividend);
+    if (divisor_value <= 0) {
+      return errors::InvalidArgument("Divisor must be positive but is ",
+                                     divisor_value);
+    }
+    if (evenly_divisible && (v % divisor_value) != 0) {
+      return errors::InvalidArgument(
+          "Dimension size must be evenly divisible by ", divisor_value,
+          " but is ", v);
+    }
+    *out = MakeDim(v / divisor_value);
   }
   return absl::OkStatus();
 }
@@ -1140,41 +1055,26 @@ absl::Status InferenceContext::Divide(DimensionHandle dividend,
 absl::Status InferenceContext::Add(DimensionHandle first,
                                    DimensionOrConstant second,
                                    DimensionHandle* out) {
-  const bool first_known = ValueKnown(first);
-  const bool second_known = ValueKnown(second);
-
-  // Fast-path: x + 0 = x
-  if (first_known && Value(first) == 0) {
+  const int64_t first_value = Value(first);
+  const int64_t second_value = Value(second);
+  // Special cases.
+  if (first_value == 0) {
     *out = MakeDim(second);
-    return absl::OkStatus();
-  }
-  if (second_known && Value(second) == 0) {
+  } else if (second_value == 0) {
     *out = first;
-    return absl::OkStatus();
-  }
-
-  // If both known, do numeric add.
-  if (first_known && second_known) {
-    const int64_t sum = static_cast<uint64_t>(Value(first)) +
-                        static_cast<uint64_t>(Value(second));
+  } else if (first_value == kUnknownDim || second_value == kUnknownDim) {
+    *out = UnknownDim();
+  } else {
+    // Invariant: Both values are known and positive. Still in run-time we can
+    // get pair of values which cannot be store in output. Check below will
+    // report error. We still need to avoid undefined behavior of signed
+    // overflow and use unsigned addition.
+    const int64_t sum = static_cast<uint64>(first_value) + second_value;
     if (sum < 0) {
       return errors::InvalidArgument("Dimension size overflow from adding ",
-                                     Value(first), " and ", Value(second));
+                                     first_value, " and ", second_value);
     }
     *out = MakeDim(sum);
-    return absl::OkStatus();
-  }
-
-  // At least one operand unknown: try to build expression.
-  DimExpr* lhs = ExprForDim(first);
-  DimExpr* rhs =
-      second.dim.IsSet() ? ExprForDim(second.dim) : MakeConstExpr(second.val);
-
-  if (lhs && rhs) {
-    DimExpr* node = shape_manager_.OwnExpr(std::make_unique<ExprAdd>(lhs, rhs));
-    *out = shape_manager_.MakeDim(kUnknownDim, /*dynamic_ratio*/ 0, node);
-  } else {
-    *out = UnknownDim();  // Can't form expr.
   }
   return absl::OkStatus();
 }
@@ -1182,34 +1082,22 @@ absl::Status InferenceContext::Add(DimensionHandle first,
 absl::Status InferenceContext::Subtract(DimensionHandle first,
                                         DimensionOrConstant second,
                                         DimensionHandle* out) {
-  const bool first_known = ValueKnown(first);
-  const bool second_known = ValueKnown(second);
-  // Fast-path: x - 0 = x
-  if (second_known && Value(second) == 0) {
+  const int64_t first_value = Value(first);
+  const int64_t second_value = Value(second);
+  // Special cases.
+  if (second_value == 0) {
     *out = first;
-    return absl::OkStatus();
-  }
-  // If both known, do numeric subtract.
-  if (first_known && second_known) {
-    const int64_t first_value = Value(first);
-    const int64_t second_value = Value(second);
+  } else if (first_value == kUnknownDim || second_value == kUnknownDim) {
+    *out = UnknownDim();
+  } else {
+    // Invariant: Both values are known, first_value is non-negative, and
+    // second_value is positive.
     if (first_value < second_value) {
       return errors::InvalidArgument(
           "Negative dimension size caused by subtracting ", second_value,
           " from ", first_value);
     }
     *out = MakeDim(first_value - second_value);
-    return absl::OkStatus();
-  }
-  // At least one operand unknown: try to build expression.
-  DimExpr* lhs = ExprForDim(first);
-  DimExpr* rhs =
-      second.dim.IsSet() ? ExprForDim(second.dim) : MakeConstExpr(second.val);
-  if (lhs && rhs) {
-    DimExpr* node = shape_manager_.OwnExpr(std::make_unique<ExprSub>(lhs, rhs));
-    *out = shape_manager_.MakeDim(kUnknownDim, /*dynamic_ratio*/ 0, node);
-  } else {
-    *out = UnknownDim();  // Can't form expr.
   }
   return absl::OkStatus();
 }
@@ -1217,31 +1105,21 @@ absl::Status InferenceContext::Subtract(DimensionHandle first,
 absl::Status InferenceContext::Multiply(DimensionHandle first,
                                         DimensionOrConstant second,
                                         DimensionHandle* out) {
-  const bool first_known = ValueKnown(first);
-  const bool second_known = ValueKnown(second);
   const int64_t first_value = Value(first);
   const int64_t second_value = Value(second);
-
-  // Fast-paths for identity and zero cases.
-  if (first_known && first_value == 0) {
+  // Special cases.
+  if (first_value == 0) {
     *out = first;
-    return absl::OkStatus();
-  }
-  if (second_known && second_value == 0) {
+  } else if (second_value == 0) {
     *out = MakeDim(second);
-    return absl::OkStatus();
-  }
-  if (first_known && first_value == 1) {
+  } else if (first_value == 1) {
     *out = MakeDim(second);
-    return absl::OkStatus();
-  }
-  if (second_known && second_value == 1) {
+  } else if (second_value == 1) {
     *out = first;
-    return absl::OkStatus();
-  }
-
-  // If both known, do numeric multiply.
-  if (first_known && second_known) {
+  } else if (first_value == kUnknownDim || second_value == kUnknownDim) {
+    *out = UnknownDim();
+  } else {
+    // Invariant: Both values are known and greater than 1.
     const int64_t product = MultiplyWithoutOverflow(first_value, second_value);
     if (product < 0) {
       return errors::InvalidArgument(
@@ -1249,19 +1127,6 @@ absl::Status InferenceContext::Multiply(DimensionHandle first,
           first_value, " and ", second_value);
     }
     *out = MakeDim(product);
-    return absl::OkStatus();
-  }
-
-  // At least one operand unknown: try to build expression.
-  DimExpr* lhs = ExprForDim(first);
-  DimExpr* rhs =
-      second.dim.IsSet() ? ExprForDim(second.dim) : MakeConstExpr(second.val);
-
-  if (lhs && rhs) {
-    DimExpr* node = shape_manager_.OwnExpr(std::make_unique<ExprMul>(lhs, rhs));
-    *out = shape_manager_.MakeDim(kUnknownDim, /*dynamic_ratio*/ 0, node);
-  } else {
-    *out = UnknownDim();  // Can't form expr.
   }
   return absl::OkStatus();
 }
