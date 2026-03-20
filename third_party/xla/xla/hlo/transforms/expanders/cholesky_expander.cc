@@ -218,9 +218,9 @@ XlaOp CholeskyExpander::BuildCholesky(XlaOp a, int64_t block_size,
         l = UpdateSliceInMinorDims(l, update, {i + k, i});
       }
     }
-    return Select(
-        BroadcastInDim(seen_error, a_shape.dimensions(), error_dim_indices),
-        FullLike(l, std::numeric_limits<float>::quiet_NaN()), l);
+    return Select(BroadcastInDim(seen_error, a_shape.dimensions(),
+                                 error_dim_indices, a_shape.expressions()),
+                  FullLike(l, std::numeric_limits<float>::quiet_NaN()), l);
   });
 }
 

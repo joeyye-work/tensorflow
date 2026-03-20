@@ -158,8 +158,10 @@ void ApplyJacobiRotationOverRows(Eigh2x2 rotation, XlaOp& tl, XlaOp& tr,
   Shape shape = tl.builder()->GetShape(tl).value();
   std::vector<int64_t> broadcast_dims(shape.dimensions().size() - 1);
   absl::c_iota(broadcast_dims, 0);
-  auto c = BroadcastInDim(rotation.c, shape.dimensions(), broadcast_dims);
-  auto s = BroadcastInDim(rotation.s, shape.dimensions(), broadcast_dims);
+  auto c = BroadcastInDim(rotation.c, shape.dimensions(), broadcast_dims,
+                          shape.expressions());
+  auto s = BroadcastInDim(rotation.s, shape.dimensions(), broadcast_dims,
+                          shape.expressions());
 
   auto s_conj = MaybeConjugate(s, true);
   std::tie(tl, tr, bl, br) =
@@ -179,8 +181,10 @@ void ApplyJacobiRotationOverCols(Eigh2x2 rotation, XlaOp& tl, XlaOp& tr,
   std::vector<int64_t> broadcast_dims(shape.dimensions().size() - 1);
   absl::c_iota(broadcast_dims, 0);
   broadcast_dims.back() = shape.dimensions().size() - 1;
-  auto c = BroadcastInDim(rotation.c, shape.dimensions(), broadcast_dims);
-  auto s = BroadcastInDim(rotation.s, shape.dimensions(), broadcast_dims);
+  auto c = BroadcastInDim(rotation.c, shape.dimensions(), broadcast_dims,
+                          shape.expressions());
+  auto s = BroadcastInDim(rotation.s, shape.dimensions(), broadcast_dims,
+                          shape.expressions());
 
   auto s_conj = MaybeConjugate(s, true);
   std::tie(tl, tr, bl, br) =
@@ -365,11 +369,12 @@ absl::Status EighExpander::SortByEigenvalues(XlaOp& v, XlaOp& w) {
   TF_ASSIGN_OR_RETURN(Shape w_shape, builder->GetShape(w));
   const int64_t num_dims = v_shape.dimensions().size();
   auto dimensions = v_shape.dimensions();
+  auto expressions = v_shape.expressions();
 
   std::vector<int64_t> broadcast_dims(num_dims - 1);
   std::iota(broadcast_dims.begin(), broadcast_dims.end(), 0);
   broadcast_dims[num_dims - 2] = num_dims - 1;
-  w = BroadcastInDim(w, dimensions, broadcast_dims);
+  w = BroadcastInDim(w, dimensions, broadcast_dims, expressions);
 
   XlaOp sort_result =
       Sort({w, v},

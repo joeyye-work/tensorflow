@@ -120,7 +120,12 @@ XlaOp DiagonalBlocks(XlaOp a, int64_t block_size) {
       auto last_blocks_dims = std::vector<int64_t>(ndims);
       std::copy(shape_dims.begin(), shape_dims.end(), last_blocks_dims.begin());
       last_blocks_dims.insert(last_blocks_dims.end() - 2, 1);
-      last_blocks = Reshape(last_blocks, last_blocks_dims);
+      auto shape_exprs = blocks_shape.expressions();
+      auto last_blocks_exprs = std::vector<DynExpr*>(ndims);
+      std::copy(shape_exprs.begin(), shape_exprs.end(),
+                last_blocks_exprs.begin());
+      last_blocks_exprs.insert(last_blocks_exprs.end() - 2, DynExpr::one);
+      last_blocks = Reshape(last_blocks, last_blocks_dims, last_blocks_exprs);
 
       // Concatenate with the other blocks if necessary
       if (n > block_size) {
@@ -366,7 +371,7 @@ XlaOp TriangularSolveExpander::InvertDiagonalBlocks(
                           /*broadcast_dimensions=*/{0, 1});
 
     // Reshape back to original batch major dimensions
-    return Reshape(inv_diag_blocks, shape.dimensions());
+    return Reshape(inv_diag_blocks, shape.dimensions(), shape.expressions());
   });
 }
 

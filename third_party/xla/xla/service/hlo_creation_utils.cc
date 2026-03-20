@@ -655,9 +655,12 @@ absl::StatusOr<HloInstruction*> CollapseFirstNDims(HloInstruction* operand,
   CHECK_GE(operand_shape.dimensions_size(), n);
   int64_t new_shape_leading_bound = 1;
   bool new_shape_leading_is_dynamic = false;
+  DynExpr* new_shape_leading_expression = DynExpr::one;
   for (int64_t i = 0; i < n; i++) {
     new_shape_leading_bound *= operand_shape.dimensions(i);
     new_shape_leading_is_dynamic |= operand_shape.is_dynamic_dimension(i);
+    new_shape_leading_expression =
+        (*new_shape_leading_expression) * (*operand_shape.expressions(i));
   }
 
   std::vector<int64_t> new_shape_dims;
@@ -675,8 +678,16 @@ absl::StatusOr<HloInstruction*> CollapseFirstNDims(HloInstruction* operand,
             operand_shape.dynamic_dimensions().end(),
             std::back_inserter(new_shape_dynamic_dims));
 
-  Shape output_shape = ShapeUtil::MakeShape(
-      operand_shape.element_type(), new_shape_dims, new_shape_dynamic_dims);
+  std::vector<DynExpr*> new_shape_expressions;
+  new_shape_expressions.reserve(operand_shape.dimensions_size() - n + 1);
+  new_shape_expressions.push_back(new_shape_leading_expression->s());
+  auto exprs = operand_shape.expressions();
+  std::copy(exprs.begin() + n, exprs.end(),
+            std::back_inserter(new_shape_expressions));
+
+  Shape output_shape =
+      ShapeUtil::MakeShape(operand_shape.element_type(), new_shape_dims,
+                           new_shape_dynamic_dims, new_shape_expressions);
 
   return MakeReshapeHlo(output_shape, operand);
 }
