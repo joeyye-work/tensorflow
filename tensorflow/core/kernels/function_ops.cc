@@ -44,9 +44,9 @@ ArgOp::ArgOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
   OP_REQUIRES_OK(ctx, ctx->GetAttr("T", &dtype_));
   OP_REQUIRES_OK(ctx, ctx->GetAttr("index", &index_));
 
-  Status s = ctx->GetAttr("_is_batch", &is_batch_);
+  Status s = ctx->GetAttr("_dynamic_dim", &dynamic_dim_);
   if (IsNotFound(s)) {
-    is_batch_ = false;
+    dynamic_dim_ = -1;
   } else {
     OP_REQUIRES_OK(ctx, s);
   }
@@ -78,7 +78,7 @@ void ArgOp::Compute(OpKernelContext* ctx) {
     OP_REQUIRES_OK(ctx, validate_type(*val));
     ctx->set_output(0, *val);
   }
-  if (is_batch_) {
+  if (dynamic_dim_ >= 0) {
     BatchSizeResource* bsr = nullptr;
     ScopedStepContainer* step_container = ctx->step_container();
 
@@ -89,7 +89,8 @@ void ArgOp::Compute(OpKernelContext* ctx) {
                               return OkStatus();
                             }));
 
-    const int64_t batch_size = val->dim_size(0);
+    const int64_t batch_size = val->dim_size(dynamic_dim_);
+    VLOG(1) << "Found batch_size in dimension #" << dynamic_dim_;
     if (bsr->GetBatchSize() == 0) {
       bsr->SetBatchSize(batch_size);
       VLOG(1) << "Set batch_size from 0 to " << batch_size
