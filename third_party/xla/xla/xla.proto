@@ -222,6 +222,8 @@ message DebugOptions {
   // When true, XLA:CPU uses XNNPACK to execute supported operations.
   bool xla_cpu_use_xnnpack = 359;
 
+  string xla_compile_batch_sizes = 389;
+
   // Enabling this will enable optimizations that ignore the possibility of NaN.
   bool xla_enable_fast_math = 335;
 
@@ -1208,7 +1210,7 @@ message DebugOptions {
   // Note: when adding a new flag, please add it to one of the hardware-specific
   // or hardware-agnostic sections at the top of this proto message.
 
-  // Next id: 389
+  // Next id: 390
 
   // Extra options to pass to the compilation backend (e.g. LLVM); specific
   // interpretation of these values is left to the backend.

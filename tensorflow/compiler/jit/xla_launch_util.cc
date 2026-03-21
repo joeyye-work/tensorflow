@@ -47,6 +47,7 @@ limitations under the License.
 #include "tensorflow/core/common_runtime/gpu/gpu_serving_device_selector.h"
 #include "tensorflow/core/common_runtime/gpu_device_context.h"
 #include "tensorflow/core/framework/allocator.h"
+#include "tensorflow/core/framework/batch_size_resource.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/resource_mgr.h"
@@ -430,8 +431,30 @@ absl::Status XlaComputationLaunchContext::PopulateOutputs(
     }
   } else {
     for (int i = 0; i < ctx->num_outputs(); ++i) {
-      output_tensor_shapes.push_back(compilation_result->outputs[i].shape);
+      xla::Shape output_host_shape = output.on_host_shape();
+      const xla::Shape& subshape = xla::ShapeUtil::GetSubshape(output_host_shape, {i});
+      VLOG(2) << "PopulateOutputs: subshape[" << i << "]: "<< subshape;
+      TensorShape shape;
+      TF_RETURN_IF_ERROR(XLAShapeToTensorShape(subshape, &shape));
+      if (subshape.outer_multiplier() > 0) {
+        BatchSizeResource* bsr = nullptr;
+        ScopedStepContainer* step_container = ctx->step_container();
+        TF_RETURN_IF_ERROR(step_container->Lookup<BatchSizeResource>(
+                       ctx->resource_manager(), BatchSizeResourceName, &bsr));
+        auto bsm = bsr->GetBatchSize() * subshape.outer_multiplier() ;
+        shape.set_dim(0, bsm);
+        output_tensor_shapes.push_back(shape);
+        bsr->Unref();
+      }
+      else {
+        output_tensor_shapes.push_back(compilation_result->outputs[i].shape);
+      }
     }
+  }
+
+  VLOG(2) << "output_tensor_shapes:";
+  for (auto s:output_tensor_shapes) {
+    VLOG(2) << s;
   }
 
   // Copy XLA results to the OpOutputList.

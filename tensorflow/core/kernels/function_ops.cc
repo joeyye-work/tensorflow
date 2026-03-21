@@ -24,13 +24,13 @@ limitations under the License.
 #include "tensorflow/core/common_runtime/gradients.h"
 #include "tensorflow/core/common_runtime/graph_constructor.h"
 #include "tensorflow/core/common_runtime/memory_types.h"
+#include "tensorflow/core/framework/batch_size_resource.h"
 #include "tensorflow/core/framework/cancellation.h"
 #include "tensorflow/core/framework/full_type.pb.h"
 #include "tensorflow/core/framework/full_type_util.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/graph/algorithm.h"
-#include "tensorflow/core/kernels/batch_size_resource.h"
 #include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/profiler/lib/traceme.h"
 #include "tensorflow/core/util/device_name_utils.h"
@@ -43,6 +43,13 @@ static constexpr const char* const kGradientOp =
 ArgOp::ArgOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
   OP_REQUIRES_OK(ctx, ctx->GetAttr("T", &dtype_));
   OP_REQUIRES_OK(ctx, ctx->GetAttr("index", &index_));
+
+  Status s = ctx->GetAttr("_is_batch", &is_batch_);
+  if (IsNotFound(s)) {
+    is_batch_ = false;
+  } else {
+    OP_REQUIRES_OK(ctx, s);
+  }
 }
 
 void ArgOp::Compute(OpKernelContext* ctx) {

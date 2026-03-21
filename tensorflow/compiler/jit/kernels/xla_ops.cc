@@ -54,6 +54,7 @@ limitations under the License.
 #include "tensorflow/compiler/jit/xla_host_send_device_context.h"
 #include "tensorflow/compiler/jit/xla_launch_util.h"
 #include "tensorflow/compiler/jit/xla_platform_info.h"
+#include "tensorflow/compiler/jit/xla_batch_matcher.h"
 #include "tensorflow/compiler/tf2xla/tf2xla_util.h"
 #include "tensorflow/compiler/tf2xla/xla_compiler.h"
 #include "tensorflow/compiler/tf2xla/xla_helpers.h"
@@ -65,13 +66,13 @@ limitations under the License.
 #include "xla/tsl/concurrency/async_value_ref.h"
 #include "xla/tsl/protobuf/error_codes.pb.h"
 #include "tensorflow/core/framework/allocator.h"
+#include "tensorflow/core/framework/batch_size_resource.h"
 #include "tensorflow/core/framework/node_def_util.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/op_requires.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/framework/types.pb.h"
-#include "tensorflow/core/kernels/batch_size_resource.h"
 #include "tensorflow/core/lib/monitoring/counter.h"
 #include "tensorflow/core/platform/env.h"
 #include "tensorflow/core/platform/errors.h"
@@ -434,7 +435,8 @@ absl::Status CompileToLocalExecutable(
     // dimension, detecting dynamic dimension via _is_batch attr in the
     // argument.
     std::vector<XlaCompiler::Argument> norm_args(args.begin(), args.end());
-    constexpr int64_t kMagicBound = 977;
+    int64_t filled_batch = 0;
+    XlaBatchMatcher* xla_batch_matcher = xla_device_compiler->xla_batch_matcher();
     if (options.flib_def != nullptr) {
       const FunctionDef* fdef = options.flib_def->Find(function.name());
       if (fdef != nullptr) {
@@ -446,23 +448,31 @@ absl::Status CompileToLocalExecutable(
           const AttrValue& v = it->second;
           if (it == attr_map.end()) continue;
           norm_args[arg_index].dynamic_dim = 0;
+
+          if (!filled_batch && xla_batch_matcher) {
+            TensorShape& shp = std::get<TensorShape>(norm_args[arg_index].shape);
+            filled_batch = xla_batch_matcher->get_xla_compile_batch(shp.dim_size(0));
+          }
         }
       }
     }
-    for (int i = 0; i < norm_args.size(); ++i) {
-      auto& arg = norm_args[i];
-      // argument rewrite.
-      if (arg.dynamic_dim == 0) {
-        TensorShape& shp = std::get<TensorShape>(arg.shape);
-        int64_t old = shp.dim_size(0);
-        shp.set_dim(0, kMagicBound);
-      }
-      // constant argument rewrite otherwise it still store the incoming batch
-      // request.
-      if (arg.kind == XlaCompiler::Argument::kConstant) {
-        auto flat = arg.constant_value.flat<int32>();
-        int32 old_batch = flat(0);
-        flat(0) = static_cast<int32>(kMagicBound);
+
+    if (filled_batch) {
+      for (int i = 0; i < norm_args.size(); ++i) {
+        auto& arg = norm_args[i];
+        // argument rewrite.
+        if (arg.dynamic_dim == 0) {
+          TensorShape& shp = std::get<TensorShape>(arg.shape);
+          int64_t old = shp.dim_size(0);
+          shp.set_dim(0, filled_batch);
+        }
+        // constant argument rewrite otherwise it still store the incoming batch
+        // request.
+        if (arg.kind == XlaCompiler::Argument::kConstant) {
+          auto flat = arg.constant_value.flat<int32>();
+          int32 old_batch = flat(0);
+          flat(0) = static_cast<int32>(filled_batch);
+        }
       }
     }
 
@@ -1014,13 +1024,20 @@ void XlaRunOp::Compute(OpKernelContext* ctx) {
     BatchSizeResource* bsr = nullptr;
     ScopedStepContainer* step_container = ctx->step_container();
 
-    OP_REQUIRES_OK(ctx, step_container->Lookup<BatchSizeResource>(
-                            ctx->resource_manager(), BatchSizeResourceName, &bsr));
+    absl::Status st = step_container->Lookup<BatchSizeResource>(
+        ctx->resource_manager(), BatchSizeResourceName, &bsr);
 
-    run_options.set_batch_size(bsr->GetBatchSize());
-    VLOG(1) << "run_options.batch_size is set to: "
+    if (st.ok()) {
+      run_options.set_batch_size(bsr->GetBatchSize());
+      VLOG(1) << "run_options.batch_size is set to: "
               << run_options.batch_size() << ". step_id: " << ctx->step_id();
-    bsr->Unref();
+      bsr->Unref();
+
+    } else if (IsNotFound(st)) {
+      VLOG(1) << "Warning: Not found BatchSizeResource in step_container.";
+    } else {
+      OP_REQUIRES_OK(ctx, st);
+    }
   }
 
   // Host callbacks used for HLO send/recv.

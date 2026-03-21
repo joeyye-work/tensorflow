@@ -780,6 +780,8 @@ cc_library(
         ":flags_headers",
         ":tf_graph_to_hlo_compiler",
         ":xla_compile_util",
+        ":xla_batch_matcher",
+        "//tensorflow/compiler/jit:flags",
         "//tensorflow/compiler/tf2xla:xla_compiler",
         "//tensorflow/core:framework",
         "//tensorflow/core:framework_lite",
@@ -2003,5 +2005,15 @@ tf_cuda_cc_test(
         "@com_google_googletest//:gtest_main",
         "@local_xla//xla/pjrt/plugin/xla_cpu:cpu_client_options",
         "@local_xla//xla/pjrt/plugin/xla_cpu:xla_cpu_pjrt_client",
+    ],
+)
+
+cc_library(
+    name = "xla_batch_matcher",
+    srcs = ["xla_batch_matcher.cc"],
+    hdrs = ["xla_batch_matcher.h"],
+    deps = [
+        "//tensorflow/core/platform:logging",
+        "@local_xla//xla:debug_options_flags",
     ],
 )
