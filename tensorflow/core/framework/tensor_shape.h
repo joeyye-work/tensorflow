@@ -74,18 +74,12 @@ class TensorShapeRep {
   std::string DebugString() const;
   static std::string DebugString(const TensorShapeProto& proto);
 
-  void set_expression(int d, xla::DynExpr* expr){
-    expressions_[d] = expr;
-  }
+  void set_expression(int d, xla::DynExpr* expr);
 
-  void AddExpression(xla::DynExpr* expr){
-    expressions_.push_back(expr);
-  }
+  void AddExpression(xla::DynExpr* expr);
 
   // Set the array of dynamic multipliers.
-  void set_expressions(std::vector<xla::DynExpr*> exprs) {
-    expressions_ = exprs;
-  }
+  void set_expressions(std::vector<xla::DynExpr*> exprs);
 
   // Get the array of dynamic multipliers.
   std::vector<xla::DynExpr*> get_expressions() const {
@@ -95,13 +89,13 @@ class TensorShapeRep {
   // Return the multiplier for a specific dynamic dimension.
   // -1 if the dimension is not dynamic.
   xla::DynExpr* get_expression(int64_t dimension) const {
-    // Guard against negative indices and avoid signed/unsigned comparison
-    if (dimension < 0) return nullptr;
+    if (dimension < 0) return xla::DynExpr::_(-999);
     const size_t dim = static_cast<size_t>(dimension);
     if (dim >= expressions_.size()) {
-      return nullptr;
+      return xla::DynExpr::_(-999);
     }
-    return expressions_[dim];
+    return expressions_[dim] != nullptr ? expressions_[dim]
+                                        : xla::DynExpr::_(-999);
   }
 
  protected:

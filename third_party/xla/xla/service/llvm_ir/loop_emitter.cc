@@ -200,7 +200,7 @@ std::vector<IrArray::Index> LoopEmitter::EmitIndexAndSetExitBasicBlock(
   bool dynamic = false;
   for (int i = 0; i < shape_.dimensions_size(); i++) {
     auto expr = shape_.expressions(i);
-    if (expr->is_dynamic()) {
+    if (expr != nullptr && expr->is_dynamic()) {
       dynamic_dims[i] = xla::llvm_ir::EmitExpression(b_, expr);
       shape_.set_dynamic_dimension(i, true);
       dynamic = true;

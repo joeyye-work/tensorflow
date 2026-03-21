@@ -759,18 +759,23 @@ Shape ShapeUtil::PrependMajorDimension(int64_t bound, Shape shape) {
     } else {
       // Only print constant expression if it is different than the dimension
       // (i.e. it is wrong!)
-      bool is_wrong = shape.expressions(i)->is_constant() &&
-                      shape.expressions(i)->get_val() != shape.dimensions(i);
+      DynExpr* expr = shape.expressions(i);
+      bool is_wrong = expr != nullptr && expr->is_constant() &&
+                      expr->get_val() != shape.dimensions(i);
       printer->Append(shape.dimensions(i));
       if (is_wrong) {
-        LOG(ERROR) << "THIS SHOULD NEVER HAPPEN! " << shape.ToString();
+        xla::StringPrinter expr_printer;
+        expr->print(&expr_printer);
+        LOG(ERROR) << "Mismatched static shape expression at dim " << i
+                   << ": dim=" << shape.dimensions(i)
+                   << ", expr=" << std::move(expr_printer).ToString();
         printer->Append("<!");
-        shape.expressions(i)->print(printer);
+        expr->print(printer);
         printer->Append("!>");
       }
-      if (shape.expressions(i) && (shape.expressions(i)->is_dynamic())) {
+      if (expr != nullptr && expr->is_dynamic()) {
         printer->Append("<");
-        shape.expressions(i)->print(printer);
+        expr->print(printer);
         printer->Append(">");
       }
     }

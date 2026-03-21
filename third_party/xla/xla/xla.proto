@@ -222,7 +222,7 @@ message DebugOptions {
   // When true, XLA:CPU uses XNNPACK to execute supported operations.
   bool xla_cpu_use_xnnpack = 359;
 
-  string xla_compile_batch_sizes = 389;
+  string xla_compile_batch_sizes = 399;
 
   // Enabling this will enable optimizations that ignore the possibility of NaN.
   bool xla_enable_fast_math = 335;

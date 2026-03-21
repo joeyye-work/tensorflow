@@ -18,7 +18,7 @@ class ExprSub;
 class ExprMul;
 class ExprDiv;
 
-// DynExpr: Base class for symbolic expressions representing dynamic dimension
+// DimExpr: Base class for symbolic expressions representing dynamic dimension
 // sizes. These expressions form a DAG that tracks how unknown dimensions relate
 // to each other through arithmetic operations.
 //
@@ -28,7 +28,7 @@ class ExprDiv;
 //   - Add/Sub/Mul/Div(lhs, rhs): Binary arithmetic operations
 //
 // INVARIANT: An unknown dimension is not just -1, it is -1 + Var(sym).
-class DynExpr {
+class DimExpr {
  public:
   enum class Kind : uint8_t {
     kConstant,
@@ -39,7 +39,7 @@ class DynExpr {
     kDiv,
   };
 
-  virtual ~DynExpr() = default;
+  virtual ~DimExpr() = default;
 
   virtual Kind kind() const = 0;
   virtual void ToProto(ExpressionProto* proto) const = 0;
@@ -48,24 +48,24 @@ class DynExpr {
   virtual int64_t ConstantValue() const { return 0; }
 
   // Factory methods - return owning pointers
-  static std::unique_ptr<DynExpr> Cons(int64_t val);
-  static std::unique_ptr<DynExpr> Var(int32_t var_id);
+  static std::unique_ptr<DimExpr> Cons(int64_t val);
+  static std::unique_ptr<DimExpr> Var(int32_t var_id);
 
   // Structural equality check
-  static bool Equals(const DynExpr* a, const DynExpr* b);
+  static bool Equals(const DimExpr* a, const DimExpr* b);
 
   // Build from proto (owns all returned nodes)
-  static std::unique_ptr<DynExpr> FromProto(const ExpressionProto& proto);
+  static std::unique_ptr<DimExpr> FromProto(const ExpressionProto& proto);
 
   // Debug representation
   std::string DebugString() const;
 
  protected:
-  DynExpr() = default;
+  DimExpr() = default;
 };
 
 // Constant expression node: represents a known integer value
-class Constant final : public DynExpr {
+class Constant final : public DimExpr {
  public:
   explicit Constant(int64_t value) : value_(value) {}
 
@@ -84,7 +84,7 @@ class Constant final : public DynExpr {
 };
 
 // Variable expression node: represents a symbolic unknown dimension
-class Variable final : public DynExpr {
+class Variable final : public DimExpr {
  public:
   explicit Variable(int32_t id) : id_(id) {}
 
@@ -100,9 +100,9 @@ class Variable final : public DynExpr {
 };
 
 // Addition expression node
-class ExprAdd final : public DynExpr {
+class ExprAdd final : public DimExpr {
  public:
-  ExprAdd(DynExpr* lhs, DynExpr* rhs) : lhs_(lhs), rhs_(rhs) {}
+  ExprAdd(DimExpr* lhs, DimExpr* rhs) : lhs_(lhs), rhs_(rhs) {}
 
   Kind kind() const override { return Kind::kAdd; }
   void ToProto(ExpressionProto* proto) const override {
@@ -118,18 +118,18 @@ class ExprAdd final : public DynExpr {
     return lhs_->ConstantValue() + rhs_->ConstantValue();
   }
 
-  DynExpr* lhs() const { return lhs_; }
-  DynExpr* rhs() const { return rhs_; }
+  DimExpr* lhs() const { return lhs_; }
+  DimExpr* rhs() const { return rhs_; }
 
  private:
-  DynExpr* lhs_;
-  DynExpr* rhs_;
+  DimExpr* lhs_;
+  DimExpr* rhs_;
 };
 
 // Subtraction expression node
-class ExprSub final : public DynExpr {
+class ExprSub final : public DimExpr {
  public:
-  ExprSub(DynExpr* lhs, DynExpr* rhs) : lhs_(lhs), rhs_(rhs) {}
+  ExprSub(DimExpr* lhs, DimExpr* rhs) : lhs_(lhs), rhs_(rhs) {}
 
   Kind kind() const override { return Kind::kSub; }
   void ToProto(ExpressionProto* proto) const override {
@@ -145,18 +145,18 @@ class ExprSub final : public DynExpr {
     return lhs_->ConstantValue() - rhs_->ConstantValue();
   }
 
-  DynExpr* lhs() const { return lhs_; }
-  DynExpr* rhs() const { return rhs_; }
+  DimExpr* lhs() const { return lhs_; }
+  DimExpr* rhs() const { return rhs_; }
 
  private:
-  DynExpr* lhs_;
-  DynExpr* rhs_;
+  DimExpr* lhs_;
+  DimExpr* rhs_;
 };
 
 // Multiplication expression node
-class ExprMul final : public DynExpr {
+class ExprMul final : public DimExpr {
  public:
-  ExprMul(DynExpr* lhs, DynExpr* rhs) : lhs_(lhs), rhs_(rhs) {}
+  ExprMul(DimExpr* lhs, DimExpr* rhs) : lhs_(lhs), rhs_(rhs) {}
 
   Kind kind() const override { return Kind::kMul; }
   void ToProto(ExpressionProto* proto) const override {
@@ -172,18 +172,18 @@ class ExprMul final : public DynExpr {
     return lhs_->ConstantValue() * rhs_->ConstantValue();
   }
 
-  DynExpr* lhs() const { return lhs_; }
-  DynExpr* rhs() const { return rhs_; }
+  DimExpr* lhs() const { return lhs_; }
+  DimExpr* rhs() const { return rhs_; }
 
  private:
-  DynExpr* lhs_;
-  DynExpr* rhs_;
+  DimExpr* lhs_;
+  DimExpr* rhs_;
 };
 
 // Division expression node
-class ExprDiv final : public DynExpr {
+class ExprDiv final : public DimExpr {
  public:
-  ExprDiv(DynExpr* lhs, DynExpr* rhs) : lhs_(lhs), rhs_(rhs) {}
+  ExprDiv(DimExpr* lhs, DimExpr* rhs) : lhs_(lhs), rhs_(rhs) {}
 
   Kind kind() const override { return Kind::kDiv; }
   void ToProto(ExpressionProto* proto) const override {
@@ -200,19 +200,19 @@ class ExprDiv final : public DynExpr {
     return (r == 0) ? 0 : lhs_->ConstantValue() / r;
   }
 
-  DynExpr* lhs() const { return lhs_; }
-  DynExpr* rhs() const { return rhs_; }
+  DimExpr* lhs() const { return lhs_; }
+  DimExpr* rhs() const { return rhs_; }
 
  private:
-  DynExpr* lhs_;
-  DynExpr* rhs_;
+  DimExpr* lhs_;
+  DimExpr* rhs_;
 };
 
 // Simplify an expression tree: constant folding and algebraic identities.
 // Returns a NEW expression (does not mutate input).
 // The arena parameter is used to allocate nodes that will be owned externally.
-DynExpr* SimplifyExpr(DynExpr* expr,
-                      std::vector<std::unique_ptr<DynExpr>>* arena);
+DimExpr* SimplifyExpr(DimExpr* expr,
+                      std::vector<std::unique_ptr<DimExpr>>* arena);
 
 }  // namespace tensorflow
 

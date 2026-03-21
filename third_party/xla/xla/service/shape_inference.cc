@@ -3857,7 +3857,7 @@ ShapeInference::InferCollectivePermuteDoneShape(const Shape& operand_shape) {
       ShapeUtil::MakeShape(operand.element_type(), dimensions, expressions);
 
   if (expressions.empty() && operand.expressions().size() > 0 &&
-      operand.expressions(0)->is_dynamic()) {
+      operand.expressions(0) != nullptr && operand.expressions(0)->is_dynamic()) {
     return InvalidArgument("Expressions is empty but operand is dynamic");
   }
 

@@ -249,7 +249,7 @@ void InferenceContext::ShapeHandleToProto(ShapeHandle handle,
     } else {
       dim_shape->set_size(-1);
       // Serialize expression if available.
-      if (DynExpr* expr = DimExpr(dim)) {
+      if (DimExpr* expr = GetDimExpr(dim)) {
         expr->ToProto(dim_shape->mutable_expr());
       }
     }
@@ -287,25 +287,25 @@ DimensionHandle InferenceContext::NumElements(ShapeHandle s) {
 }
 
 DimensionHandle InferenceContext::UnknownDimWithExpr(
-    std::unique_ptr<DynExpr> expr) {
-  DynExpr* owned = shape_manager_.OwnExpr(std::move(expr));
+    std::unique_ptr<DimExpr> expr) {
+  DimExpr* owned = shape_manager_.OwnExpr(std::move(expr));
   return shape_manager_.MakeDim(kUnknownDim, /*dynamic_ratio*/0, owned);
 }
 
-DynExpr* InferenceContext::DimExpr(DimensionHandle d) const {
+DimExpr* InferenceContext::GetDimExpr(DimensionHandle d) const {
   if (!d.IsSet()) return nullptr;
   return d->expr_;
 }
 
-DynExpr* InferenceContext::MakeConstExpr(int64_t v) {
+DimExpr* InferenceContext::MakeConstExpr(int64_t v) {
   return shape_manager_.OwnExpr(std::make_unique<Constant>(v));
 }
 
-DynExpr* InferenceContext::ExprForDim(DimensionHandle d) {
+DimExpr* InferenceContext::ExprForDim(DimensionHandle d) {
   if (!d.IsSet()) return nullptr;
 
   // If already tagged with expr, use it.
-  if (DynExpr* e = DimExpr(d)) return e;
+  if (DimExpr* e = GetDimExpr(d)) return e;
 
   // Known dim -> const expr.
   if (ValueKnown(d)) {
@@ -980,9 +980,9 @@ absl::Status InferenceContext::MakeShapeFromShapeProto(
       if (dim_proto.has_expr() && dim_proto.expr().node_type_case() !=
                                       ExpressionProto::NODE_TYPE_NOT_SET) {
         // Deserialize expression
-        std::unique_ptr<DynExpr> expr = DynExpr::FromProto(dim_proto.expr());
+        std::unique_ptr<DimExpr> expr = DimExpr::FromProto(dim_proto.expr());
         if (expr) {
-          DynExpr* owned = shape_manager_.OwnExpr(std::move(expr));
+          DimExpr* owned = shape_manager_.OwnExpr(std::move(expr));
           dims.push_back(shape_manager_.MakeDim(kUnknownDim,/*dynamic_ratio */ 0, owned));
         } else {
           dims.push_back(UnknownDim());
@@ -1124,11 +1124,11 @@ absl::Status InferenceContext::Divide(DimensionHandle dividend,
     return absl::OkStatus();
   }
   // At least one operand unknown: try to build expression.
-  DynExpr* lhs = ExprForDim(dividend);
-  DynExpr* rhs = divisor.dim.IsSet() ? ExprForDim(divisor.dim)
+  DimExpr* lhs = ExprForDim(dividend);
+  DimExpr* rhs = divisor.dim.IsSet() ? ExprForDim(divisor.dim)
                                      : MakeConstExpr(divisor.val);
   if (lhs && rhs) {
-    DynExpr* node = shape_manager_.OwnExpr(
+    DimExpr* node = shape_manager_.OwnExpr(
         std::make_unique<ExprDiv>(lhs, rhs));
     *out = shape_manager_.MakeDim(kUnknownDim, /*dynamic_ratio*/0, node);
   } else {
@@ -1166,12 +1166,12 @@ absl::Status InferenceContext::Add(DimensionHandle first,
   }
 
   // At least one operand unknown: try to build expression.
-  DynExpr* lhs = ExprForDim(first);
-  DynExpr* rhs =
+  DimExpr* lhs = ExprForDim(first);
+  DimExpr* rhs =
       second.dim.IsSet() ? ExprForDim(second.dim) : MakeConstExpr(second.val);
 
   if (lhs && rhs) {
-    DynExpr* node = shape_manager_.OwnExpr(std::make_unique<ExprAdd>(lhs, rhs));
+    DimExpr* node = shape_manager_.OwnExpr(std::make_unique<ExprAdd>(lhs, rhs));
     *out = shape_manager_.MakeDim(kUnknownDim, /*dynamic_ratio*/ 0, node);
   } else {
     *out = UnknownDim();  // Can't form expr.
@@ -1202,11 +1202,11 @@ absl::Status InferenceContext::Subtract(DimensionHandle first,
     return absl::OkStatus();
   }
   // At least one operand unknown: try to build expression.
-  DynExpr* lhs = ExprForDim(first);
-  DynExpr* rhs =
+  DimExpr* lhs = ExprForDim(first);
+  DimExpr* rhs =
       second.dim.IsSet() ? ExprForDim(second.dim) : MakeConstExpr(second.val);
   if (lhs && rhs) {
-    DynExpr* node = shape_manager_.OwnExpr(std::make_unique<ExprSub>(lhs, rhs));
+    DimExpr* node = shape_manager_.OwnExpr(std::make_unique<ExprSub>(lhs, rhs));
     *out = shape_manager_.MakeDim(kUnknownDim, /*dynamic_ratio*/ 0, node);
   } else {
     *out = UnknownDim();  // Can't form expr.
@@ -1253,12 +1253,12 @@ absl::Status InferenceContext::Multiply(DimensionHandle first,
   }
 
   // At least one operand unknown: try to build expression.
-  DynExpr* lhs = ExprForDim(first);
-  DynExpr* rhs =
+  DimExpr* lhs = ExprForDim(first);
+  DimExpr* rhs =
       second.dim.IsSet() ? ExprForDim(second.dim) : MakeConstExpr(second.val);
 
   if (lhs && rhs) {
-    DynExpr* node = shape_manager_.OwnExpr(std::make_unique<ExprMul>(lhs, rhs));
+    DimExpr* node = shape_manager_.OwnExpr(std::make_unique<ExprMul>(lhs, rhs));
     *out = shape_manager_.MakeDim(kUnknownDim, /*dynamic_ratio*/ 0, node);
   } else {
     *out = UnknownDim();  // Can't form expr.

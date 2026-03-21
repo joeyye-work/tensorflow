@@ -165,6 +165,7 @@ class TensorArrayOp : public XlaOpKernel {
       CHECK(element_shape_.AsTensorShape(&shape));
       TensorShape ta_shape;
       ta_shape.AddDim(size);
+      ta_shape.AddExpression(xla::DynExpr::_(size));
       ta_shape.AppendShape(shape);
       xla::XlaOp zero = XlaHelpers::Zero(b, dtype_);
       value = xla::Broadcast(zero, ta_shape.dim_sizes(),

@@ -85,16 +85,17 @@ class ReshapeOp : public XlaOpKernel {
                     errors::InvalidArgument(
                         "size ", d, " must be non-negative, not ", size));
         shape.AddDim(size);
-        if (d < input_shape.dims() &&
-            input_shape.get_expression(d)->is_dynamic()) {
+        xla::DynExpr* input_expr =
+            d < input_shape.dims() ? input_shape.get_expression(d) : nullptr;
+        if (input_expr != nullptr && input_expr->is_dynamic()) {
           int old = input_shape.dim_size(d);
           bool is_split = (old > size);
           int local_ratio = ratio * (is_split ? old / size : size / old);
           xla::DynExpr* new_expr =
               (size > old)
-                  ? *input_shape.get_expression(d) *
+                  ? *input_expr *
                         *xla::DynExpr::_(local_ratio)  // Split [xy] -> [x/y,y]
-                  : *input_shape.get_expression(d) /
+                  : *input_expr /
                         *xla::DynExpr::_(local_ratio);  // Reduce [x,y] -> [x*y]
 
           // Pass ratio to next dimension if this is a split, otherwise just
@@ -176,6 +177,7 @@ class ReshapeOp : public XlaOpKernel {
       shape.set_expression(
           unknown_index, missing_expr->s());
     }
+
     OP_REQUIRES(ctx, shape.num_elements() == input_shape.num_elements(),
                 errors::InvalidArgument("Input to reshape is a tensor with ",
                                         input_shape.num_elements(),

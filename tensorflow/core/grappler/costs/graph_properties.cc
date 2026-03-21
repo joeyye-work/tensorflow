@@ -1420,9 +1420,9 @@ class SymbolicShapeRefiner {
     if (node->op() == "_Arg") {
       var_id *= -1;
       // var_id would be minus when it's argument.
-      dim = c->UnknownDimWithExpr(DynExpr::Var(var_id));
+      dim = c->UnknownDimWithExpr(DimExpr::Var(var_id));
     } else {
-      dim = c->UnknownDimWithExpr(DynExpr::Var(var_id));
+      dim = c->UnknownDimWithExpr(DimExpr::Var(var_id));
     }
     VLOG(1) << "[EXPR] GetUnknownOutputDim: node=" << node->name()
             << " out=" << index << " dim=" << dim_id << " -> Var(" << var_id
@@ -2052,9 +2052,22 @@ class SymbolicShapeRefiner {
           continue;
         }
         // If already tagged with expr, keep it.
-        if (ic->DimExpr(dim) != nullptr) {
+        auto* dim_expr = ic->GetDimExpr(dim);
+        if (dim_expr != nullptr) {
           dims.push_back(dim);
           continue;
+        }
+        auto output_shapes_it = node->attr().find("_output_shapes");
+        if (output_shapes_it != node->attr().end() &&
+            out < output_shapes_it->second.list().shape_size() &&
+            d < output_shapes_it->second.list().shape(out).dim_size()) {
+          const int64_t annotated_size =
+              output_shapes_it->second.list().shape(out).dim(d).size();
+          if (annotated_size >= 0) {
+            changed = true;
+            dims.push_back(ic->MakeDim(annotated_size));
+            continue;
+          }
         }
         // Canonicalize ALL unknown dims.
         DimensionHandle canon = GetUnknownOutputDim(node, out, d);
@@ -2299,32 +2312,32 @@ class SymbolicShapeManager {
 
  private:
   // Get the variable ID from an expression, or -1 if not a variable.
-  static int32_t GetVarId(const DynExpr* e) {
-    if (!e || e->kind() != DynExpr::Kind::kVariable) return -1;
+  static int32_t GetVarId(const DimExpr* e) {
+    if (!e || e->kind() != DimExpr::Kind::kVariable) return -1;
     return static_cast<const Variable*>(e)->id();
   }
 
-  static bool IsConst(const DynExpr* e) {
-    return e && e->kind() == DynExpr::Kind::kConstant;
+  static bool IsConst(const DimExpr* e) {
+    return e && e->kind() == DimExpr::Kind::kConstant;
   }
 
-  static bool IsVar(const DynExpr* e) {
-    return e && e->kind() == DynExpr::Kind::kVariable;
+  static bool IsVar(const DimExpr* e) {
+    return e && e->kind() == DimExpr::Kind::kVariable;
   }
 
-  static bool IsPlaceHolder(const DynExpr* e) {
+  static bool IsPlaceHolder(const DimExpr* e) {
     if (!e) return false;
-    if (e->kind() != DynExpr::Kind::kVariable) return false;
+    if (e->kind() != DimExpr::Kind::kVariable) return false;
     return static_cast<const Variable*>(e)->id() < 0;
   }
 
-  static bool IsCompound(const DynExpr* e) {
+  static bool IsCompound(const DimExpr* e) {
     if (!e) return false;
     switch (e->kind()) {
-      case DynExpr::Kind::kAdd:
-      case DynExpr::Kind::kSub:
-      case DynExpr::Kind::kMul:
-      case DynExpr::Kind::kDiv:
+      case DimExpr::Kind::kAdd:
+      case DimExpr::Kind::kSub:
+      case DimExpr::Kind::kMul:
+      case DimExpr::Kind::kDiv:
         return true;
       default:
         return false;
@@ -2332,7 +2345,7 @@ class SymbolicShapeManager {
   }
 
   // Ranking: Const > Arg_ > Compound > Var > null
-  static int InfoScore(const DynExpr* e) {
+  static int InfoScore(const DimExpr* e) {
     if (!e) return 0;
     if (IsConst(e)) return 4;
     if (IsPlaceHolder(e)) return 3;
@@ -2342,7 +2355,7 @@ class SymbolicShapeManager {
   }
 
   // Prefer "more informative" but keep deterministic tie-break.
-  static DynExpr* PreferMoreInformative(DynExpr* a, DynExpr* b) {
+  static DimExpr* PreferMoreInformative(DimExpr* a, DimExpr* b) {
     if (a == b) return a;
     const int sa = InfoScore(a);
     const int sb = InfoScore(b);
@@ -2353,7 +2366,7 @@ class SymbolicShapeManager {
   }
 
   // Get the expr pointer from a dimension handle (accesses private member).
-  static DynExpr* GetExprFromDimHandle(const DimensionHandle& d) {
+  static DimExpr* GetExprFromDimHandle(const DimensionHandle& d) {
     if (!d.IsSet()) return nullptr;
     return d->expr_;
   }
@@ -2384,22 +2397,22 @@ class SymbolicShapeManager {
     void* r2 = dims_.RootId(d2);
 
     // Fetch best-known expr for each set.
-    auto get_best = [&](void* r, DimensionHandle d) -> DynExpr* {
+    auto get_best = [&](void* r, DimensionHandle d) -> DimExpr* {
       auto it = dim_root_expr_.find(r);
       if (it != dim_root_expr_.end()) return it->second;
       return ExprForDim(d);  // may be null
     };
 
-    DynExpr* e1 = get_best(r1, d1);
-    DynExpr* e2 = get_best(r2, d2);
+    DimExpr* e1 = get_best(r1, d1);
+    DimExpr* e2 = get_best(r2, d2);
 
     // If already in same UF set, just keep the most informative expr.
     if (r1 == r2) {
-      DynExpr* existing = nullptr;
+      DimExpr* existing = nullptr;
       if (auto it = dim_root_expr_.find(r1); it != dim_root_expr_.end()) {
         existing = it->second;
       }
-      DynExpr* chosen = PreferMoreInformative(existing,
+      DimExpr* chosen = PreferMoreInformative(existing,
                                             PreferMoreInformative(e1, e2));
       if (chosen) dim_root_expr_[r1] = chosen;  // keep or upgrade
       return absl::OkStatus();
@@ -2412,7 +2425,7 @@ class SymbolicShapeManager {
     void* new_root = dims_.RootId(d1);
 
     // Choose best expr across both sets.
-    DynExpr* chosen = PreferMoreInformative(e1, e2);
+    DimExpr* chosen = PreferMoreInformative(e1, e2);
 
     // Remove stale root keys (only the old roots).
     dim_root_expr_.erase(r1);
@@ -2430,7 +2443,7 @@ class SymbolicShapeManager {
   DisjointSet<shape_inference::ShapeHandle> shapes_;
   absl::flat_hash_map<int64_t, std::unique_ptr<DimExpr>> const_exprs_;
   // Map from union-find root pointer to the best expression for that set.
-  absl::flat_hash_map<void*, DynExpr*> dim_root_expr_;
+  absl::flat_hash_map<void*, DimExpr*> dim_root_expr_;
   DisjointSet<shape_inference::DimensionHandle> dims_;
 };
 
