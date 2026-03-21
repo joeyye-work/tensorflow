@@ -1996,38 +1996,37 @@ class SymbolicShapeRefiner {
     for (int out = 0; out < ic->num_outputs(); ++out) {
       ShapeHandle s = ic->output(out);
 
-      if (!ic->RankKnown(s) && node->op() == "_Arg") {
-        // Treat batched function arguments as vectors with batch dim at dim0.
-        DimensionHandle d0 = GetUnknownOutputDim(node, out, /*dim_index=*/0);
-        ShapeHandle vec = ic->MakeShape({d0});
-        ic->set_output(out, vec);
-        s = vec;
-      }
-
-      if (!ic->RankKnown(s)){
-        //if Rank is not realized yet, get it from attr.
+      if (!ic->RankKnown(s)) {
         auto it = node->attr().find("_output_shapes");
-        if (it != node->attr().end() && it->second.list().shape_size()>0){
-          const TensorShapeProto& proto = it->second.list().shape(out);
-
-          std::vector<DimensionHandle> dims;
-          dims.reserve(proto.dim_size());
-
-          for(int d=0; d<proto.dim_size();++d){
-            int64_t size = proto.dim(d).size();
-            if (size >=0){
-              dims.push_back(ic->MakeDim(size));
-            } else {
-              dims.push_back(GetUnknownOutputDim(node, out, d));
-            }
-          }
-          s = ic->MakeShape(dims);
-          ic->set_output(out,s);
-        }else {
-          VLOG(1) << "RANK still unknown." << node->name();
+        if (it == node->attr().end() || out >= it->second.list().shape_size()) {
+          VLOG(1) << "RANK still unknown. " << node->name();
           continue;
         }
+
+        const TensorShapeProto& proto = it->second.list().shape(out);
+        if (proto.unknown_rank()) {
+          continue;
+        }
+
+        std::vector<DimensionHandle> dims;
+        dims.reserve(proto.dim_size());
+
+        for (int d = 0; d < proto.dim_size(); ++d) {
+          int64_t size = proto.dim(d).size();
+          if (size >= 0) {
+            dims.push_back(ic->MakeDim(size));
+          } else {
+            dims.push_back(GetUnknownOutputDim(node, out, d));
+          }
+        }
+        s = ic->MakeShape(dims);
+        ic->set_output(out, s);
       }
+
+      if (!ic->RankKnown(s)) {
+        continue;
+      }
+
       bool changed = false;
       std::vector<DimensionHandle> dims;
       dims.reserve(ic->Rank(s));

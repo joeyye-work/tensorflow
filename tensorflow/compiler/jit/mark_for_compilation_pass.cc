@@ -135,6 +135,8 @@ class MarkForCompilationPassImpl {
     int annotate_cluster_id;
 
     bool enable_cluster_parallel;
+
+    bool cluster_single_dynamic_dim;  // New flag to control single dynamic dim clustering
   };
 
   MarkForCompilationPassImpl(DebugOptions debug_options, Graph* graph,
@@ -261,9 +263,12 @@ class MarkForCompilationPassImpl {
     void set_annotated_id(int id) { annotated_id_ = id; }
     int chain_id() const {return chain_id_;}
     void set_chain_id(int id) {chain_id_ = id;}
+    void add_dim_var(int dim_var) { dim_vars_.insert(dim_var); }
+    const std::set<int>& dim_vars() const { return dim_vars_; }
 
    private:
     int annotated_id_ = -1;
+    std::set<int> dim_vars_;
     int chain_id_ = -1;
     int cluster_size_ = 1;
     int cycles_graph_node_id_;
@@ -337,6 +342,7 @@ class MarkForCompilationPassImpl {
   }
 
   absl::Status AssignAnnotatedClusterIDs();
+  absl::Status AssignDimVars();
   void collectInputNodes(std::set<Node*> &path_nodes);
   void collectMergeNodes(const std::vector<Node*>& nodeSet,
                          std::set<Node*> &merger_nodes);
@@ -680,6 +686,166 @@ absl::Status IgnoreResourceOpForSafetyAnalysis(
   }
   return absl::OkStatus();
 }
+// node mapping to multiple vectors of expressions (one for each output in
+// order)
+static std::map<std::string, std::vector<std::vector<std::unique_ptr<DimExpr>>>>
+    expr_map;
+// Helper to convert ExpressionProto to a readable string.
+std::string ExprProtoToString(const ExpressionProto& e) {
+  switch (e.node_type_case()) {
+    case ExpressionProto::kConstantValue:
+      return std::to_string(e.constant_value());
+    case ExpressionProto::kVariableId:
+      return absl::StrCat("Var(", e.variable_id(), ")");
+    case ExpressionProto::kAddNode:
+      return absl::StrCat("(", ExprProtoToString(e.add_node().lhs()), " + ",
+                         ExprProtoToString(e.add_node().rhs()), ")");
+    case ExpressionProto::kSubNode:
+      return absl::StrCat("(", ExprProtoToString(e.sub_node().lhs()), " - ",
+                         ExprProtoToString(e.sub_node().rhs()), ")");
+    case ExpressionProto::kMulNode:
+      return absl::StrCat("(", ExprProtoToString(e.mul_node().lhs()), " * ",
+                         ExprProtoToString(e.mul_node().rhs()), ")");
+    case ExpressionProto::kDivNode:
+      return absl::StrCat("(", ExprProtoToString(e.div_node().lhs()), " / ",
+                         ExprProtoToString(e.div_node().rhs()), ")");
+    default:
+      return "<none>";
+  }
+}
+
+std::unique_ptr<DimExpr> ExprFromProto(const ExpressionProto& proto) {
+  switch (proto.node_type_case()) {
+    case ExpressionProto::kConstantValue:
+      return DimExpr::Cons(proto.constant_value());
+    case ExpressionProto::kVariableId:
+      return DimExpr::Var(proto.variable_id());
+    case ExpressionProto::kAddNode: {
+      auto lhs = ExprFromProto(proto.add_node().lhs());
+      auto rhs = ExprFromProto(proto.add_node().rhs());
+      // Note: These are owning pointers, but ExprAdd takes raw pointers.
+      // The caller must manage lifetime appropriately.
+      return std::make_unique<ExprAdd>(lhs.release(), rhs.release());
+    }
+    case ExpressionProto::kSubNode: {
+      auto lhs = ExprFromProto(proto.sub_node().lhs());
+      auto rhs = ExprFromProto(proto.sub_node().rhs());
+      return std::make_unique<ExprSub>(lhs.release(), rhs.release());
+    }
+    case ExpressionProto::kMulNode: {
+      auto lhs = ExprFromProto(proto.mul_node().lhs());
+      auto rhs = ExprFromProto(proto.mul_node().rhs());
+      return std::make_unique<ExprMul>(lhs.release(), rhs.release());
+    }
+    case ExpressionProto::kDivNode: {
+      auto lhs = ExprFromProto(proto.div_node().lhs());
+      auto rhs = ExprFromProto(proto.div_node().rhs());
+      return std::make_unique<ExprDiv>(lhs.release(), rhs.release());
+    }
+    case ExpressionProto::NODE_TYPE_NOT_SET:
+    default:
+      return nullptr;
+  }
+}
+
+static xla::DynExpr* DimExprToDynExpr(const DimExpr* e) {
+  switch (e->kind()) {
+    case DimExpr::Kind::kConstant: {
+      auto* ac = static_cast<const Constant*>(e);
+      return xla::DynExpr::_(ac->value());
+    }
+    case DimExpr::Kind::kVariable: {
+      auto* av = static_cast<const Variable*>(e);
+      return xla::DynExpr::V(av->id());  // Use 1 all the time for now
+    }
+    case DimExpr::Kind::kAdd: {
+      auto* ee = static_cast<const ExprAdd*>(e);
+      return *DimExprToDynExpr(ee->lhs()) + *DimExprToDynExpr(ee->rhs());
+    }
+    case DimExpr::Kind::kSub: {
+      auto* ee = static_cast<const ExprSub*>(e);
+      return *DimExprToDynExpr(ee->lhs()) - *DimExprToDynExpr(ee->rhs());
+    }
+    case DimExpr::Kind::kMul: {
+      auto* ee = static_cast<const ExprMul*>(e);
+      return *DimExprToDynExpr(ee->lhs()) * *DimExprToDynExpr(ee->rhs());
+    }
+    case DimExpr::Kind::kDiv: {
+      auto* ee = static_cast<const ExprDiv*>(e);
+      return *DimExprToDynExpr(ee->lhs()) / *DimExprToDynExpr(ee->rhs());
+    }
+  }
+  return nullptr;
+}
+
+// Runs Grappler static inference and logs any ExpressionProto found in output
+// tensor shapes (from GraphProperties, not from _output_shapes attrs).
+void LogExpressionsViaGraphProperties(const tensorflow::Graph& graph) {
+  using tensorflow::ExpressionProto;
+  using tensorflow::GraphDef;
+  using tensorflow::NodeDef;
+  using tensorflow::TensorShapeProto;
+  using tensorflow::grappler::GraphProperties;
+  using tensorflow::grappler::GrapplerItem;
+
+  GraphDef graph_def;
+  graph.ToGraphDef(&graph_def);
+
+  GrapplerItem item;
+  item.id = "mark_for_compilation_pass_expr_dump";
+  item.graph = graph_def;
+
+  GraphProperties props(item);
+
+  absl::Status st = props.InferStatically(
+      /*assume_valid_feeds=*/false,
+      /*aggressive_shape_inference=*/false,
+      /*include_input_tensor_values=*/false,
+      /*include_output_tensor_values=*/false);
+
+  if (!st.ok()) {
+    LOG(ERROR) << "[EXPR][GP] InferStatically failed: " << st.message();
+    return;
+  }
+
+  int found = 0;
+  VLOG(1) << "[EXPR][GP] === GraphProperties output expr dump ===";
+
+
+  for (const NodeDef& n : graph_def.node()) {
+    if (!props.HasOutputProperties(n.name())) continue;
+    const auto& outs = props.GetOutputProperties(n.name());
+    std::vector<std::vector<std::unique_ptr<DimExpr>>> list_exprs(outs.size());
+    for (int out_idx = 0; out_idx < static_cast<int>(outs.size()); ++out_idx) {
+      const auto& tp = outs[out_idx];
+      const TensorShapeProto& shp = tp.shape();
+
+      if (shp.unknown_rank()) continue;
+      std::vector<std::unique_ptr<DimExpr>> exprs;
+      for (int d = 0; d < shp.dim_size(); ++d) {
+        const auto& dim = shp.dim(d);
+
+        const ExpressionProto& expr = dim.expr();
+        if (expr.node_type_case() == ExpressionProto::NODE_TYPE_NOT_SET)
+          continue;
+
+        VLOG(1) << "Node " << n.name() << " has expression "
+                << ExprProtoToString(expr);
+
+        auto ex = ExprFromProto(expr);
+        exprs.push_back(std::move(ex));
+
+        ++found;
+      }
+      list_exprs[out_idx] = std::move(exprs);
+    }
+    expr_map[n.name()] = std::move(list_exprs);
+
+  }
+
+  VLOG(1) << "[EXPR][GP] === Found " << found
+          << " expressions via GraphProperties ===";
+}
 
 absl::StatusOr<bool> MarkForCompilationPassImpl::Initialize() {
   TF_RET_CHECK(!initialized_ && !edges_contracted_ && !clusters_created_);
@@ -720,6 +886,10 @@ absl::StatusOr<bool> MarkForCompilationPassImpl::Initialize() {
   // just interpreter the annotations and assign preferred IDs
   if (debug_options_.annotate_cluster_id) {
     TF_RETURN_IF_ERROR(AssignAnnotatedClusterIDs());
+  }
+  if (debug_options_.cluster_single_dynamic_dim) {
+    LogExpressionsViaGraphProperties(*graph_);
+    TF_RETURN_IF_ERROR(AssignDimVars());
   }
   if (debug_options_.enable_cluster_parallel) {
     TF_RETURN_IF_ERROR(AssignParallelChains());
@@ -1626,6 +1796,56 @@ absl::Status MarkForCompilationPassImpl::AssignAnnotatedClusterIDs(void) {
   return absl::OkStatus();
 }
 
+absl::Status MarkForCompilationPassImpl::AssignDimVars(void) {
+  for (Node* node : graph_->nodes()) {
+    auto node_name = node->name();
+    Cluster * cluster = GetClusterForNode(node);
+    if (!cluster) continue;
+    for (const tensorflow::Edge* edge : node->in_edges()) {
+      if (edge->IsControlEdge()) {
+          // Skip control edges if you are only interested in data edges
+          continue;
+      }
+
+      const tensorflow::Node* input = edge->src(); // Source node of the edge
+      auto it = expr_map.find(input->name());
+      if (it == expr_map.end()) {
+        VLOG(2) << "No expression found for node " << input->name();
+        continue;
+      }
+
+      auto output_index = edge->src_output(); // Output index of the source node
+      if (output_index >= (it->second).size()) {
+        LOG(INFO) << "Warning: Output index " << output_index << " is out of bounds for node " << input->name();
+        continue;
+      }
+      for (auto& pDim: (it->second)[output_index]) {
+        DimExpr * d= pDim.get();
+        xla::DynExpr * dyn = DimExprToDynExpr(d);
+        auto new_ids = dyn->get_all_ids();
+        for (auto id : new_ids) {
+          cluster->add_dim_var(id);
+          VLOG(2) << "Add dim var " << id << " to cluster of node "<< node_name;
+        }
+      }
+    }
+    // create a for loop for each dim vars in cluster and print each dim var
+    if (VLOG_IS_ON(2)) {
+      if (cluster->dim_vars().empty()) {
+        VLOG(2) << "Cluster of node " << node_name << " has no dim vars.";
+      }
+      else {
+        std::string id_str;
+        for (auto id : cluster->dim_vars()) {
+          id_str += "Dim var " + std::to_string(id) + ", ";
+        }
+        VLOG(2) << "Cluster of node " << node_name << " has dim vars:\n" << id_str;
+      }
+    }
+  }
+  return absl::OkStatus();
+}
+
 bool MarkForCompilationPassImpl::LogNotContractableAndReturnFalse(
     Cluster* from, Cluster* to, absl::string_view reason) {
   VLOG(3) << EdgeContractionFailureMsg(from, to, reason);
@@ -1850,6 +2070,18 @@ absl::StatusOr<bool> MarkForCompilationPassImpl::TryToContractEdge(
   if (debug_options_.annotate_cluster_id && from->annotated_id() != to->annotated_id()) {
     return LogNotContractableAndReturnFalse(
         from, to, "the two nodes do not have same annotated ids");
+  }
+
+  if (debug_options_.cluster_single_dynamic_dim) {
+    if (from->dim_vars().size() > 1 || to->dim_vars().size() > 1) {
+      return LogNotContractableAndReturnFalse(
+        from, to, "the two nodes have multiple dynamic dimensions");
+    }
+    if (from->dim_vars().size() == 1 && to->dim_vars().size() == 1 &&
+        from->dim_vars() != to->dim_vars()) {
+      return LogNotContractableAndReturnFalse(
+        from, to, "the two nodes have different dynamic dimensions");
+    }
   }
 
   TF_ASSIGN_OR_RETURN(bool devices_compatible,
@@ -2248,6 +2480,8 @@ absl::Status MarkForCompilationPass::Run(
   debug_options.dump_graphs = flags->tf_xla_clustering_debug;
   debug_options.annotate_cluster_id = flags->tf_xla_annotate_cluster_id;
   debug_options.enable_cluster_parallel = flags->tf_xla_cluster_parallel;
+  debug_options.cluster_single_dynamic_dim =
+      flags->tf_xla_cluster_single_dynamic_dim;  // Updated option name
 
   return MarkForCompilation(options, debug_options);
 }

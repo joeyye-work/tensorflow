@@ -90,13 +90,13 @@ void XlaBatchMatcher::print_all_batches() {
 void XlaBatchMatcher::parse_env_config() {
   // If the env var not set or is empty, filled with the nearest power of two by default
   if (!env_str_) {
-    LOG(INFO) << "[XLA_BATCH_WARN] Env var " << "--tf_xla_compile_batch_sizes" <<
+    VLOG(2) << "[XLA_BATCH_WARN] Env var " << "--tf_xla_compile_batch_sizes" <<
       " not set, filled with the nearest power of two by default";
     return;
   }
 
   if (std::string(env_str_).empty()) {
-    LOG(INFO) << "[XLA_BATCH_WARN] Env var " << "--tf_xla_compile_batch_sizes" <<
+    VLOG(2) << "[XLA_BATCH_WARN] Env var " << "--tf_xla_compile_batch_sizes" <<
         "is empty, filled with the nearest power of two by default";
     return;
   }
@@ -176,7 +176,7 @@ int64_t XlaBatchMatcher::get_xla_compile_batch(int64_t real_batch) {
   int64_t selected = find_min_larger_batch(real_batch);
   if (real_batch != last_batch_ || all_batches_.empty()) {
     last_batch_ = real_batch;
-    LOG(INFO) << "[XLA_BATCH_INFO] Real batch: " << real_batch
+    VLOG(2) << "[XLA_BATCH_INFO] Real batch: " << real_batch
       << " -> Selected compile batch: " << selected;
   }
   return selected;

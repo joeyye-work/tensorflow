@@ -28,7 +28,7 @@ limitations under the License.
 #include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/platform/status.h"
 #include "tensorflow/core/platform/statusor.h"
-#include "xla/shape.h"
+#include "xla/shape_dynexpr.h"
 
 namespace tensorflow {
 
@@ -95,10 +95,13 @@ class TensorShapeRep {
   // Return the multiplier for a specific dynamic dimension.
   // -1 if the dimension is not dynamic.
   xla::DynExpr* get_expression(int64_t dimension) const {
-    if (dimension >= expressions_.size()) {
+    // Guard against negative indices and avoid signed/unsigned comparison
+    if (dimension < 0) return nullptr;
+    const size_t dim = static_cast<size_t>(dimension);
+    if (dim >= expressions_.size()) {
       return nullptr;
     }
-    return expressions_[dimension];
+    return expressions_[dim];
   }
 
  protected:
