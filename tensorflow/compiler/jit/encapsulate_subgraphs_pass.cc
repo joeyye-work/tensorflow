@@ -26,6 +26,7 @@ limitations under the License.
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/types/optional.h"
+#include "tensorflow/compiler/jit/encapsulate_util.h"
 #include "tensorflow/compiler/jit/flags.h"
 #include "tensorflow/compiler/jit/mark_for_compilation_pass.h"
 #include "tensorflow/compiler/jit/shape_inference_helpers.h"
@@ -55,8 +56,6 @@ limitations under the License.
 #include "tensorflow/core/util/device_name_utils.h"
 #include "tensorflow/core/util/dump_graph.h"
 #include "tensorflow/core/framework/tensor_shape.pb.h"
-#include "tensorflow/core/grappler/costs/graph_properties.h"
-#include "tensorflow/core/grappler/grappler_item.h"
 namespace tensorflow {
 
 static const absl::flat_hash_set<absl::string_view> kFailingOps = {
@@ -144,109 +143,6 @@ std::string ExprProtoToString(const ExpressionProto& e) {
       return "<none>";
   }
 }
-
-std::map<std::string, std::vector<std::unique_ptr<DynExpr>>> test_map;
-
-std::unique_ptr<DynExpr> ExprFromProto(const ExpressionProto& proto) {
-  switch (proto.node_type_case()) {
-    case ExpressionProto::kConstantValue:
-      return DynExpr::Cons(proto.constant_value());
-    case ExpressionProto::kVariableId:
-      return DynExpr::Var(proto.variable_id());
-    case ExpressionProto::kAddNode: {
-      auto lhs = ExprFromProto(proto.add_node().lhs());
-      auto rhs = ExprFromProto(proto.add_node().rhs());
-      // Note: These are owning pointers, but ExprAdd takes raw pointers.
-      // The caller must manage lifetime appropriately.
-      return std::make_unique<ExprAdd>(lhs.release(), rhs.release());
-    }
-    case ExpressionProto::kSubNode: {
-      auto lhs = ExprFromProto(proto.sub_node().lhs());
-      auto rhs = ExprFromProto(proto.sub_node().rhs());
-      return std::make_unique<ExprSub>(lhs.release(), rhs.release());
-    }
-    case ExpressionProto::kMulNode: {
-      auto lhs = ExprFromProto(proto.mul_node().lhs());
-      auto rhs = ExprFromProto(proto.mul_node().rhs());
-      return std::make_unique<ExprMul>(lhs.release(), rhs.release());
-    }
-    case ExpressionProto::kDivNode: {
-      auto lhs = ExprFromProto(proto.div_node().lhs());
-      auto rhs = ExprFromProto(proto.div_node().rhs());
-      return std::make_unique<ExprDiv>(lhs.release(), rhs.release());
-    }
-    case ExpressionProto::NODE_TYPE_NOT_SET:
-    default:
-      return nullptr;
-  }
-}
-
-// Runs Grappler static inference and logs any ExpressionProto found in output
-// tensor shapes (from GraphProperties, not from _output_shapes attrs).
-void LogExpressionsViaGraphProperties(const tensorflow::Graph& graph) {
-  using tensorflow::ExpressionProto;
-  using tensorflow::GraphDef;
-  using tensorflow::NodeDef;
-  using tensorflow::TensorShapeProto;
-  using tensorflow::grappler::GraphProperties;
-  using tensorflow::grappler::GrapplerItem;
-
-  GraphDef graph_def;
-  graph.ToGraphDef(&graph_def);
-
-  GrapplerItem item;
-  item.id = "mark_for_compilation_pass_expr_dump";
-  item.graph = graph_def;
-
-  GraphProperties props(item);
-
-  absl::Status st = props.InferStatically(
-      /*assume_valid_feeds=*/false,
-      /*aggressive_shape_inference=*/false,
-      /*include_input_tensor_values=*/false,
-      /*include_output_tensor_values=*/false);
-
-  if (!st.ok()) {
-    LOG(ERROR) << "[EXPR][GP] InferStatically failed: " << st.message();
-    return;
-  }
-
-  int found = 0;
-  VLOG(1) << "[EXPR][GP] === GraphProperties output expr dump ===";
-
-
-  for (const NodeDef& n : graph_def.node()) {
-    if (!props.HasOutputProperties(n.name())) continue;
-    const auto& outs = props.GetOutputProperties(n.name());
-    for (int out_idx = 0; out_idx < static_cast<int>(outs.size()); ++out_idx) {
-      const auto& tp = outs[out_idx];
-      const TensorShapeProto& shp = tp.shape();
-
-      if (shp.unknown_rank()) continue;
-      std::vector<std::unique_ptr<DynExpr>> exprs;
-      for (int d = 0; d < shp.dim_size(); ++d) {
-        const auto& dim = shp.dim(d);
-
-        const ExpressionProto& expr = dim.expr();
-        if (expr.node_type_case() == ExpressionProto::NODE_TYPE_NOT_SET)
-          continue;
-
-        VLOG(1) << "Node " << n.name() << " is inferred to have expression "
-                << ExprProtoToString(expr) << " on dimension #" << d;
-
-        auto ex = ExprFromProto(expr);
-        exprs.push_back(std::move(ex));
-
-        ++found;
-      }
-      test_map[n.name()] = std::move(exprs);
-    }
-  }
-
-  VLOG(1) << "[EXPR][GP] === Found " << found
-          << " expressions via GraphProperties ===";
-}
-
 
 struct OutputInputTensorPairHasher {
   uint64 operator()(std::pair<OutputTensor, InputTensor> const& s) const {
@@ -503,6 +399,19 @@ class Encapsulator {
 
 namespace {
 
+bool BuildOutputShapeProto(const Node& node, int output_slot,
+                           TensorShapeProto* proto) {
+  AttrSlice attrs = node.attrs();
+  auto shape_attr =
+      attrs.FindByString(kXlaInferredOutputTensorShapesAttrName);
+  if (shape_attr == nullptr || !shape_attr->has_list() ||
+      shape_attr->list().shape_size() <= output_slot) {
+    return false;
+  }
+  *proto = shape_attr->list().shape(output_slot);
+  return true;
+}
+
 // Return in 'sorted' a topological sort of clusters according to the
 // dependencies encoded in ancestors. clusters is the list of all clusters
 // including clusters that are not present in the ancestors map. has_successors
@@ -585,6 +494,31 @@ Node* Encapsulator::Subgraph::MakeNodeImage(const Graph* graph_in, Node* node) {
 
 Graph* Encapsulator::Subgraph::GetGraph() const { return graph_.get(); }
 
+void ExprToProto(xla::DynExpr* expr, ExpressionProto* proto) {
+  auto e = expr->s();
+  if (xla::Constant* c = dynamic_cast<xla::Constant*>(e)) {
+    proto->set_constant_value(c->get_val());
+  } else if (xla::Variable* v = dynamic_cast<xla::Variable*>(e)) {
+    proto->set_variable_id(v->get_id());
+  } else if (xla::Add* a = dynamic_cast<xla::Add*>(e)) {
+    auto* add_msg = proto->mutable_add_node();
+    ExprToProto(a->get_lhs(), add_msg->mutable_lhs());
+    ExprToProto(a->get_rhs(), add_msg->mutable_rhs());
+  } else if (xla::Mul* m = dynamic_cast<xla::Mul*>(e)) {
+    auto* mul_msg = proto->mutable_mul_node();
+    ExprToProto(m->get_lhs(), mul_msg->mutable_lhs());
+    ExprToProto(m->get_rhs(), mul_msg->mutable_rhs());
+  } else if (xla::Sub* s = dynamic_cast<xla::Sub*>(e)) {
+    auto* sub_msg = proto->mutable_sub_node();
+    ExprToProto(s->get_lhs(), sub_msg->mutable_lhs());
+    ExprToProto(s->get_rhs(), sub_msg->mutable_rhs());
+  } else if (xla::Div* d = dynamic_cast<xla::Div*>(e)) {
+    auto* div_msg = proto->mutable_div_node();
+    ExprToProto(d->get_lhs(), div_msg->mutable_lhs());
+    ExprToProto(d->get_rhs(), div_msg->mutable_rhs());
+  }
+}
+
 absl::Status Encapsulator::Subgraph::RecordArg(
     const Edge* edge,
     const absl::flat_hash_map<const Node*, Node*>& node_images,
@@ -605,24 +539,12 @@ absl::Status Encapsulator::Subgraph::RecordArg(
     builder.Attr("T", dtype);
     builder.Attr("index", arg_index);
     AttrSlice attrs = src_node->attrs();
-    auto shape_attr = attrs.FindByString("_output_shapes");
-    if (shape_attr && shape_attr->has_list()) {
-      const TensorShapeProto& shape = shape_attr->list().shape(src_slot);
-      std::vector<std::unique_ptr<DynExpr>> expressions =
-          std::move(test_map[src_node->name()]);
-      for (const auto& e : expressions) {
-        if (!e->IsConstant()) {
-          builder.Attr("_is_batch", true);
-        }
-      }
-      if (shape.dim_size() >= 1 && shape.dim(0).size() == -1) {
-        VLOG(1) << "Found Dynamic dimension in " << src_node->name() << ":"
-                << src_slot;
-        builder.Attr("_is_batch", true);
-      }
+    TensorShapeProto output_shape_proto;
+    if (BuildOutputShapeProto(*src_node, src_slot, &output_shape_proto)) {
       VLOG(1) << "Adding following output shapes for node " << src_node->name()
-              << " : " << tsp->DebugString();
-      builder.Attr("_output_shapes", {*tsp});
+              << " : " << output_shape_proto.DebugString();
+      builder.Attr("_output_shapes", {output_shape_proto});
+      builder.Attr(kXlaInferredOutputShapesAttrName, {output_shape_proto});
     } else {
       // if cluster argument is the real argument.
       auto build_attr = attrs.FindByString("_dynamic_dim");
@@ -1320,9 +1242,6 @@ absl::Status EncapsulateSubgraphsPass::Run(
     DumpGraphToFile("encapsulate_subgraphs_before", **options.graph,
                     options.flib_def);
   }
-
-  LogExpressionsViaGraphProperties(**options.graph);
-
 
   // TODO(b/195757077): Remove this once there is a better way to disable
   // GraphOptimizationPasses that are not needed due to MLIR bridge.
