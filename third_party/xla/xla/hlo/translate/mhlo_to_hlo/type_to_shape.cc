@@ -150,6 +150,7 @@ Shape TypeToShape(mlir::Type type) {
 
     llvm::SmallVector<int64_t, 4> shape(rank, mlir::ShapedType::kDynamic);
     std::vector<bool> is_dynamic(rank, false);
+    std::vector<DynExpr*> expressions(rank, DynExpr::_(-60));
     for (int64_t dim = 0; dim < rank; ++dim) {
       int64_t size = t.getDimSize(dim);
       if (size == ShapedType::kDynamic) {
@@ -191,7 +192,8 @@ Shape TypeToShape(mlir::Type type) {
       return sparse_shape;
     }
 
-    return ShapeUtil::MakeShape(primitive_type, shape, is_dynamic);
+    return ShapeUtil::MakeShape(primitive_type, shape, is_dynamic,
+                                expressions);
   } else if (auto tuple_type = mlir::dyn_cast<mlir::TupleType>(type)) {
     llvm::SmallVector<Shape, 4> shapes;
     shapes.reserve(tuple_type.size());

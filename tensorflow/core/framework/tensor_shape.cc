@@ -26,6 +26,105 @@ limitations under the License.
 
 namespace tensorflow {
 
+xla::DynExpr* ExprFromProto(const ExpressionProto& proto) {
+  switch (proto.node_type_case()) {
+    case ExpressionProto::kConstantValue:
+      return xla::DynExpr::_(proto.constant_value());
+
+    case ExpressionProto::kVariableId:
+      return xla::DynExpr::V(proto.variable_id());
+
+    case ExpressionProto::kAddNode: {
+      const auto& add = proto.add_node();
+      return *ExprFromProto(add.lhs()) + *ExprFromProto(add.rhs());
+    }
+
+    case ExpressionProto::kSubNode: {
+      const auto& sub = proto.sub_node();
+      return *ExprFromProto(sub.lhs()) - *ExprFromProto(sub.rhs());
+    }
+
+    case ExpressionProto::kMulNode: {
+      const auto& mul = proto.mul_node();
+      return *ExprFromProto(mul.lhs()) * *ExprFromProto(mul.rhs());
+    }
+
+    case ExpressionProto::kDivNode: {
+      const auto& div = proto.div_node();
+      return *ExprFromProto(div.lhs()) / *ExprFromProto(div.rhs());
+    }
+
+    case ExpressionProto::NODE_TYPE_NOT_SET:
+    default:
+      return nullptr;
+  }
+}
+
+void ExprToProto(xla::DynExpr* expr, ExpressionProto* proto) {
+  auto e = expr->s();
+  if (xla::Constant* c = dynamic_cast<xla::Constant*>(e)) {
+    proto->set_constant_value(c->get_val());
+  } else if (xla::Variable* v = dynamic_cast<xla::Variable*>(e)) {
+    proto->set_variable_id(v->get_id());
+  } else if (xla::Add* a = dynamic_cast<xla::Add*>(e)) {
+    auto* add_msg = proto->mutable_add_node();
+    ExprToProto(a->get_lhs(), add_msg->mutable_lhs());
+    ExprToProto(a->get_rhs(), add_msg->mutable_rhs());
+  } else if (xla::Mul* m = dynamic_cast<xla::Mul*>(e)) {
+    auto* mul_msg = proto->mutable_mul_node();
+    ExprToProto(m->get_lhs(), mul_msg->mutable_lhs());
+    ExprToProto(m->get_rhs(), mul_msg->mutable_rhs());
+  } else if (xla::Sub* s = dynamic_cast<xla::Sub*>(e)) {
+    auto* sub_msg = proto->mutable_sub_node();
+    ExprToProto(s->get_lhs(), sub_msg->mutable_lhs());
+    ExprToProto(s->get_rhs(), sub_msg->mutable_rhs());
+  } else if (xla::Div* d = dynamic_cast<xla::Div*>(e)) {
+    auto* div_msg = proto->mutable_div_node();
+    ExprToProto(d->get_lhs(), div_msg->mutable_lhs());
+    ExprToProto(d->get_rhs(), div_msg->mutable_rhs());
+  }
+}
+
+// Independent helper function to handle the recursion
+void BuildExprString(xla::DynExpr* e, std::ostringstream& oss) {
+  if (xla::Constant* c = dynamic_cast<xla::Constant*>(e)) {
+    oss << c->get_val();
+  } else if (xla::Variable* v = dynamic_cast<xla::Variable*>(e)) {
+    char letter = 'A' + (v->get_id() - 1);
+    oss << letter;
+  } else if (xla::Add* a = dynamic_cast<xla::Add*>(e)) {
+    oss << "(";
+    BuildExprString(a->get_lhs(), oss);
+    oss << " + ";
+    BuildExprString(a->get_rhs(), oss);
+    oss << ")";
+  } else if (xla::Mul* m = dynamic_cast<xla::Mul*>(e)) {
+    oss << "(";
+    BuildExprString(m->get_lhs(), oss);
+    oss << " * ";
+    BuildExprString(m->get_rhs(), oss);
+    oss << ")";
+  } else if (xla::Sub* s = dynamic_cast<xla::Sub*>(e)) {
+    oss << "(";
+    BuildExprString(s->get_lhs(), oss);
+    oss << " - ";
+    BuildExprString(s->get_rhs(), oss);
+    oss << ")";
+  } else if (xla::Div* d = dynamic_cast<xla::Div*>(e)) {
+    oss << "(";
+    BuildExprString(d->get_lhs(), oss);
+    oss << " / ";
+    BuildExprString(d->get_rhs(), oss);
+    oss << ")";
+  }
+}
+
+std::string ExprToString(xla::DynExpr* e) {
+    std::ostringstream oss;
+    BuildExprString(e, oss);
+    return oss.str();
+}
+
 // TensorShape and PartialTensorShape should have no fields beyond
 // TensorShapeRep.  In particular, their sizes should be the same.
 static_assert(sizeof(TensorShapeRep) == sizeof(TensorShape),
@@ -151,6 +250,9 @@ TensorShapeBase<Shape>::TensorShapeBase(const TensorShapeProto& proto) {
     set_num_elements(1);
     for (const auto& d : proto.dim()) {
       AddDim(d.size());
+    }
+    for (const auto& e : proto.expressions()) {
+      AddExpression(ExprFromProto(e));
     }
   }
 }
@@ -505,6 +607,9 @@ void TensorShapeBase<Shape>::UnsafeAddDim(int64_t size,
 template <class Shape>
 void TensorShapeBase<Shape>::AppendShape(const TensorShapeBase& shape) {
   for (auto d : shape) AddDim(d.size);
+  for (auto e : shape.get_expressions()){
+     AddExpression(e);
+  }
 }
 
 template <class Shape>
@@ -585,6 +690,7 @@ template <class Shape>
 void TensorShapeBase<Shape>::set_dim(int d, int64_t size) {
   CHECK_GE(d, 0);
   CHECK_LT(d, dims());
+  if (get_expressions().size() > d) set_expression(d, xla::DynExpr::_(size));
   if (!kIsPartial) {
     CHECK_GE(size, 0);
   }
@@ -611,6 +717,8 @@ void TensorShapeBase<Shape>::set_dim(int d, int64_t size) {
 
 template <class Shape>
 absl::Status TensorShapeBase<Shape>::SetDimWithStatus(int d, int64_t size) {
+  if (get_expressions().size() > d) set_expression(d, xla::DynExpr::_(size));
+
   if (TF_PREDICT_FALSE(d < 0)) {
     return errors::InvalidArgument("Index must be non-negative, got ", d);
   }
@@ -731,6 +839,10 @@ void TensorShapeBase<Shape>::AsProto(TensorShapeProto* proto) const {
     for (int i = 0; i < dims(); i++) {
       proto->add_dim()->set_size(dim_size(i));
     }
+    for (int i = 0; i < get_expressions().size(); i++) {
+      ExpressionProto* eproto = proto->add_expressions();
+      ExprToProto(get_expression(i), eproto);
+    }
   }
 }
 
@@ -764,6 +876,11 @@ string TensorShapeRep::DebugString() const {
     } else {
       strings::StrAppend(&s, dim);
     }
+    if (shape.get_expression(i) != nullptr) {
+      strings::StrAppend(&s, "(");
+      strings::StrAppend(&s, ExprToString(shape.get_expression(i)));
+      strings::StrAppend(&s, ")");
+    }
   }
   strings::StrAppend(&s, "]");
   return s;
@@ -787,6 +904,15 @@ string TensorShapeRep::DebugString(const TensorShapeProto& proto) {
     first = false;
   }
   strings::StrAppend(&s, "]");
+  strings::StrAppend(&s, "<");
+  first = true;
+  for (const auto& e : proto.expressions()) {
+    if (!first) strings::StrAppend(&s, ",");
+    auto exp = ExprFromProto(e);
+    strings::StrAppend(&s, ExprToString(exp));
+    first = false;
+  }
+  strings::StrAppend(&s, ">");
   return s;
 }
 
@@ -950,6 +1076,7 @@ absl::Status PartialTensorShape::MergeWith(const PartialTensorShape& shape,
       return s;
     }
   }
+  result->set_expressions(shape.get_expressions());
   return absl::OkStatus();
 }
 

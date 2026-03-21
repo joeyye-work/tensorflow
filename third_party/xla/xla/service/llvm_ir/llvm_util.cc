@@ -292,9 +292,13 @@ llvm::Type* ShapeToIrType(const Shape& shape, llvm::LLVMContext& context) {
     result_type =
         llvm::ArrayType::get(result_type, shape.tuple_shapes().size());
   } else if (shape.IsArray()) {
-    for (int64_t dimension : LayoutUtil::MinorToMajor(shape)) {
-      result_type =
-          llvm::ArrayType::get(result_type, shape.dimensions(dimension));
+    auto dimensions = LayoutUtil::MinorToMajor(shape);
+    for (int i = 0; i < dimensions.size(); i++) {
+      // The MinorToMajor order reverses dimensions...
+      bool is_dynamic =
+           shape.expressions(dimensions.size() - 1 - i)->is_dynamic();
+      int64_t dim_val = is_dynamic ? 0 : shape.dimensions(dimensions[i]);
+      result_type = llvm::ArrayType::get(result_type, dim_val);
     }
   }
   return result_type;
@@ -815,7 +819,8 @@ void EmitEarlyReturn(llvm::Value* condition, llvm::IRBuilderBase* b,
   b->SetInsertPoint(continued, continued->getFirstInsertionPt());
 }
 
-llvm::Value* GetBatchDimByName(llvm::IRBuilderBase* b, int64_t multiplier) {
+llvm::Value* GetBatchDimByName(llvm::IRBuilderBase* b, int64_t multiplier,
+                               int64_t offset) {
   llvm::Function* function = b->GetInsertBlock()->getParent();
   llvm::LLVMContext& ctx = b->getContext();
   llvm::IntegerType* i64Type = llvm::IntegerType::getInt64Ty(ctx);
@@ -870,7 +875,79 @@ llvm::Value* GetBatchDimByName(llvm::IRBuilderBase* b, int64_t multiplier) {
     llvm::ConstantInt* m = llvm::ConstantInt::get(i64Type, multiplier, true);
     bdim_scaled = b->CreateMul(loadedValue, m, "bdim_scaled");
   }
+  if (offset != 0){
+    llvm::ConstantInt* offset_value =
+        llvm::ConstantInt::get(i64Type, offset, true);
+    bdim_scaled = b->CreateAdd(bdim_scaled, offset_value, "bdim_offset");
+  }
   return bdim_scaled;
+}
+
+llvm::Value* EmitExpression(llvm::IRBuilderBase* b, DynExpr* expr) {
+  llvm::Function* function = b->GetInsertBlock()->getParent();
+  llvm::LLVMContext& ctx = b->getContext();
+  llvm::IntegerType* i64Type = llvm::IntegerType::getInt64Ty(ctx);
+  if (expr == nullptr) return nullptr;
+  if (expr->is_constant())
+    return llvm::ConstantInt::get(i64Type, expr->get_val(), true);
+  if (Variable* var_node = dynamic_cast<Variable*>(expr)) {
+    // For now we can just use %bdim...
+    return GetBatchDimByName(b);
+  }
+  if (Mul* mul_node = dynamic_cast<Mul*>(expr)) {
+    llvm::Value* v_lhs = EmitExpression(b, mul_node->get_lhs());
+    llvm::Value* v_rhs = EmitExpression(b, mul_node->get_rhs());
+    return b->CreateMul(v_lhs, v_rhs, "mul_dims");
+  }
+  // TODO: Check if this should ever happen
+  if (Div* div_node = dynamic_cast<Div*>(expr)) {
+    llvm::Value* v_lhs = EmitExpression(b, div_node->get_lhs());
+    llvm::Value* v_rhs = EmitExpression(b, div_node->get_rhs());
+    return b->CreateUDiv(v_lhs, v_rhs, "div_dims");
+  }
+  if (Add* add_node = dynamic_cast<Add*>(expr)) {
+    llvm::Value* v_lhs = EmitExpression(b, add_node->get_lhs());
+    llvm::Value* v_rhs = EmitExpression(b, add_node->get_rhs());
+    return b->CreateAdd(v_lhs, v_rhs, "add_dims");
+  }
+  if (Sub* sub_node = dynamic_cast<Sub*>(expr)) {
+    llvm::Value* v_lhs = EmitExpression(b, sub_node->get_lhs());
+    llvm::Value* v_rhs = EmitExpression(b, sub_node->get_rhs());
+    return b->CreateSub(v_lhs, v_rhs, "sub_dims");
+  }
+  return nullptr;
+}
+
+llvm::Value* createDynamicGEP(llvm::IRBuilderBase* builder,
+                              llvm::Value* base_ptr,
+                              const std::vector<llvm::Value*>& indices,
+                              absl::Span<const int64_t> dims,
+                              absl::Span<DynExpr* const> expressions,
+                              llvm::Type* elem_type,
+                              const llvm::Twine& name) {
+  llvm::Value* total_index = builder->getInt64(0);
+  llvm::Type* int64_ty = builder->getInt64Ty();
+
+  for (size_t i = 0; i < indices.size(); ++i) {
+    // The stride is the product of all dimensions to the right of this index.
+    llvm::Value* stride = builder->getInt64(1);
+    for (size_t j = i; j < dims.size(); ++j) {
+      if (expressions[j]->is_dynamic()) {
+        llvm::Value* expr_value =
+            EmitExpression(builder, expressions[j]);
+        stride = builder->CreateMul(stride, expr_value, "stride.dyn");
+      } else {
+        stride = builder->CreateMul(
+            stride, llvm::ConstantInt::get(int64_ty, dims[j]), "stride.static");
+      }
+    }
+    llvm::Value* scaled_index =
+        builder->CreateMul(indices[i], stride, "idx.scaled");
+    total_index = builder->CreateAdd(total_index, scaled_index, "idx.total");
+  }
+
+  // Final GEP: result = base + total_index * sizeof(elem_type)
+  return builder->CreateGEP(elem_type, base_ptr, total_index, name);
 }
 
 }  // namespace llvm_ir

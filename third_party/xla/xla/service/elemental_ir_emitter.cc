@@ -3289,8 +3289,9 @@ absl::StatusOr<llvm::Value*> ElementalIrEmitter::EmitElementalConcatenate(
     cases.emplace_back(current_offset, operand);
     llvm::Value* cdim = source_index.GetConstantWithIndexType(
         operand->shape().dimensions(concat_dim));
-    if (concat_dim == 0 && operand->shape().outer_multiplier() > 0) {
-      cdim = llvm_ir::GetBatchDimByName(b_, operand->shape().outer_multiplier());
+    if (operand->shape().expressions(concat_dim)->is_dynamic()) {
+      cdim = llvm_ir::EmitExpression(
+          b_, operand->shape().expressions(concat_dim));
     }
     current_offset = b_->CreateAdd(current_offset, cdim, "current_offset");
     coffset += operand->shape().dimensions(concat_dim);
@@ -3625,14 +3626,9 @@ absl::StatusOr<llvm::Value*> ElementalIrEmitter::EmitElementalPad(
     int64_t shape_dim = hlo->operand(0)->shape().dimensions(i);
     llvm::Value* bound = index_typed_const(shape_dim);
 
-    int64_t multiplier =
-        (i == 0) ? hlo->operand(0)->shape().outer_multiplier() : -1;
-    if (multiplier > 0) {
-      bound = llvm_ir::GetBatchDimByName(b_, multiplier);
-    } else if (shape_dim == 977) {
-      // This should be deleted.
-      LOG(ERROR) << "Dynamic batch marker: No multiplier for batch dim: "
-                 << hlo->ToString();
+    if (hlo->operand(0)->shape().expressions(i)->is_dynamic()) {
+      bound = llvm_ir::EmitExpression(
+          b_, hlo->operand(0)->shape().expressions(i));
     }
 
     in_bounds = And(in_bounds, ICmpSLT(multi_index[i], bound), "in_bounds");
@@ -3703,12 +3699,14 @@ absl::StatusOr<llvm::Value*> ElementalIrEmitter::EmitElementalDot(
   };
 
   llvm::Value* contracted_bound = index_typed_const(contracted_dim_size);
-  int64_t multiplier = (lhs_contracting_dim == 0)
-                           ? hlo->operand(0)->shape().outer_multiplier()
-                           : -1;
-  if (multiplier > 0) {
-    llvm::Value* bdim_value = llvm_ir::GetBatchDimByName(b_, multiplier);
-    contracted_bound = bdim_value;
+
+  if (!hlo->operand(0)
+           ->shape()
+           .expressions(lhs_contracting_dim)
+           ->is_constant()) {
+    llvm::Value* expr_value = llvm_ir::EmitExpression(
+        b_, hlo->operand(0)->shape().expressions(lhs_contracting_dim));
+    contracted_bound = expr_value;
   }
 
   std::unique_ptr<llvm_ir::ForLoop> inner_loop = llvm_ir::ForLoop::EmitForLoop(
@@ -3907,9 +3905,17 @@ llvm_ir::ElementGenerator ElementalIrEmitter::MakeElementGenerator(
         const HloInstruction* operand = hlo->operand(0);
         std::vector<llvm::Value*> source_multi_index = target_index.multidim();
         for (int64_t dim : hlo->dimensions()) {
-          source_multi_index[dim] = Sub(target_index.GetConstantWithIndexType(
-                                            hlo->shape().dimensions(dim) - 1),
-                                        target_index[dim]);
+          if (hlo->shape().expressions(dim)->is_dynamic()) {
+            llvm::Value* one = target_index.GetConstantWithIndexType(1);
+            llvm::Value* expr_value =
+                llvm_ir::EmitExpression(b_, hlo->shape().expressions(dim));
+            source_multi_index[dim] =
+                Sub(Sub(expr_value, one), target_index[dim]);
+          } else {
+            source_multi_index[dim] = Sub(target_index.GetConstantWithIndexType(
+                                              hlo->shape().dimensions(dim) - 1),
+                                          target_index[dim]);
+          }
         }
         llvm_ir::IrArray::Index source_index(
             source_multi_index, operand->shape(), target_index.GetType());
@@ -3991,8 +3997,6 @@ llvm_ir::ElementGenerator ElementalIrEmitter::MakeElementGenerator(
     case HloOpcode::kSlice:
       return [this, hlo, &operand_to_generator](
                  const IrArray::Index& index) -> absl::StatusOr<llvm::Value*> {
-        // [Steven] the problem is that slices are represented by integer ranges.
-        // If these are based on the magic number they are wrong.
         IrArray::Index sliced_index = index.SourceIndexOfSlice(
             /*operand_shape=*/hlo->operand(0)->shape(),
             /*starts=*/hlo->slice_starts(),
@@ -4266,12 +4270,10 @@ absl::StatusOr<llvm::Value*> ElementalIrEmitter::EmitElementalReduceWindow(
     int64_t dim_bound = reduce_window->inputs()[0]->shape().dimensions(i);
     llvm::Value* shape_bound = index_typed_const(dim_bound);
 
-    int64_t multiplier =
-        (i == 0) ? reduce_window->inputs()[0]->shape().outer_multiplier() : -1;
-
-    if (multiplier > 0) {
-      llvm::Value* bdim_value = llvm_ir::GetBatchDimByName(b_, multiplier);
-      shape_bound = bdim_value;
+    if (reduce_window->inputs()[0]->shape().expressions(i)->is_dynamic()) {
+      llvm::Value* expr_value = llvm_ir::EmitExpression(
+          b_, reduce_window->inputs()[0]->shape().expressions(i));
+      shape_bound = expr_value;
     }
 
     in_bounds =

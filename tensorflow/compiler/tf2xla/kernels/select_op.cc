@@ -70,8 +70,10 @@ class SelectOp : public XlaOpKernel {
       // Broadcast into the dimensions on the right.
       std::vector<int64_t> broadcast_dimensions(cond_shape.dims());
       absl::c_iota(broadcast_dimensions, 0);
+
       cond_handle = xla::BroadcastInDim(cond_handle, then_shape.dim_sizes(),
-                                        broadcast_dimensions);
+                                        broadcast_dimensions,
+                                        then_shape.get_expressions());
     }
     ctx->SetOutput(0, xla::Select(cond_handle, then_handle, else_handle));
   }
@@ -81,7 +83,8 @@ class SelectOp : public XlaOpKernel {
   void operator=(const SelectOp&) = delete;
 };
 
-REGISTER_XLA_OP(Name("Select"), MlirXlaOpKernel);
+// REGISTER_XLA_OP(Name("Select"), MlirXlaOpKernel);
+REGISTER_XLA_OP(Name("Select"), SelectOp);
 
 class SelectOpV2 : public XlaOpKernel {
  public:

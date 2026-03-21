@@ -49,8 +49,9 @@ xla::BitGeneratorTy GetBitGeneratorForDevice(
       device_type_string == DEVICE_CPU_XLA_JIT) {
     return [=](xla::XlaOp key, xla::XlaOp state, const xla::Shape& shape) {
       std::tie(state, key) = xla::ScramblePhiloxKey(key);
-      xla::XlaOp philox_state =
-          xla::ConcatInDim(key.builder(), {xla::Reshape(key, {1}), state}, 0);
+      xla::XlaOp philox_state = xla::ConcatInDim(
+          key.builder(),
+          {xla::Reshape(key, {1}, {xla::DynExpr::one}), state}, 0);
       xla::XlaOp result = xla::RngBitGenerator(xla::RandomAlgorithm::RNG_PHILOX,
                                                philox_state, shape);
       return xla::RngOutput{/*value=*/xla::GetTupleElement(result, 1),
@@ -421,19 +422,23 @@ class StatelessParameterizedTruncatedNormalOp : public XlaOpKernel {
     xla::Shape xla_shape;
     OP_REQUIRES_OK(ctx, TensorShapeToXLAShape(rng_dtype, shape, &xla_shape));
 
-    auto bcasted_means = BroadcastTo(ctx->Input(2), shape.dim_sizes());
+    auto bcasted_means =
+        BroadcastTo(ctx->Input(2), shape.dim_sizes(), shape.get_expressions());
     OP_REQUIRES_OK(ctx, bcasted_means.status());
     auto means = bcasted_means.value();
 
-    auto bcasted_stddevs = BroadcastTo(ctx->Input(3), shape.dim_sizes());
+    auto bcasted_stddevs =
+        BroadcastTo(ctx->Input(3), shape.dim_sizes(), shape.get_expressions());
     OP_REQUIRES_OK(ctx, bcasted_stddevs.status());
     auto stddevs = bcasted_stddevs.value();
 
-    auto bcasted_minvals = BroadcastTo(ctx->Input(4), shape.dim_sizes());
+    auto bcasted_minvals =
+        BroadcastTo(ctx->Input(4), shape.dim_sizes(), shape.get_expressions());
     OP_REQUIRES_OK(ctx, bcasted_minvals.status());
     auto minvals = bcasted_minvals.value();
 
-    auto bcasted_maxvals = BroadcastTo(ctx->Input(5), shape.dim_sizes());
+    auto bcasted_maxvals =
+        BroadcastTo(ctx->Input(5), shape.dim_sizes(), shape.get_expressions());
     OP_REQUIRES_OK(ctx, bcasted_maxvals.status());
     auto maxvals = bcasted_maxvals.value();
 

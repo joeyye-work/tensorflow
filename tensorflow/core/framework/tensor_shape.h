@@ -28,6 +28,7 @@ limitations under the License.
 #include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/platform/status.h"
 #include "tensorflow/core/platform/statusor.h"
+#include "xla/shape.h"
 
 namespace tensorflow {
 
@@ -73,7 +74,36 @@ class TensorShapeRep {
   std::string DebugString() const;
   static std::string DebugString(const TensorShapeProto& proto);
 
+  void set_expression(int d, xla::DynExpr* expr){
+    expressions_[d] = expr;
+  }
+
+  void AddExpression(xla::DynExpr* expr){
+    expressions_.push_back(expr);
+  }
+
+  // Set the array of dynamic multipliers.
+  void set_expressions(std::vector<xla::DynExpr*> exprs) {
+    expressions_ = exprs;
+  }
+
+  // Get the array of dynamic multipliers.
+  std::vector<xla::DynExpr*> get_expressions() const {
+    return expressions_;
+  }
+
+  // Return the multiplier for a specific dynamic dimension.
+  // -1 if the dimension is not dynamic.
+  xla::DynExpr* get_expression(int64_t dimension) const {
+    if (dimension >= expressions_.size()) {
+      return nullptr;
+    }
+    return expressions_[dimension];
+  }
+
  protected:
+  std::vector<xla::DynExpr*> expressions_;
+
   // Constructable only via TensorShapeBase
   TensorShapeRep() = default;
 
@@ -710,6 +740,7 @@ absl::Status TensorShape::AsEigenDSizesWithPaddingWithStatus(
 
 inline TensorShapeRep::TensorShapeRep(const TensorShapeRep& b) {
   num_elements_ = b.num_elements_;
+  expressions_ = b.expressions_;
   if (b.tag() != REP_OUT_OF_LINE) {
     memcpy(buf(), b.buf(), sizeof(u_.buf));
     // memcpy above Implicitly does:
@@ -723,6 +754,7 @@ inline TensorShapeRep::TensorShapeRep(const TensorShapeRep& b) {
 
 inline TensorShapeRep::TensorShapeRep(TensorShapeRep&& b) {
   num_elements_ = b.num_elements_;
+  expressions_ = b.expressions_;
   memcpy(buf(), b.buf(), sizeof(u_.buf));
   // memcpy above Implicitly does:
   //   set_ndims_byte(b.ndims_byte());
@@ -738,6 +770,8 @@ inline TensorShapeRep::~TensorShapeRep() {
 
 inline void TensorShapeRep::operator=(const TensorShapeRep& b) {
   num_elements_ = b.num_elements_;
+  expressions_ = b.expressions_;
+
   if (tag() != REP_OUT_OF_LINE && b.tag() != REP_OUT_OF_LINE) {
     memcpy(buf(), b.buf(), sizeof(u_.buf));
     // memcpy above implicitly also does:
@@ -753,6 +787,8 @@ inline void TensorShapeRep::operator=(TensorShapeRep&& b) {
     DestructorOutOfLine();
   }
   num_elements_ = b.num_elements_;
+  expressions_ = b.expressions_;
+
   memcpy(buf(), b.buf(), sizeof(u_.buf));
   // memcpy above Implicitly does:
   //   set_ndims_byte(b.ndims_byte());

@@ -103,7 +103,7 @@ class DiagOp : public XlaOpKernel {
 
     // Flattens the input to 1D.
     int64_t size = input_shape.num_elements();
-    input = xla::Reshape(input, {size});
+    input = xla::Reshape(input, {size}, {});
 
     // Create an R2 with the R1 diagonal.
     xla::XlaOp diag = CreateDiagonal(input, size, /*other_dims=*/{});

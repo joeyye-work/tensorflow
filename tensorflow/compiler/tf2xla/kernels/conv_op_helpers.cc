@@ -97,8 +97,11 @@ xla::XlaOp TransposeFilterForGroupConvolutionBackpropInput(
   CHECK_GE(num_dims, 2);  // Crash OK
   xla::Shape new_shape = filter_shape;
   new_shape.set_dimensions(num_dims - 1, num_groups);
-  new_shape.add_dimensions(filter_shape.dimensions(num_dims - 1) / num_groups);
-  xla::XlaOp result = xla::Reshape(filter, new_shape.dimensions());
+  new_shape.add_dimensions(
+      filter_shape.dimensions(num_dims - 1) / num_groups,
+      (*filter_shape.expressions(num_dims - 1) / num_groups)->s());
+  xla::XlaOp result =
+      xla::Reshape(filter, new_shape.dimensions(), new_shape.expressions());
 
   // 2. Transpose to [H, W, ..., G, filter_in_depth, out_depth / G]
   std::vector<int64_t> transpose_dims(num_dims + 1);
@@ -118,7 +121,8 @@ xla::XlaOp ReshapeFilterForDepthwiseConvolution(const xla::Shape& filter_shape,
                                                 xla::XlaOp filter) {
   return xla::Reshape(
       filter,
-      GroupedFilterShapeForDepthwiseConvolution(filter_shape).dimensions());
+      GroupedFilterShapeForDepthwiseConvolution(filter_shape).dimensions(),
+      GroupedFilterShapeForDepthwiseConvolution(filter_shape).expressions());
 }
 
 // Performs some basic checks on ConvOpAttrs that are true for all kinds of XLA
@@ -603,7 +607,8 @@ absl::StatusOr<xla::XlaOp> MakeXlaBackpropFilterConvOp(
   }
 
   if (attrs.depthwise) {
-    filter_backprop = xla::Reshape(filter_backprop, filter_shape.dimensions());
+    filter_backprop = xla::Reshape(filter_backprop, filter_shape.dimensions(),
+                                   filter_shape.expressions());
   }
 
   return filter_backprop;

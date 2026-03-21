@@ -533,7 +533,7 @@ llvm_ir::IrArray KernelApiIrBuilder::EmitKernelArgument(
   const llvm::DataLayout& data_layout = llvm_module->getDataLayout();
   int64_t pointer_size = data_layout.getTypeStoreSize(builder.getPtrTy());
   int64_t byte_size = ShapeUtil::ByteSizeOf(shape, pointer_size);
-  if (shape.outer_multiplier() < 0)
+  if (!shape.has_dynamic_expr())
     llvm_ir::SetDereferenceableMetadataForLoad(data,byte_size);
 
   // All buffers pointers passed to host kernels are expected to be invariant

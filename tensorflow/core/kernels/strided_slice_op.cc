@@ -309,6 +309,8 @@ class StridedSliceAssignOp : public OpKernel {
     bool is_simple_slice = true;
     absl::InlinedVector<int64_t, 4UL> begin;
     absl::InlinedVector<int64_t, 4UL> end;
+    absl::InlinedVector<xla::DynExpr*, 4UL> begin_expr;
+    absl::InlinedVector<xla::DynExpr*, 4UL> end_expr;
     absl::InlinedVector<int64_t, 4UL> strides;
 
     Tensor* old_lhs = nullptr;
@@ -353,7 +355,7 @@ class StridedSliceAssignOp : public OpKernel {
                      old_lhs->shape(), begin_mask, end_mask, ellipsis_mask,
                      new_axis_mask, shrink_axis_mask, &processing_shape,
                      &final_shape, &is_identity, &is_simple_slice, &slice_dim0,
-                     &begin, &end, &strides, &shape_spec));
+                     &begin, &end, &strides, &begin_expr, &end_expr, &shape_spec));
 
     if (processing_shape.num_elements() > 0) {
       const Tensor& input = context->input(4);

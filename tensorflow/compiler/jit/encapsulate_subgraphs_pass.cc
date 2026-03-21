@@ -54,11 +54,12 @@ limitations under the License.
 #include "tensorflow/core/public/version.h"
 #include "tensorflow/core/util/device_name_utils.h"
 #include "tensorflow/core/util/dump_graph.h"
-
+#include "tensorflow/core/framework/tensor_shape.pb.h"
+#include "tensorflow/core/grappler/costs/graph_properties.h"
+#include "tensorflow/core/grappler/grappler_item.h"
 namespace tensorflow {
 
 static const absl::flat_hash_set<absl::string_view> kFailingOps = {
-    "Pad",
     "Where",
     // add more here
 };
@@ -119,6 +120,133 @@ void MarkGuaranteedConstants(
     }
   }
 }
+
+// Helper to convert ExpressionProto to a readable string.
+std::string ExprProtoToString(const ExpressionProto& e) {
+  switch (e.node_type_case()) {
+    case ExpressionProto::kConstantValue:
+      return std::to_string(e.constant_value());
+    case ExpressionProto::kVariableId:
+      return absl::StrCat("Var(", e.variable_id(), ")");
+    case ExpressionProto::kAddNode:
+      return absl::StrCat("(", ExprProtoToString(e.add_node().lhs()), " + ",
+                         ExprProtoToString(e.add_node().rhs()), ")");
+    case ExpressionProto::kSubNode:
+      return absl::StrCat("(", ExprProtoToString(e.sub_node().lhs()), " - ",
+                         ExprProtoToString(e.sub_node().rhs()), ")");
+    case ExpressionProto::kMulNode:
+      return absl::StrCat("(", ExprProtoToString(e.mul_node().lhs()), " * ",
+                         ExprProtoToString(e.mul_node().rhs()), ")");
+    case ExpressionProto::kDivNode:
+      return absl::StrCat("(", ExprProtoToString(e.div_node().lhs()), " / ",
+                         ExprProtoToString(e.div_node().rhs()), ")");
+    default:
+      return "<none>";
+  }
+}
+
+std::map<std::string, std::vector<std::unique_ptr<DynExpr>>> test_map;
+
+std::unique_ptr<DynExpr> ExprFromProto(const ExpressionProto& proto) {
+  switch (proto.node_type_case()) {
+    case ExpressionProto::kConstantValue:
+      return DynExpr::Cons(proto.constant_value());
+    case ExpressionProto::kVariableId:
+      return DynExpr::Var(proto.variable_id());
+    case ExpressionProto::kAddNode: {
+      auto lhs = ExprFromProto(proto.add_node().lhs());
+      auto rhs = ExprFromProto(proto.add_node().rhs());
+      // Note: These are owning pointers, but ExprAdd takes raw pointers.
+      // The caller must manage lifetime appropriately.
+      return std::make_unique<ExprAdd>(lhs.release(), rhs.release());
+    }
+    case ExpressionProto::kSubNode: {
+      auto lhs = ExprFromProto(proto.sub_node().lhs());
+      auto rhs = ExprFromProto(proto.sub_node().rhs());
+      return std::make_unique<ExprSub>(lhs.release(), rhs.release());
+    }
+    case ExpressionProto::kMulNode: {
+      auto lhs = ExprFromProto(proto.mul_node().lhs());
+      auto rhs = ExprFromProto(proto.mul_node().rhs());
+      return std::make_unique<ExprMul>(lhs.release(), rhs.release());
+    }
+    case ExpressionProto::kDivNode: {
+      auto lhs = ExprFromProto(proto.div_node().lhs());
+      auto rhs = ExprFromProto(proto.div_node().rhs());
+      return std::make_unique<ExprDiv>(lhs.release(), rhs.release());
+    }
+    case ExpressionProto::NODE_TYPE_NOT_SET:
+    default:
+      return nullptr;
+  }
+}
+
+// Runs Grappler static inference and logs any ExpressionProto found in output
+// tensor shapes (from GraphProperties, not from _output_shapes attrs).
+void LogExpressionsViaGraphProperties(const tensorflow::Graph& graph) {
+  using tensorflow::ExpressionProto;
+  using tensorflow::GraphDef;
+  using tensorflow::NodeDef;
+  using tensorflow::TensorShapeProto;
+  using tensorflow::grappler::GraphProperties;
+  using tensorflow::grappler::GrapplerItem;
+
+  GraphDef graph_def;
+  graph.ToGraphDef(&graph_def);
+
+  GrapplerItem item;
+  item.id = "mark_for_compilation_pass_expr_dump";
+  item.graph = graph_def;
+
+  GraphProperties props(item);
+
+  absl::Status st = props.InferStatically(
+      /*assume_valid_feeds=*/false,
+      /*aggressive_shape_inference=*/false,
+      /*include_input_tensor_values=*/false,
+      /*include_output_tensor_values=*/false);
+
+  if (!st.ok()) {
+    LOG(ERROR) << "[EXPR][GP] InferStatically failed: " << st.message();
+    return;
+  }
+
+  int found = 0;
+  VLOG(1) << "[EXPR][GP] === GraphProperties output expr dump ===";
+
+
+  for (const NodeDef& n : graph_def.node()) {
+    if (!props.HasOutputProperties(n.name())) continue;
+    const auto& outs = props.GetOutputProperties(n.name());
+    for (int out_idx = 0; out_idx < static_cast<int>(outs.size()); ++out_idx) {
+      const auto& tp = outs[out_idx];
+      const TensorShapeProto& shp = tp.shape();
+
+      if (shp.unknown_rank()) continue;
+      std::vector<std::unique_ptr<DynExpr>> exprs;
+      for (int d = 0; d < shp.dim_size(); ++d) {
+        const auto& dim = shp.dim(d);
+
+        const ExpressionProto& expr = dim.expr();
+        if (expr.node_type_case() == ExpressionProto::NODE_TYPE_NOT_SET)
+          continue;
+
+        VLOG(1) << "Node " << n.name() << " has expression "
+                << ExprProtoToString(expr);
+
+        auto ex = ExprFromProto(expr);
+        exprs.push_back(std::move(ex));
+
+        ++found;
+      }
+      test_map[n.name()] = std::move(exprs);
+    }
+  }
+
+  VLOG(1) << "[EXPR][GP] === Found " << found
+          << " expressions via GraphProperties ===";
+}
+
 
 struct OutputInputTensorPairHasher {
   uint64 operator()(std::pair<OutputTensor, InputTensor> const& s) const {
@@ -480,6 +608,13 @@ absl::Status Encapsulator::Subgraph::RecordArg(
     auto shape_attr = attrs.FindByString("_output_shapes");
     if (shape_attr && shape_attr->has_list()) {
       const TensorShapeProto& shape = shape_attr->list().shape(src_slot);
+      std::vector<std::unique_ptr<DynExpr>> expressions =
+          std::move(test_map[src_node->name()]);
+      for (const auto& e : expressions) {
+        if (!e->IsConstant()) {
+          builder.Attr("_is_batch", true);
+        }
+      }
       if (shape.dim_size() >= 1 && shape.dim(0).size() == -1) {
         VLOG(1) << "Found Dynamic dimension in " << src_node->name() << ":"
                 << src_slot;
@@ -1182,6 +1317,9 @@ absl::Status EncapsulateSubgraphsPass::Run(
     DumpGraphToFile("encapsulate_subgraphs_before", **options.graph,
                     options.flib_def);
   }
+
+  LogExpressionsViaGraphProperties(**options.graph);
+
 
   // TODO(b/195757077): Remove this once there is a better way to disable
   // GraphOptimizationPasses that are not needed due to MLIR bridge.
