@@ -183,7 +183,7 @@ static absl::StatusOr<MaybeOwningDeviceMemory> MemoryForAllocation(
         se::OwningDeviceMemory padded,
         memory_allocator->Allocate(device_ordinal, compiled_bytes));
     
-    void* dst = padded-> opaque();
+    void* dst = padded->opaque();
     void* src = param_mem.opaque();
 
     std::memcpy(dst, src, runtime_bytes);
