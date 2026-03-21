@@ -3072,6 +3072,7 @@ tf_kernel_library(
         "//tensorflow/core:lib",
         "//tensorflow/core:lib_internal",
         "//tensorflow/core/profiler/lib:traceme",
+        "//tensorflow/core/kernels:batch_size_resource",
     ],
 )
 
@@ -7971,6 +7972,15 @@ cc_library(
     ],
     alwayslink = 1,
 )
+
+cc_library(
+    name = "batch_size_resource",
+    srcs = ["batch_size_resource.h"],
+    deps = [
+        "//tensorflow/core:framework",
+    ],
+)
+
 
 # For a more maintainable build this target should not exist and the headers
 # should  be split into the existing cc_library targets, but this change was

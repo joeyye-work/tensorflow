@@ -223,7 +223,7 @@ KernelThunk<num_arguments, num_results>::ExecuteInternal(
 
   // Use a fast path if kernel called just once.
   if (ABSL_PREDICT_TRUE(call_once_)) {
-    TF_RETURN_IF_ERROR(kernel->CallOnce(kernel_args));
+    TF_RETURN_IF_ERROR(kernel->CallOnce(kernel_args, params.batch_size));
     return OkExecuteEvent();
   }
 
@@ -231,10 +231,12 @@ KernelThunk<num_arguments, num_results>::ExecuteInternal(
   // by scheduling tasks into it. HostKernel launch completion will
   // automatically signal KernelThunk execute completion.
   if (ABSL_PREDICT_TRUE(params.intra_op_threadpool)) {
-    return kernel->Launch(thread_dim_, kernel_args, params.intra_op_threadpool);
+    return kernel->Launch(thread_dim_, params.batch_size, kernel_args,
+                          params.intra_op_threadpool);
   }
 
-  TF_RETURN_IF_ERROR(kernel->Launch(thread_dim_, kernel_args));
+  TF_RETURN_IF_ERROR(
+      kernel->Launch(thread_dim_, params.batch_size, kernel_args));
   return OkExecuteEvent();
 }
 

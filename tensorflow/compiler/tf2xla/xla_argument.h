@@ -53,6 +53,9 @@ struct XlaArgument {
     kTensorList,
   };
 
+  //To keep dynamic dim as an attribute of the argument.
+  int64_t dynamic_dim = -1;
+
   Kind kind = kInvalid;
 
   // The type of the argument. If the argument is a resource, this

@@ -65,6 +65,9 @@ struct MarkForCompilationPassFlags {
   // Enable operator name to influence clustering decision
   bool tf_xla_annotate_cluster_id;
 
+  // Split parallel compute subgraph info different clusters
+  bool tf_xla_cluster_parallel;
+
   // If non-empty, limit XLA clustering to the following TF operations.
   string tf_xla_ops_to_cluster;
 
@@ -95,6 +98,9 @@ struct MarkForCompilationPassFlags {
   // If true names of clustered operations will be computed deterministically
   // so that they remain stable from run to run of auto clusteing.
   bool tf_xla_deterministic_cluster_names;
+
+  // If true enables support of dynamic sizes.
+  bool tf_xla_enable_dynamic_sizes;
 
   // If non-empty, JIT-compiled executables are saved to and loaded from the
   // specified file system directory path.

@@ -30,6 +30,7 @@ limitations under the License.
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/graph/algorithm.h"
+#include "tensorflow/core/kernels/batch_size_resource.h"
 #include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/profiler/lib/traceme.h"
 #include "tensorflow/core/util/device_name_utils.h"
@@ -59,15 +60,41 @@ void ArgOp::Compute(OpKernelContext* ctx) {
     }
   };
 
+  Tensor t;
   if (frame->CanConsumeArg(index_)) {
-    Tensor val;
-    frame->ConsumeArg(index_, &val);
-    OP_REQUIRES_OK(ctx, validate_type(val));
-    ctx->set_output(0, std::move(val));
+    frame->ConsumeArg(index_, &t);
+    OP_REQUIRES_OK(ctx, validate_type(t));
+    ctx->set_output(0, std::move(t));
+    val = &t;
   } else {
     OP_REQUIRES_OK(ctx, frame->GetArg(index_, &val));
     OP_REQUIRES_OK(ctx, validate_type(*val));
     ctx->set_output(0, *val);
+  }
+  if (is_batch_) {
+    BatchSizeResource* bsr = nullptr;
+    ScopedStepContainer* step_container = ctx->step_container();
+
+    OP_REQUIRES_OK(ctx, step_container->LookupOrCreate<BatchSizeResource>(
+                            ctx->resource_manager(), BatchSizeResourceName, &bsr,
+                            [](BatchSizeResource** ret) -> Status {
+                              *ret = new BatchSizeResource();
+                              return OkStatus();
+                            }));
+
+    const int64_t batch_size = val->dim_size(0);
+    if (bsr->GetBatchSize() == 0) {
+      bsr->SetBatchSize(batch_size);
+      VLOG(1) << "Set batch_size from 0 to " << batch_size
+              << ". step_id: " << ctx->step_id();
+    } else if (bsr->GetBatchSize() != batch_size) {
+      VLOG(1) << "Warning: Set batch_size from " << bsr->GetBatchSize()
+              << ". step_id: " << ctx->step_id();
+      bsr->SetBatchSize(batch_size);
+    } else {
+      VLOG(1) << "batch_size already set to " << batch_size;
+    }
+    bsr->Unref();
   }
 }
 

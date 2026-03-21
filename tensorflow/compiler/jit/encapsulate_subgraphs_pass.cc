@@ -57,6 +57,12 @@ limitations under the License.
 
 namespace tensorflow {
 
+static const absl::flat_hash_set<absl::string_view> kFailingOps = {
+    "Pad",
+    "Where",
+    // add more here
+};
+
 const char* const kXlaCompiledKernelAttr = "_XlaCompiledKernel";
 const char* const kXlaNumConstantArgsAttr = "_XlaNumConstantArgs";
 const char* const kXlaNumResourceArgsAttr = "_XlaNumResourceArgs";
@@ -470,6 +476,24 @@ absl::Status Encapsulator::Subgraph::RecordArg(
     DataType dtype = edge->dst()->input_type(edge->dst_input());
     builder.Attr("T", dtype);
     builder.Attr("index", arg_index);
+    AttrSlice attrs = src_node->attrs();
+    auto shape_attr = attrs.FindByString("_output_shapes");
+    if (shape_attr && shape_attr->has_list()) {
+      const TensorShapeProto& shape = shape_attr->list().shape(src_slot);
+      if (shape.dim_size() >= 1 && shape.dim(0).size() == -1) {
+        VLOG(1) << "Found Dynamic dimension in " << src_node->name() << ":"
+                << src_slot;
+        builder.Attr("_is_batch", true);
+      }
+    } else {
+      // if cluster argument is the real argument.
+      auto build_attr = attrs.FindByString("_is_batch");
+      if (build_attr) {
+        VLOG(1) << "Found Dynamic dimension in " << src_node->name() << ":"
+                << src_slot;
+        builder.Attr("_is_batch", true);
+      }
+    }
     absl::Status s = builder.Finalize(&arg_def);
     if (!s.ok()) return s;
 
@@ -1143,6 +1167,14 @@ static absl::Status RenumberArguments(Graph* graph,
   return absl::OkStatus();
 }
 
+static bool SubgraphHasFailingOps(const Graph& g) {
+  for (Node* n : g.op_nodes()) {
+    if (n->IsRetval()) continue;
+    if (kFailingOps.contains(n->def().op())) return true;
+  }
+  return false;
+}
+
 absl::Status EncapsulateSubgraphsPass::Run(
     const GraphOptimizationPassOptions& options) {
   VLOG(1) << "EncapsulateSubgraphsPass::Run";
@@ -1289,8 +1321,8 @@ absl::Status EncapsulateSubgraphsPass::Run(
 
         // TODO(phawkins): add a forward is-constant analysis, similarly split
         // outputs into host-memory constants and device-memory non-constants.
-
-        AddNodeAttr(kXlaCompiledKernelAttr, true, node);
+        bool compile_enabled = !SubgraphHasFailingOps(**subgraph);
+        AddNodeAttr(kXlaCompiledKernelAttr, compile_enabled, node);
         AddNodeAttr(kXlaNumConstantArgsAttr, num_consts, node);
         AddNodeAttr(kXlaNumResourceArgsAttr, num_resources, node);
         return absl::OkStatus();

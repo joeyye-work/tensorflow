@@ -840,6 +840,8 @@ absl::Status XlaCompiler::CompileFunction(
       }
     } else {
       TensorShape tensor_shape = std::get<TensorShape>(args[i].shape);
+      AttrSlice n_attrs = fbody->arg_nodes[i]->attrs();
+      std::vector<const TensorShapeProto*> output_shapes;
       fbody->arg_nodes[i]->ClearAttr("_output_shapes");
       fbody->arg_nodes[i]->AddAttr("_output_shapes",
                                    std::vector<TensorShape>{tensor_shape});
@@ -1194,6 +1196,13 @@ absl::Status XlaCompiler::BuildArguments(
 
       xla::OpMetadata arg_metadata;
       arg_metadata.set_op_name(arg.node_name);
+
+      if (arg.dynamic_dim==0) {
+        // Encode dynamic dims as a string in op_type, so it appears in HLO metadata.
+        arg_metadata.set_op_type(
+            absl::StrCat("XLA_Arg_dyn[",arg.dynamic_dim, "]"));
+      }
+
       builder->SetOneShotOpMetadata(arg_metadata);
       arg_handles[i] = xla::GetTupleElement(tuple, i);
     }
@@ -1203,6 +1212,15 @@ absl::Status XlaCompiler::BuildArguments(
       xla::XlaScopedShardingAssignment assign_sharding(
           builder, it == arg_shardings.end() ? std::optional<xla::OpSharding>()
                                              : it->second);
+      auto& arg = args[input_to_args->at(i)];
+      xla::OpMetadata arg_metadata;
+      arg_metadata.set_op_name(arg.node_name);
+      if (arg.dynamic_dim==0) {
+        arg_metadata.set_op_type(
+            absl::StrCat("XLA_Arg_dyn[",arg.dynamic_dim, "]"));
+      }
+      builder->SetOneShotOpMetadata(arg_metadata);
+      
       if (is_entry_computation) {
         // Add an entry to is_same_across_replicas for every leaf buffer.
         std::vector<bool> is_same_across_replicas(
