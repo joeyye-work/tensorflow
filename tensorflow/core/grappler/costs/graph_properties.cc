@@ -2041,6 +2041,7 @@ class SymbolicShapeRefiner {
       }
 
       bool changed = false;
+      const bool force_fresh_unknown_dim = node->op() == "Reshape";
       std::vector<DimensionHandle> dims;
       dims.reserve(ic->Rank(s));
       for (int d = 0; d < ic->Rank(s); ++d) {
@@ -2053,7 +2054,7 @@ class SymbolicShapeRefiner {
         }
         // If already tagged with expr, keep it.
         auto* dim_expr = ic->GetDimExpr(dim);
-        if (dim_expr != nullptr) {
+        if (dim_expr != nullptr && !force_fresh_unknown_dim) {
           dims.push_back(dim);
           continue;
         }
