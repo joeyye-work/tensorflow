@@ -97,7 +97,7 @@ class SegmentReduce : public XlaOpKernel {
 
     auto buffer =
         xla::Broadcast(InitialValue(builder), buffer_shape.dim_sizes(),
-                       buffer_shape.get_expressions());
+                       buffer_shape.get_filled_expressions());
 
     // Build dynamic dim sizes for buffer, as well as whether each dimension
     // size is dynamic or static. We build two parts: num_sgement part and

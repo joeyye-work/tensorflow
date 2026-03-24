@@ -69,7 +69,7 @@ class TileOp : public XlaOpKernel {
     std::vector<int64_t> output_dims(input_shape.dims());
     std::vector<xla::DynExpr*> output_exprs(input_shape.dims());
 
-    auto expr_sizes = input_shape.get_expressions();
+    auto expr_sizes = input_shape.get_filled_expressions();
 
     for (int64_t i = 0; i < input_shape.dims(); ++i) {
       OP_REQUIRES(ctx, multiples_bounds[i] >= 0,

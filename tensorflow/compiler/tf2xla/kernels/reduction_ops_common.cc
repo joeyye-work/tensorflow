@@ -112,7 +112,7 @@ void XlaReductionOp::Compile(XlaOpKernelContext* ctx) {
       // If we are not reducing along dimension i.
       int64_t dim = data_shape.dim_size(i);
       final_shape.push_back(dim);
-      final_exprs.push_back(data_shape.get_expression(i));
+      final_exprs.push_back(data_shape.get_filled_expression(i));
     } else if (keep_dims_) {
       // We are reducing along dimension i, but we want to keep the
       // same number of dimensions, so we set the dimension of i to

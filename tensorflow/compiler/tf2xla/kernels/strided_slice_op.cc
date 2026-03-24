@@ -83,7 +83,7 @@ class StridedSliceOp : public XlaOpKernel {
             i,
             input_shape.dim_size(shape_spec.output_to_processing_mapping[i]));
         partial_final_shape.set_expression(
-            i, input_shape.get_expression(
+            i, input_shape.get_filled_expression(
                    shape_spec.output_to_processing_mapping[i]));
       }
     }
@@ -101,7 +101,7 @@ class StridedSliceOp : public XlaOpKernel {
         // dimension is unknown, we use input shape as bound.
         partial_processing_shape.set_dim(i, input_shape.dim_size(i));
         partial_processing_shape.set_expression(i,
-                                                input_shape.get_expression(i));
+                                                input_shape.get_filled_expression(i));
       }
     }
     TensorShape processing_shape;
@@ -224,11 +224,11 @@ class StridedSliceOp : public XlaOpKernel {
 
     slice =
         xla::DynamicSlice(slice, start_indices, processing_shape.dim_sizes(),
-                          processing_shape.get_expressions());
+                          processing_shape.get_filled_expressions());
     // new_axis_mask_, ellipsis_mask_ and shrink_axis_mask_ may add or remove
     // size 1 dims of a shape.
     slice = xla::Reshape(slice, final_shape.dim_sizes(),
-                         final_shape.get_expressions());
+                         final_shape.get_filled_expressions());
     for (int64_t i = 0; i < final_shape.dims(); ++i) {
       int64 processing_shape_dim = shape_spec.output_to_processing_mapping[i];
       // If processing_shape_dim is -1, it means the output dimension was newly
@@ -319,7 +319,7 @@ class StridedSliceOp : public XlaOpKernel {
         } else {
           // Negative stride: swap begin and end, add 1 because the interval
           // is semi-open, and mark the dimension to be reversed.
-          auto input_exprs = input_shape.get_expressions();
+          auto input_exprs = input_shape.get_filled_expressions();
           slice_begin.push_back(input_shape.dim_size(i) - begin[i] - 1);
           slice_begin_expr.push_back(
               (*input_exprs[i] - *begin_expr[i] - 1)->s());
@@ -351,7 +351,7 @@ class StridedSliceOp : public XlaOpKernel {
           ends_are_dynamic, [](bool dynamic) { return !dynamic; });
       // Static output shape, return a static slice.
       slice = xla::Reshape(slice, final_shape.dim_sizes(),
-                           final_shape.get_expressions());
+                           final_shape.get_filled_expressions());
       if (xla_shape.is_static() && ends_are_static) {
         ctx->SetOutput(0, slice);
         return;
@@ -487,12 +487,12 @@ class StridedSliceGradOp : public XlaOpKernel {
     VLOG(1) << "xla final_shape" << final_shape;
     VLOG(1) << "input_shape" << input_shape.DebugString();
     auto input_sizes = input_shape.dim_sizes();
-    auto input_exprs = input_shape.get_expressions();
+    auto input_exprs = input_shape.get_filled_expressions();
     // For unknown output dim the bound of the output shape is input.  Pad and
     // double the size of input shape to leave enough buffer to avoid OOB
     // dynamic update slice.
     auto input_sizes_padded = input_shape.dim_sizes();
-    auto input_exprs_padded = input_shape.get_expressions();
+    auto input_exprs_padded = input_shape.get_filled_expressions();
     bool need_padding = false;
     for (int64_t i = 0; i < processing_shape.dims(); ++i) {
       if (processing_shape.dim_size(i) == -1) {
@@ -540,7 +540,7 @@ class StridedSliceGradOp : public XlaOpKernel {
 
     zero = xla::Broadcast(zero, input_sizes_padded, input_exprs_padded);
     grad = xla::Reshape(grad, processing_shape.dim_sizes(),
-                        processing_shape.get_expressions());
+                        processing_shape.get_filled_expressions());
     grad = xla::DynamicUpdateSlice(zero, grad, begins);
     if (need_padding) {
       // We padded the input shape to avoid OOB when DUS. Now slice out the
@@ -610,7 +610,7 @@ class StridedSliceGradOp : public XlaOpKernel {
 
     // Undo any new/shrink axes.
     grad = xla::Reshape(grad, processing_shape.dim_sizes(),
-                        processing_shape.get_expressions());
+                        processing_shape.get_filled_expressions());
 
     // Pad the input gradients.
     absl::InlinedVector<int64_t, 4> dimensions_to_reverse;

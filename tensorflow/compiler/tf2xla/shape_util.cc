@@ -178,7 +178,7 @@ xla::Shape TensorShapeToXLAShape(xla::PrimitiveType type,
   MarkForCompilationPassFlags* flags = GetMarkForCompilationPassFlags();
   std::vector<xla::DynExpr*> expressions;
   if (flags->tf_xla_enable_dynamic_sizes) {
-    expressions = tensor_shape.get_filled_expressions();
+    expressions.resize(rank);
   }
   for (int d = 0; d < rank; ++d) {
     dimensions[d] = tensor_shape.dim_size(d);
@@ -186,6 +186,9 @@ xla::Shape TensorShapeToXLAShape(xla::PrimitiveType type,
       LOG(WARNING) << "Unable to convert TF shape with dynamic size to XLA "
                       "shape; returning unknown sentinel value";
       return xla::ShapeUtil::MakeShapeWithDenseLayout(type, {0}, {0});
+    }
+    if (flags->tf_xla_enable_dynamic_sizes) {
+      expressions[d] = tensor_shape.get_filled_expression(d);
     }
   }
   // XLA uses minor-to-major; Tensorflow uses major-to-minor.

@@ -128,7 +128,7 @@ class FakeQuantWithMinMaxArgsGradOp : public XlaOpKernel {
         xla::Le(nudged_input_min, input), xla::Le(input, nudged_input_max));
     xla::XlaOp zeroes = xla::Broadcast(XlaHelpers::Zero(b, data_type),
                                        gradient_shape.dim_sizes(),
-                                       gradient_shape.get_expressions());
+                                       gradient_shape.get_filled_expressions());
     xla::XlaOp output = xla::Select(between_nudged_min_max, gradient, zeroes);
     ctx->SetOutput(0, output);
   }
@@ -215,7 +215,7 @@ class FakeQuantWithMinMaxVarsGradOp : public XlaOpKernel {
         xla::Le(nudged_input_min, input), xla::Le(input, nudged_input_max));
     xla::XlaOp zero = XlaHelpers::Zero(b, data_type);
     xla::XlaOp zeroes = xla::Broadcast(zero, gradient_shape.dim_sizes(),
-                                       gradient_shape.get_expressions());
+                                       gradient_shape.get_filled_expressions());
     xla::XlaOp output0 = xla::Select(between_nudged_min_max, gradient, zeroes);
     ctx->SetOutput(0, output0);
 
@@ -352,7 +352,7 @@ class FakeQuantWithMinMaxVarsPerChannelGradOp : public XlaOpKernel {
         xla::Le(nudged_input_min, input), xla::Le(input, nudged_input_max));
     xla::XlaOp zero = XlaHelpers::Zero(b, data_type);
     xla::XlaOp zeroes = xla::Broadcast(zero, gradient_shape.dim_sizes(),
-                                       gradient_shape.get_expressions());
+                                       gradient_shape.get_filled_expressions());
     xla::XlaOp output0 = xla::Select(between_nudged_min_max, gradient, zeroes);
     ctx->SetOutput(0, output0);
 

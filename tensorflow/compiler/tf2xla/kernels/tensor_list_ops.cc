@@ -132,7 +132,7 @@ absl::Status TryGetElementShapeFromInput(XlaOpKernelContext* ctx,
   }
 
   *shape = xla::ShapeUtil::MakeShape(dtype, partial_shape.dim_sizes(),
-                                     partial_shape.get_expressions());
+                                     partial_shape.get_filled_expressions());
   *got_shape = true;
   return absl::OkStatus();
 }

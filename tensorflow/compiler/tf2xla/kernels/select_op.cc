@@ -73,7 +73,7 @@ class SelectOp : public XlaOpKernel {
 
       cond_handle = xla::BroadcastInDim(cond_handle, then_shape.dim_sizes(),
                                         broadcast_dimensions,
-                                        then_shape.get_expressions());
+                                        then_shape.get_filled_expressions());
     }
     ctx->SetOutput(0, xla::Select(cond_handle, then_handle, else_handle));
   }

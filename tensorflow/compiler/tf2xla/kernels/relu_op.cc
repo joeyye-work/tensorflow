@@ -91,10 +91,10 @@ class Relu6GradOp : public XlaOpKernel {
     const TensorShape shape = ctx->InputShape(0);
     const auto zero =
         xla::Broadcast(XlaHelpers::Zero(b, input_type(0)), shape.dim_sizes(),
-                       shape.get_expressions());
+                       shape.get_filled_expressions());
     const auto six =
         xla::Broadcast(XlaHelpers::IntegerLiteral(b, input_type(0), 6),
-                       shape.dim_sizes(), shape.get_expressions());
+                       shape.dim_sizes(), shape.get_filled_expressions());
     auto out = xla::Select(
         xla::And(xla::Lt(ctx->Input(1), six), xla::Gt(ctx->Input(1), zero)),
         ctx->Input(0), zero);

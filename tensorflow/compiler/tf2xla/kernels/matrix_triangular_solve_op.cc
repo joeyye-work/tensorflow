@@ -100,7 +100,7 @@ MatrixTriangularSolveOp::Broadcast(xla::XlaOp lhs, const TensorShape& lhs_shape,
   lhs_broadcast_shape.AddDim(m);
   lhs_broadcast_shape.AddExpression(xla::DynExpr::_(m));
   auto lhs_output = BroadcastTo(lhs, lhs_broadcast_shape.dim_sizes(),
-                                lhs_broadcast_shape.get_expressions());
+                                lhs_broadcast_shape.get_filled_expressions());
   if (!lhs_output.ok()) {
     xla::XlaOp error = lhs.builder()->ReportError(lhs_output.status());
     return {error, error};
@@ -112,7 +112,7 @@ MatrixTriangularSolveOp::Broadcast(xla::XlaOp lhs, const TensorShape& lhs_shape,
   rhs_broadcast_shape.AddDim(n);
   rhs_broadcast_shape.AddExpression(xla::DynExpr::_(n));
   auto rhs_output = BroadcastTo(rhs, rhs_broadcast_shape.dim_sizes(),
-                                rhs_broadcast_shape.get_expressions());
+                                rhs_broadcast_shape.get_filled_expressions());
   if (!rhs_output.ok()) {
     xla::XlaOp error = rhs.builder()->ReportError(rhs_output.status());
     return {error, error};

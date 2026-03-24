@@ -73,7 +73,7 @@ class SliceOp : public XlaOpKernel {
           // A size[i] of -1 means "all elements from begin[i] to dim_size(i)".
           wrapped_size[i] = input_shape.dim_size(i) - begin[i];
           wrapped_size_exprs[i] =
-              (*input_shape.get_expression(i) - begin[i])->s();
+              (*input_shape.get_filled_expression(i) - begin[i])->s();
         } else {
           wrapped_size[i] = size[i];
           wrapped_size_exprs[i] = xla::DynExpr::_(size[i]);

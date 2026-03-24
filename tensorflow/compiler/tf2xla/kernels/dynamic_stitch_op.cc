@@ -179,7 +179,7 @@ class DynamicStitchOp : public XlaOpKernel {
       // Then the rest are the common extra shape.
       for (int d = indices0_shape.dims(); d < data0_shape.dims(); d++) {
         new_shape.AddDim(data0_shape.dim_size(d));
-        new_shape.AddExpression(data0_shape.get_expression(d));
+        new_shape.AddExpression(data0_shape.get_filled_expression(d));
       }
       // Get the data, shaped appropriately.
       auto handle = data[input_num];

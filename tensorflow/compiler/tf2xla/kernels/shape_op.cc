@@ -290,7 +290,7 @@ class ExpandDimsOp : public XlaOpKernel {
                                         " dimensions."));
 
     auto existing_dims = input_shape.dim_sizes();
-    auto existing_exprs = input_shape.get_expressions();
+    auto existing_exprs = input_shape.get_filled_expressions();
 
     // Safe - # elements in tensor dims bounded.
     const int existing_dims_size = static_cast<int>(existing_dims.size());
@@ -469,7 +469,7 @@ class OnesLikeOp : public XlaOpKernel {
 
     auto one = XlaHelpers::One(ctx->builder(), input_type(0));
     ctx->SetOutput(0, xla::Broadcast(one, input_shape.dim_sizes(),
-                                     input_shape.get_expressions()));
+                                     input_shape.get_filled_expressions()));
   }
 };
 

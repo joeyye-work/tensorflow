@@ -13,7 +13,7 @@ bool ParseTensorShapeExpressionsEnabled() {
   bool tf_xla_enable_dynamic_sizes = false;
   std::vector<tsl::Flag> flag_list = {
       tsl::Flag("tf_xla_enable_dynamic_sizes", &tf_xla_enable_dynamic_sizes,
-                "Legacy XLA flag for enabling XLA dynamic sizes."),
+                "XLA flag for enabling XLA dynamic sizes."),
   };
   xla::ParseFlagsFromEnvAndIgnoreUnknown("TF_XLA_FLAGS", flag_list);
   return tf_xla_enable_dynamic_sizes;

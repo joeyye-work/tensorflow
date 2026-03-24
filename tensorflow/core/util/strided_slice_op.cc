@@ -330,12 +330,12 @@ absl::Status ValidateStridedSliceOp(
   *slice_dim0 = true;
   *is_simple_slice = true;
   processing_shape->Clear();
+  auto dim_exprs = input_shape.get_filled_expressions();
   for (int i = 0; i < input_shape.dims(); ++i) {
     int64_t& begin_i = (*begin)[i];
     int64_t& end_i = (*end)[i];
     int64_t& stride_i = (*strides)[i];
     int64_t dim_i = input_shape.dim_size(i);
-    auto dim_exprs = input_shape.get_expressions();
 
     xla::DynExpr* dim_i_expr =
         i < dim_exprs.size() ? dim_exprs[i] : xla::DynExpr::_(dim_i);
@@ -515,7 +515,7 @@ absl::Status ValidateStridedSliceOp(
     if (gather_index >= 0) {
       final_shape->AddDim(processing_shape->dim_size(gather_index));
       final_shape->AddExpression(
-          processing_shape->get_expression(gather_index));
+          processing_shape->get_filled_expression(gather_index));
       if (shape_spec != nullptr) {
         shape_spec->output_to_sparse_mapping.push_back(sparse_index);
         shape_spec->output_to_processing_mapping.push_back(gather_index);

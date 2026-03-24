@@ -81,7 +81,7 @@ class SplitOp : public XlaOpKernel {
     // All the slices are the same size: this is the size along the
     // split dimension.
     const int32_t slice_size = input_shape.dim_size(split_dim) / num_split;
-    auto slice_expr = *input_shape.get_expression(split_dim) / num_split;
+    auto slice_expr = *input_shape.get_filled_expression(split_dim) / num_split;
 
     // The vectors we will use to define the slice. The entry for the
     // split dimensions varies for each output.
@@ -95,7 +95,7 @@ class SplitOp : public XlaOpKernel {
       // the split dimension is filled in below.
       int64_t dim = input_shape.dim_size(i);
       limits[i] = dim;
-      limits_expr[i] = input_shape.get_expression(i);
+      limits_expr[i] = input_shape.get_filled_expression(i);
     }
 
     // Create each of the outputs.
@@ -219,7 +219,7 @@ class SplitVOp : public XlaOpKernel {
     std::vector<int64_t> strides(input_shape.dims(), 1);
     std::vector<xla::DynExpr*> begin_expr(input_shape.dims(),
                                           xla::DynExpr::zero);
-    auto input_exprs = input_shape.get_expressions();
+    auto input_exprs = input_shape.get_filled_expressions();
     std::vector<xla::DynExpr*> limits_expr(input_exprs.begin(),
                                            input_exprs.end());
     for (int i = 0; i < num_split; ++i) {

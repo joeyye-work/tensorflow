@@ -423,22 +423,22 @@ class StatelessParameterizedTruncatedNormalOp : public XlaOpKernel {
     OP_REQUIRES_OK(ctx, TensorShapeToXLAShape(rng_dtype, shape, &xla_shape));
 
     auto bcasted_means =
-        BroadcastTo(ctx->Input(2), shape.dim_sizes(), shape.get_expressions());
+        BroadcastTo(ctx->Input(2), shape.dim_sizes(), shape.get_filled_expressions());
     OP_REQUIRES_OK(ctx, bcasted_means.status());
     auto means = bcasted_means.value();
 
     auto bcasted_stddevs =
-        BroadcastTo(ctx->Input(3), shape.dim_sizes(), shape.get_expressions());
+        BroadcastTo(ctx->Input(3), shape.dim_sizes(), shape.get_filled_expressions());
     OP_REQUIRES_OK(ctx, bcasted_stddevs.status());
     auto stddevs = bcasted_stddevs.value();
 
     auto bcasted_minvals =
-        BroadcastTo(ctx->Input(4), shape.dim_sizes(), shape.get_expressions());
+        BroadcastTo(ctx->Input(4), shape.dim_sizes(), shape.get_filled_expressions());
     OP_REQUIRES_OK(ctx, bcasted_minvals.status());
     auto minvals = bcasted_minvals.value();
 
     auto bcasted_maxvals =
-        BroadcastTo(ctx->Input(5), shape.dim_sizes(), shape.get_expressions());
+        BroadcastTo(ctx->Input(5), shape.dim_sizes(), shape.get_filled_expressions());
     OP_REQUIRES_OK(ctx, bcasted_maxvals.status());
     auto maxvals = bcasted_maxvals.value();
 

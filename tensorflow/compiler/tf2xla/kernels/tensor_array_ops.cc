@@ -169,7 +169,7 @@ class TensorArrayOp : public XlaOpKernel {
       ta_shape.AppendShape(shape);
       xla::XlaOp zero = XlaHelpers::Zero(b, dtype_);
       value = xla::Broadcast(zero, ta_shape.dim_sizes(),
-                             ta_shape.get_expressions());
+                             ta_shape.get_filled_expressions());
     }
 
     XlaResource* var =
@@ -226,7 +226,7 @@ class TensorArrayWriteOp : public XlaOpKernel {
     TensorShape slice_shape = elem_shape;
     slice_shape.InsertDim(0, 1LL);
     auto update = xla::Reshape(value, slice_shape.dim_sizes(),
-                               slice_shape.get_expressions());
+                               slice_shape.get_filled_expressions());
 
     xla::XlaOp written;
     if (resource->tensor_array_multiple_writes_aggregate()) {
@@ -277,7 +277,7 @@ class TensorArrayReadOp : public XlaOpKernel {
     start_indices[0] = index;
 
     auto slice_shape = ta_shape.dim_sizes();
-    auto slice_exprs = ta_shape.get_expressions();
+    auto slice_exprs = ta_shape.get_filled_expressions();
     slice_shape[0] = 1LL;
     slice_exprs[0] = xla::DynExpr::_(1LL);
 
@@ -475,11 +475,11 @@ class TensorArrayConcatOp : public XlaOpKernel {
     xla::XlaOp ta = resource->value();
 
     auto ta_dims = ta_shape.dim_sizes();
-    auto ta_exprs = ta_shape.get_expressions();
+    auto ta_exprs = ta_shape.get_filled_expressions();
     std::vector<int64_t> shape(ta_dims.begin() + 1, ta_dims.end());
     std::vector<xla::DynExpr*> exprs(ta_exprs.begin() + 1, ta_exprs.end());
     shape[0] *= ta_shape.dim_size(0);
-    exprs[0] = *ta_exprs[0] * *ta_shape.get_expression(0);
+    exprs[0] = *ta_exprs[0] * *ta_shape.get_filled_expression(0);
     ctx->SetOutput(0, xla::Reshape(ta, shape, exprs));
 
     Tensor lengths(DT_INT64, {ta_dims[0]});
@@ -552,7 +552,7 @@ class TensorArraySplitOp : public XlaOpKernel {
                                         ta_shape.DebugString()));
 
     const xla::XlaOp reshape =
-        xla::Reshape(value, ta_shape.dim_sizes(), ta_shape.get_expressions());
+        xla::Reshape(value, ta_shape.dim_sizes(), ta_shape.get_filled_expressions());
     if (dtype_ == DT_BOOL) {
       ta = xla::Or(ta, reshape);
     } else {

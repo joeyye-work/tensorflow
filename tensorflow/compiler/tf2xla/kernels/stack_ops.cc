@@ -158,7 +158,7 @@ class StackPushOp : public XlaOpKernel {
     TensorShape slice_shape = elem_shape;
     slice_shape.InsertDim(0, 1LL);
     auto update = xla::Reshape(value, slice_shape.dim_sizes(),
-                               slice_shape.get_expressions());
+                               slice_shape.get_filled_expressions());
 
     // TODO(phawkins): We don't check the index is in bounds --- there is no
     // error mechanism in XLA.

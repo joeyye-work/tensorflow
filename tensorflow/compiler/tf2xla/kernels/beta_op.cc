@@ -64,13 +64,13 @@ class BetaincOp : public XlaOpKernel {
         builder->ReportErrorOrReturn([&]() -> absl::StatusOr<xla::XlaOp> {
           TF_ASSIGN_OR_RETURN(
               auto a, BroadcastTo(ctx->Input(0), merged_shape.dim_sizes(),
-                                  merged_shape.get_expressions()));
+                                  merged_shape.get_filled_expressions()));
           TF_ASSIGN_OR_RETURN(
               auto b, BroadcastTo(ctx->Input(1), merged_shape.dim_sizes(),
-                                  merged_shape.get_expressions()));
+                                  merged_shape.get_filled_expressions()));
           TF_ASSIGN_OR_RETURN(
               auto x, BroadcastTo(ctx->Input(2), merged_shape.dim_sizes(),
-                                  merged_shape.get_expressions()));
+                                  merged_shape.get_filled_expressions()));
           return xla::RegularizedIncompleteBeta(a, b, x);
         });
     ctx->SetOutput(0, result);
