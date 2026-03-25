@@ -263,6 +263,9 @@ class MarkForCompilationPassImpl {
     int chain_id() const {return chain_id_;}
     void set_chain_id(int id) {chain_id_ = id;}
     void add_dim_var(int dim_var) { dim_vars_.insert(dim_var); }
+    void merge_dim_vars(const std::set<int>& dim_vars) {
+      dim_vars_.insert(dim_vars.begin(), dim_vars.end());
+    }
     const std::set<int>& dim_vars() const { return dim_vars_; }
 
    private:
@@ -639,6 +642,9 @@ void MarkForCompilationPassImpl::Cluster::Merge(Cluster* other) {
   if (!xla_scope_.has_value()) {
     xla_scope_ = std::move(other->xla_scope_);
   }
+
+  merge_dim_vars(other->dim_vars_);
+  other->dim_vars_.clear();
 
   resource_var_operation_node_ids_.reserve(
       resource_var_operation_node_ids_.size() +
