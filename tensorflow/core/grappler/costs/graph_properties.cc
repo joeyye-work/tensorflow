@@ -1999,7 +1999,7 @@ class SymbolicShapeRefiner {
       if (!ic->RankKnown(s)) {
         bool recovered_rank = false;
         auto it = node->attr().find("_output_shapes");
-        if(it != node->attr().end() && out < it->second.list().shape_size()){
+        if(it == node->attr().end()){
           it = node->attr().find("shape");
         }
         if (it != node->attr().end() && out < it->second.list().shape_size()) {
@@ -2021,7 +2021,6 @@ class SymbolicShapeRefiner {
             recovered_rank = true;
           }
         }
-
         if (!recovered_rank && node->op() == "_Arg") {
           DimensionHandle d0 = GetUnknownOutputDim(node, out, /*dim_id=*/0);
           ShapeHandle vec = ic->MakeShape({d0});
