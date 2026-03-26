@@ -84,7 +84,9 @@ class TensorShapeRep {
 
   // Get the array of dynamic multipliers.
   std::vector<xla::DynExpr*> get_expressions() const {
-    return expressions_;
+    const size_t limit = std::min<size_t>(expressions_.size(), ndims_byte());
+    return std::vector<xla::DynExpr*>(expressions_.begin(),
+                                      expressions_.begin() + limit);
   }
 
   // Get the array of dynamic multipliers, filling missing entries with
