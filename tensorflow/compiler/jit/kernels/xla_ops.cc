@@ -426,7 +426,7 @@ static xla::DynExpr* DimExprToDynExpr(const DimExpr* e) {
     }
     case DimExpr::Kind::kVariable: {
       auto* av = static_cast<const Variable*>(e);
-      return xla::DynExpr::V(1);
+      return xla::DynExpr::V(av->id());
     }
     case DimExpr::Kind::kAdd: {
       auto* ee = static_cast<const ExprAdd*>(e);
@@ -446,6 +446,13 @@ static xla::DynExpr* DimExprToDynExpr(const DimExpr* e) {
     }
   }
   return nullptr;
+}
+
+static int64_t GetSingleDynamicVarId(const xla::DynExpr* expr) {
+  CHECK_NE(expr, nullptr);
+  auto ids = expr->get_all_ids();
+  CHECK_EQ(ids.size(), 1);
+  return ids.front();
 }
 
 
@@ -685,10 +692,12 @@ absl::Status CompileToLocalExecutable(
         for (int j = 0; j < shp.get_expressions().size(); ++j) {
           auto e = shp.get_expression(j);
           if (e->is_dynamic()) {
+            int64_t dynamic_var_id = GetSingleDynamicVarId(e);
             int64_t old = shp.dim_size(j);
             old_vars.push_back({i, j, old});
             xla::DynExpr* padded_expr = xla::DynExpr::_(filled_batch);
-            xla::DynExpr* subst_expr = e->substitute(1, padded_expr)->s();
+            xla::DynExpr* subst_expr =
+                e->substitute(dynamic_var_id, padded_expr)->s();
             int64_t new_dim = subst_expr->get_val();
             if (new_dim >= 0) {
               shp.set_dim(j, new_dim);
