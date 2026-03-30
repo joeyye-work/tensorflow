@@ -62,7 +62,7 @@ bool IsNonComplexNonBatchedMatrixVectorDot(const HloInstruction* hlo) {
 bool HasDynamicDimensions(const Shape& shape) {
   for (int64_t i = 0; i < shape.dimensions().size(); ++i) {
     if (shape.is_dynamic_dimension(i) ||
-        (shape.expressions(i) && shape.expressions(i)->is_dynamic())) {
+        shape.expressions(i)->is_dynamic()) {
       return true;
     }
   }
