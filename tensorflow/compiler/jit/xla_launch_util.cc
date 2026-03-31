@@ -68,6 +68,13 @@ namespace {
 using xla::ScopedShapedBuffer;
 using xla::ShapedBuffer;
 
+int64_t GetSingleDynamicVarId(const xla::DynExpr* expr) {
+  CHECK_NE(expr, nullptr);
+  auto ids = expr->get_all_ids();
+  CHECK_EQ(ids.size(), 1);
+  return ids.front();
+}
+
 // Fetch the platform Id from device.
 se::Platform::Id XlaPlatformInfoFromDevice(DeviceBase* device_base) {
   auto device = static_cast<Device*>(device_base);
@@ -444,10 +451,12 @@ absl::Status XlaComputationLaunchContext::PopulateOutputs(
         auto expr = subshape.expressions(dim);
         if (expr != nullptr && expr->is_dynamic()) {
           has_dynamic = true;
+          int64_t dynamic_var_id = GetSingleDynamicVarId(expr);
           VLOG(1) << "Current expression is " << expr;
           if (run_options) {
             xla::DynExpr* batch_size = xla::DynExpr::_(run_options->batch_size());
-            xla::DynExpr* subst_expr = expr->substitute(1, batch_size)->s();
+            xla::DynExpr* subst_expr =
+                expr->substitute(dynamic_var_id, batch_size)->s();
             shape.set_dim(dim, subst_expr->get_val());
           } else {
             // TODO: Fallback to BatchSizeResource for now. Remove it later.
@@ -457,8 +466,8 @@ absl::Status XlaComputationLaunchContext::PopulateOutputs(
             TF_RETURN_IF_ERROR(step_container->Lookup<BatchSizeResource>(
                           ctx->resource_manager(), BatchSizeResourceName, &bsr));
             xla::DynExpr* batch_size = xla::DynExpr::_(bsr->GetBatchSize());
-            // Just substitute Var(1) for now.
-            xla::DynExpr* subst_expr = expr->substitute(1, batch_size)->s();
+            xla::DynExpr* subst_expr =
+                expr->substitute(dynamic_var_id, batch_size)->s();
             shape.set_dim(dim, subst_expr->get_val());
             bsr->Unref();
           }
