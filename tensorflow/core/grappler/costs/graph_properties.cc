@@ -2107,7 +2107,9 @@ class SymbolicShapeRefiner {
       }
     }
     // Update NodeContext output fields after shape inference function runs.
-    status.Update(CanonicalizeOutputDims(&node));
+    if (TensorShapeExpressionsEnabled()) {
+      status.Update(CanonicalizeOutputDims(&node));
+    }
     status.Update(MaybeUpdateNodeContextOutput(node, is_fed, c));
 
     return status;

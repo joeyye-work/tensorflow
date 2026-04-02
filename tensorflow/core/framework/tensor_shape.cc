@@ -496,8 +496,11 @@ void TensorShapeRep::set_expression(int d, xla::DynExpr* expr) {
     expressions_.clear();
     return;
   }
-  if (expressions_.size() <= static_cast<size_t>(d)) {
-    expressions_.resize(d + 1, nullptr);
+  CHECK_GE(d, 0);
+  CHECK_LT(d, ndims_byte());
+  const size_t new_size = static_cast<size_t>(d) + 1;
+  if (expressions_.size() < new_size) {
+    expressions_.resize(new_size, nullptr);
   }
   expressions_[d] = expr;
 }
@@ -514,6 +517,9 @@ void TensorShapeRep::set_expressions(std::vector<xla::DynExpr*> exprs) {
   if (!kTensorShapeExpressionsEnabled) {
     expressions_.clear();
     return;
+  }
+  if (exprs.size() > ndims_byte()) {
+    exprs.resize(ndims_byte());
   }
   while (!exprs.empty() && exprs.back() == nullptr) {
     exprs.pop_back();
