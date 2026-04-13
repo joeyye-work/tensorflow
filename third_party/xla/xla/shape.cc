@@ -42,7 +42,7 @@ limitations under the License.
 namespace xla {
 
 const DExpr& Shape::MissingExpression() {
-  static const DExpr missing = DExpr::Unknown();
+  static const DExpr missing = DExpr::Unknown(kMissingExpressionSentinel);
   return missing;
 }
 

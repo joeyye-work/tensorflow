@@ -56,7 +56,7 @@ xla::DExpr DExprFromProto(const ExpressionProto& proto) {
     }
     case ExpressionProto::NODE_TYPE_NOT_SET:
     default:
-      return xla::DExpr::Unknown();
+      return xla::DExpr::Unknown(xla::kMissingExpressionSentinel);
   }
 }
 
@@ -485,9 +485,11 @@ void TensorShapeRep::set_expression(int d, xla::DExpr expr) {
     return;
   }
   if (expressions_.size() <= static_cast<size_t>(d)) {
-    expressions_.resize(d + 1, xla::DExpr::Unknown());
+    expressions_.resize(d + 1,
+                        xla::DExpr::Unknown(xla::kMissingExpressionSentinel));
   }
-  expressions_[d] = expr ? std::move(expr) : xla::DExpr::Unknown();
+  expressions_[d] = expr ? std::move(expr)
+                         : xla::DExpr::Unknown(xla::kMissingExpressionSentinel);
 }
 
 void TensorShapeRep::AddExpression(xla::DExpr expr) {
@@ -495,7 +497,9 @@ void TensorShapeRep::AddExpression(xla::DExpr expr) {
     return;
   }
   CHECK_LT(expressions_.size(), ndims_byte());
-  expressions_.push_back(expr ? std::move(expr) : xla::DExpr::Unknown());
+  expressions_.push_back(expr ? std::move(expr)
+                              : xla::DExpr::Unknown(
+                                    xla::kMissingExpressionSentinel));
 }
 
 void TensorShapeRep::set_expressions(std::vector<xla::DExpr> exprs) {
@@ -504,7 +508,7 @@ void TensorShapeRep::set_expressions(std::vector<xla::DExpr> exprs) {
     return;
   }
   for (auto& expr : exprs) {
-    if (!expr) expr = xla::DExpr::Unknown();
+    if (!expr) expr = xla::DExpr::Unknown(xla::kMissingExpressionSentinel);
   }
   expressions_ = std::move(exprs);
 }

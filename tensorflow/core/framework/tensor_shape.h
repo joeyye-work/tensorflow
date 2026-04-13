@@ -103,7 +103,8 @@ class TensorShapeRep {
   // Return the multiplier for a specific dynamic dimension.
   // -1 if the dimension is not dynamic.
   const xla::DExpr& get_expression(int64_t dimension) const {
-    static const xla::DExpr kMissingExpression = xla::DExpr::Unknown();
+    static const xla::DExpr kMissingExpression =
+        xla::DExpr::Unknown(xla::kMissingExpressionSentinel);
     if (dimension < 0) return kMissingExpression;
     const size_t dim = static_cast<size_t>(dimension);
     if (dim >= expressions_.size()) {
@@ -113,14 +114,16 @@ class TensorShapeRep {
   }
 
   xla::DExpr get_filled_expression(int64_t dimension) const {
-    if (dimension < 0) return xla::DExpr::Unknown();
+    if (dimension < 0) {
+      return xla::DExpr::Unknown(xla::kMissingExpressionSentinel);
+    }
     const size_t dim = static_cast<size_t>(dimension);
     if (dim < expressions_.size() && expressions_[dim]) {
       return expressions_[dim];
     }
 
     if (ndims_byte() == kUnknownRank || dim >= ndims_byte()) {
-      return xla::DExpr::Unknown();
+      return xla::DExpr::Unknown(xla::kMissingExpressionSentinel);
     }
 
     return constant_expression_for_dim(dim);

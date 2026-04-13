@@ -31,6 +31,8 @@ limitations under the License.
 
 namespace xla {
 
+inline constexpr int kMissingExpressionSentinel = -1000001;
+
 enum class DExprKind {
   kUnknown,
   kConstant,
@@ -160,6 +162,10 @@ class UnknownExpr : public DynExpr {
   }
   DExprKind kind() const override { return DExprKind::kUnknown; }
   void print(xla::Printer* printer) const override {
+    if (id_ == kMissingExpressionSentinel) {
+      printer->Append("_");
+      return;
+    }
     printer->Append("?");
     if (id_ != 0) {
       printer->Append(id_);
@@ -577,7 +583,7 @@ inline DExpr DExprFromProto(const xla::ExpressionProto& proto) {
     }
     case ExpressionProto::NODE_TYPE_NOT_SET:
     default:
-      return DExpr::Unknown();
+      return DExpr::Unknown(kMissingExpressionSentinel);
   }
 }
 
