@@ -723,7 +723,13 @@ template <class Shape>
 void TensorShapeBase<Shape>::set_dim(int d, int64_t size) {
   CHECK_GE(d, 0);
   CHECK_LT(d, dims());
-  if (get_expressions().size() > d) set_expression(d, xla::DExpr::Const(size));
+  // After DExpr migration, missing slots may be normalized to Unknown().
+  // Preserve those placeholders here instead of materializing them into a
+  // concrete constant just because the dimension size changed.
+  if (get_expressions().size() > d &&
+      get_expression(d).kind() != xla::DExpr::Kind::kUnknown) {
+    set_expression(d, xla::DExpr::Const(size));
+  }
   if (!kIsPartial) {
     CHECK_GE(size, 0);
   }
@@ -785,7 +791,13 @@ absl::Status TensorShapeBase<Shape>::SetDimWithStatus(int d, int64_t size) {
     }
   }
 
-  if (get_expressions().size() > d) set_expression(d, xla::DExpr::Const(size));
+  // After DExpr migration, missing slots may be normalized to Unknown().
+  // Preserve those placeholders here instead of materializing them into a
+  // concrete constant just because the dimension size changed.
+  if (get_expressions().size() > d &&
+      get_expression(d).kind() != xla::DExpr::Kind::kUnknown) {
+    set_expression(d, xla::DExpr::Const(size));
+  }
   return RecomputeNumElements();
 }
 
