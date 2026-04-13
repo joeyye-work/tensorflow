@@ -31,6 +31,8 @@ limitations under the License.
 
 namespace xla {
 
+// Reserved sentinel for "missing expression". Keep this outside the normal
+// expression id space so it cannot be confused with a real UnknownExpr id.
 inline constexpr int kMissingExpressionSentinel = -1000001;
 
 enum class DExprKind {
