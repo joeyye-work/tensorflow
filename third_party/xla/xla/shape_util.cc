@@ -123,6 +123,7 @@ void PrintBufferShape(Printer* printer, const Shape& shape) {
 // its Layout.
 absl::StatusOr<Shape> MakeShapeWithLayoutInternal(
     PrimitiveType element_type, absl::Span<const int64_t> dimensions,
+    absl::Span<const DExpr> expressions,
     absl::Span<const int64_t> minor_to_major,
     absl::Span<const Tile> tiles, int64_t tail_padding_alignment_in_elements,
     PrimitiveType index_primitive_type, PrimitiveType pointer_primitive_type,
@@ -139,7 +140,8 @@ absl::StatusOr<Shape> MakeShapeWithLayoutInternal(
                            PrimitiveType_Name(element_type));
   }
   TF_ASSIGN_OR_RETURN(Shape shape,
-                      ShapeUtil::MakeValidatedShape(element_type, dimensions));
+                      ShapeUtil::MakeValidatedShape(element_type, dimensions,
+                                                     expressions));
   if (element_size_in_bits ==
       ShapeUtil::ByteSizeOfPrimitiveType(element_type) * 8) {
     // Only set element_size_in_bits if it's different from the default value.
@@ -383,11 +385,29 @@ static std::vector<DExpr> MakeExpressions(
 
 /* static */ Shape ShapeUtil::MakeShapeWithDenseLayout(
     PrimitiveType element_type, absl::Span<const int64_t> dimensions,
+    absl::Span<const DExpr> expressions,
     absl::Span<const int64_t> minor_to_major, absl::Span<const Tile> tiles,
     int64_t tail_padding_alignment_in_elements, int64_t element_size_in_bits,
     int64_t memory_space, absl::Span<const SplitConfig> split_configs) {
   auto ret = MakeShapeWithLayoutInternal(
-      element_type, dimensions, minor_to_major, tiles,
+      element_type, dimensions, expressions, minor_to_major, tiles,
+      tail_padding_alignment_in_elements,
+      /*index_primitive_type=*/PRIMITIVE_TYPE_INVALID,
+      /*pointer_primitive_type=*/PRIMITIVE_TYPE_INVALID, element_size_in_bits,
+      memory_space, split_configs,
+      /*physical_shape=*/std::nullopt);
+  TF_CHECK_OK(ret.status());
+  return *ret;
+}
+
+/* static */ Shape ShapeUtil::MakeShapeWithDenseLayout(
+    PrimitiveType element_type, absl::Span<const int64_t> dimensions,
+    absl::Span<const int64_t> minor_to_major, absl::Span<const Tile> tiles,
+    int64_t tail_padding_alignment_in_elements, int64_t element_size_in_bits,
+    int64_t memory_space, absl::Span<const SplitConfig> split_configs) {
+  auto ret = MakeShapeWithLayoutInternal(
+      element_type, dimensions, MakeExpressions(dimensions), minor_to_major,
+      tiles,
       tail_padding_alignment_in_elements,
       /*index_primitive_type=*/PRIMITIVE_TYPE_INVALID,
       /*pointer_primitive_type=*/PRIMITIVE_TYPE_INVALID, element_size_in_bits,
@@ -404,7 +424,7 @@ static std::vector<DExpr> MakeExpressions(
     int64_t tail_padding_alignment_in_elements, int64_t element_size_in_bits,
     int64_t memory_space, std::optional<Shape> physical_shape) {
   auto ret = MakeShapeWithLayoutInternal(
-      element_type, dimensions, minor_to_major,
+      element_type, dimensions, MakeExpressions(dimensions), minor_to_major,
       /*tiles=*/{}, tail_padding_alignment_in_elements, index_primitive_type,
       pointer_primitive_type, element_size_in_bits, memory_space,
       /*split_configs=*/{}, std::move(physical_shape));
@@ -441,13 +461,9 @@ static std::vector<DExpr> MakeExpressions(
 /* static */ Shape ShapeUtil::MakeShapeWithDescendingLayout(
     PrimitiveType element_type, absl::Span<const int64_t> dimensions,
     absl::Span<const DExpr> expressions) {
-  auto shape = MakeShapeWithDenseLayout(element_type, dimensions,
-                                        LayoutUtil::MakeDescendingLayout(
-                                            dimensions.size())
-                                            .minor_to_major());
-  std::vector<DExpr> exprs(expressions.begin(), expressions.end());
-  shape.set_expressions(exprs);
-  return shape;
+  return MakeShapeWithDenseLayout(
+      element_type, dimensions, expressions,
+      LayoutUtil::MakeDescendingLayout(dimensions.size()).minor_to_major());
 }
 
 /* static */ Shape
@@ -461,7 +477,17 @@ ShapeUtil::MakeShapeWithDescendingLayoutAndSamePhysicalLayout(
     }
     dims[i] = shape.dimensions(dim);
   }
-  Shape new_shape = MakeShapeWithDescendingLayout(shape.element_type(), dims);
+  std::vector<DExpr> expressions;
+  expressions.reserve(shape.dimensions().size());
+  for (int i = 0; i < shape.dimensions().size(); ++i) {
+    int dim = i;
+    if (shape.has_layout()) {
+      dim = LayoutUtil::Major(shape.layout(), dim);
+    }
+    expressions.push_back(shape.expressions(dim));
+  }
+  Shape new_shape = MakeShapeWithDescendingLayout(shape.element_type(), dims,
+                                                  expressions);
   // Since the physical layout is kept the same, the tiles and element size are
   // the same also.
   if (shape.has_layout()) {
@@ -1839,7 +1865,8 @@ ShapeUtil::DecomposeBitcastToTrt(const Shape& input_shape,
   }
 
   Shape output_shape_with_layout = MakeShapeWithDenseLayout(
-      output_shape.element_type(), output_shape.dimensions(), output_layout);
+      output_shape.element_type(), output_shape.dimensions(),
+      output_shape.expressions(), output_layout);
   CHECK(ReshapeIsBitcast(input_shape, output_shape_with_layout))
       << "reshape is not a bitcast for input_shape: "
       << ShapeUtil::HumanStringWithLayout(input_shape)
@@ -2072,7 +2099,8 @@ struct ParallelState {
   }
 
   // Create the shape of the "work" which has same layout as the original shape.
-  Shape work_shape = ShapeUtil::MakeShape(shape.element_type(), work_dims);
+  Shape work_shape = ShapeUtil::MakeShape(shape.element_type(), work_dims,
+                                          shape.expressions());
   *work_shape.mutable_layout() = shape.layout();
 
   // We target one task (partition) per available thread.

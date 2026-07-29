@@ -1316,6 +1316,7 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
         x = instr->AddInstruction(op.first->CloneWithNewOperands(
             ShapeUtil::MakeShapeWithDenseLayout(
                 x->shape().element_type(), op.first->shape().dimensions(),
+                op.first->shape().expressions(),
                 op.first->shape().layout().minor_to_major()),
             operands));
       }
@@ -1378,6 +1379,7 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
         instr->AddInstruction(HloInstruction::CreateCustomCall(
             ShapeUtil::MakeShapeWithDenseLayout(
                 instr->shape().element_type(), new_output_shape.dimensions(),
+                new_output_shape.expressions(),
                 instr->shape().layout().minor_to_major()),
             operands_list, kCublasLtMatmulF8CallTarget));
     TF_RETURN_IF_ERROR(new_custom_call->set_backend_config(gpu_backend_config));

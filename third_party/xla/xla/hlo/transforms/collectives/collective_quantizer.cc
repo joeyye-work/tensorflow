@@ -121,6 +121,7 @@ HloInstruction* ApplyUnaries(HloInstruction* instr,
     instr = instr->AddInstruction(unary->CloneWithNewOperands(
         ShapeUtil::MakeShapeWithDenseLayout(
             instr->shape().element_type(), unary->shape().dimensions(),
+            unary->shape().expressions(),
             unary->shape().layout().minor_to_major()),
         {instr}));
   }

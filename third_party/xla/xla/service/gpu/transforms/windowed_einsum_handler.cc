@@ -183,11 +183,13 @@ absl::StatusOr<HloInstruction*> ShiftDequantizationF8(
     for (HloInstruction* unary : unaries[k]) {
       Shape new_shape = ShapeUtil::MakeShapeWithDenseLayout(
           operands[k]->shape().element_type(), unary->shape().dimensions(),
+          unary->shape().expressions(),
           unary->shape().layout().minor_to_major());
 
       operands[k] = unary->AddInstruction(unary->CloneWithNewOperands(
           ShapeUtil::MakeShapeWithDenseLayout(
               operands[k]->shape().element_type(), unary->shape().dimensions(),
+              unary->shape().expressions(),
               unary->shape().layout().minor_to_major()),
           {operands[k]}));
     }

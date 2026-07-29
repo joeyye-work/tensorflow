@@ -122,12 +122,15 @@ XlaOp ConcatenateIota(xla::XlaBuilder* b, XlaOp indices,
   for (auto dim : warp_shape) {
     dimensions.push_back(dim.size);
   }
+  std::vector<xla::DExpr> expressions(warp_shape.get_expressions().begin(),
+                                      warp_shape.get_expressions().end());
   // Except the last dimension, which is of size 1.
   dimensions.back() = 1;
+  expressions.back() = xla::DExpr::Const(1);
 
-  auto batch_indices =
-      xla::Iota(b, xla::ShapeUtil::MakeShape(xla::S32, dimensions),
-                /*iota_dimension=*/0);
+  auto batch_indices = xla::Iota(
+      b, xla::ShapeUtil::MakeShape(xla::S32, dimensions, expressions),
+      /*iota_dimension=*/0);
 
   return xla::ConcatInDim(b, {batch_indices, indices}, dimensions.size() - 1);
 }
@@ -365,14 +368,18 @@ XlaOp CalculateGradWarp(XlaOpKernelContext* ctx, XlaOp grad_output, XlaOp ratio,
   auto warp_dims = warp_shape.dim_sizes();
   std::vector<int64_t> warp_dims_without_last_dims(warp_dims.begin(),
                                                    warp_dims.end() - 1);
+  std::vector<xla::DExpr> warp_expressions(
+      warp_shape.get_expressions().begin(), warp_shape.get_expressions().end());
+  warp_expressions.pop_back();
 
   // With dimension [batch, dim_0, ...dim_n, 4]
   std::vector<int64_t> neighbor_broadcast_dims = warp_dims_without_last_dims;
   neighbor_broadcast_dims.push_back(4);
+  warp_expressions.push_back(xla::DExpr::Const(4));
 
   // With dimension [batch, dim_0, ...dim_n, 4]
-  auto neighbor_broadcast_shape =
-      xla::ShapeUtil::MakeShape(data_type, neighbor_broadcast_dims);
+  auto neighbor_broadcast_shape = xla::ShapeUtil::MakeShape(
+      data_type, neighbor_broadcast_dims, warp_expressions);
 
   const int64_t last_warp_dim = warp_shape.dims() - 1;
 

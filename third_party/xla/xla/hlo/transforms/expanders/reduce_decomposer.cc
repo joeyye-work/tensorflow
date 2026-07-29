@@ -47,6 +47,7 @@ class VariadicReductionLayoutEqualizer : public DfsHloRewriteVisitor {
       if (first_input_s.layout() != input_s.layout()) {
         Shape new_input_s = ShapeUtil::MakeShapeWithDenseLayout(
             input_s.element_type(), input_s.dimensions(),
+            input_s.expressions(),
             first_input_s.layout().minor_to_major());
         auto copy = MakeCopyHlo(input, new_input_s);
         changed = true;
