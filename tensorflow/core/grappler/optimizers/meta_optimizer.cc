@@ -44,6 +44,7 @@ limitations under the License.
 #include "tensorflow/core/grappler/optimizers/custom_graph_optimizer_registry.h"
 #include "tensorflow/core/grappler/optimizers/debug_stripper.h"
 #include "tensorflow/core/grappler/optimizers/dependency_optimizer.h"
+#include "tensorflow/core/grappler/optimizers/freeze_readonly_variables_optimizer.h"
 #include "tensorflow/core/grappler/optimizers/function_optimizer.h"
 #include "tensorflow/core/grappler/optimizers/generic_layout_optimizer.h"
 #include "tensorflow/core/grappler/optimizers/implementation_selector.h"
@@ -543,6 +544,10 @@ absl::Status MetaOptimizer::InitializeCustomGraphOptimizers(
     const std::set<string>& device_types,
     const std::set<string>& pre_initialized_optimizers,
     std::vector<std::unique_ptr<GraphOptimizer>>* optimizers) const {
+  bool freeze_readonly_variables_optimizer_initialized =
+      pre_initialized_optimizers.find(
+          FreezeReadonlyVariablesOptimizerName()) !=
+      pre_initialized_optimizers.end();
   for (const auto& optimizer_config : cfg_.custom_optimizers()) {
     if (pre_initialized_optimizers.find(optimizer_config.name()) !=
         pre_initialized_optimizers.end()) {
@@ -558,6 +563,9 @@ absl::Status MetaOptimizer::InitializeCustomGraphOptimizers(
       TF_RETURN_IF_ERROR(
           custom_optimizer->InitWithConfig(config_proto_, &optimizer_config));
       optimizers->push_back(std::move(custom_optimizer));
+      if (optimizer_config.name() == FreezeReadonlyVariablesOptimizerName()) {
+        freeze_readonly_variables_optimizer_initialized = true;
+      }
     } else {
       // If there are no custom optimizers with given name, try to initialize a
       // default optimizer. This way, custom configurable optimizers can be
@@ -572,6 +580,14 @@ absl::Status MetaOptimizer::InitializeCustomGraphOptimizers(
       VLOG(2) << "Can't register an optimizer by name: "
               << optimizer_config.name();
     }
+  }
+  if (IsFreezeReadonlyVariablesOptimizerEnabled() &&
+      !freeze_readonly_variables_optimizer_initialized) {
+    auto optimizer = CreateFreezeReadonlyVariablesOptimizer();
+    VLOG(2) << "Registered env-enabled custom graph optimizer: "
+            << optimizer->name();
+    TF_RETURN_IF_ERROR(optimizer->InitWithConfig(config_proto_, nullptr));
+    optimizers->push_back(std::move(optimizer));
   }
   return InitializePluginGraphOptimizers(device_types, optimizers);
 }

@@ -274,6 +274,28 @@ cc_library(
 )
 
 cc_library(
+    name = "freeze_readonly_variables_optimizer",
+    srcs = ["freeze_readonly_variables_optimizer.cc"],
+    hdrs = ["freeze_readonly_variables_optimizer.h"],
+    copts = tf_copts(),
+    visibility = ["//visibility:public"],
+    deps = [
+        ":custom_graph_optimizer",
+        ":custom_graph_optimizer_registry",
+        "//tensorflow/core:framework",
+        "//tensorflow/core:lib",
+        "//tensorflow/core:protos_all_cc",
+        "//tensorflow/core/grappler:grappler_item",
+        "//tensorflow/core/grappler:utils",
+        "//tensorflow/core/grappler/clusters:cluster",
+        "//tensorflow/core/util/tensor_bundle",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_library(
     name = "arithmetic_optimizer",
     srcs = ["arithmetic_optimizer.cc"],
     hdrs = [
@@ -640,6 +662,7 @@ cc_library(
         ":custom_graph_optimizer_registry",
         ":debug_stripper",
         ":dependency_optimizer",
+        ":freeze_readonly_variables_optimizer",
         ":function_optimizer",
         ":generic_layout_optimizer",
         ":graph_optimizer",
